@@ -94,6 +94,9 @@ let selectGen = 0;                  // selectConsole re-entrancy generation (see
 let view = "console";               // console | graph | editor (§17, §15.35)
 let lastDump = { node: [], edge: [] };
 let lastPorts = [];
+/// The graph page's last-rendered model, serialized (§15.70 — the reasoning lives with
+/// `renderView`). `null` means "the pane holds no rendering of any model".
+let graphKey = null;
 /// The terminal's render queue and its one-shot flush flag (§15.67 — the reasoning lives
 /// with `scheduleRender`, far below). Declared here, with the rest of the module state,
 /// because `resetTerminal` discards the queue and is itself declared above that code: a
@@ -293,7 +296,49 @@ function renderView() {
     el.hidden = view !== "console";
   }
   for (const b of viewBtns) b.classList.toggle("active", b.dataset.view === view);
-  if (view === "graph") renderGraph(graphViewEl, graphModel(lastDump, lastState));
+  // ---- the graph page repaints when the graph moves, not when a snapshot arrives -----
+  //
+  // §10's `state` is published every 200 ms whether or not anything changed, and this
+  // line used to hand `graph.mjs` a fresh model on every one of them — so
+  // `root.replaceChildren()` and the whole card list ran five times a second on a graph
+  // where nothing had happened (plan §18 item 91, §15.70). Two costs were measured, and
+  // the second is the one that decided the item:
+  //
+  //   * Main thread, on an **idle** 48-node graph: 11.8 ms per snapshot — 4.8 ms of
+  //     layout, 1.5 ms of style recalculation, 1.3 ms of script and the paint — which at
+  //     §10's 5 Hz is ~6 % of the main thread for as long as the page is open, growing
+  //     with the graph (25 ms per snapshot at 192 nodes). Real, and on an unloaded box
+  //     still not something an operator would name; under concurrent load the same page
+  //     measured 28 %.
+  //   * **An operator could not select an address off this page at all.** A selection's
+  //     anchor is a DOM node, and `replaceChildren` detaches it: 0/10 selections survived
+  //     one second, and a drag of a human's duration (400 ms) never even completed
+  //     cleanly — 0/10, against 10/10 with the repaint suppressed. §15.65's harm class on
+  //     a page that has no click handler to lose one through.
+  //
+  // So the model is serialized and the repaint is skipped when it has not moved.
+  // `renderGraph` is a pure function of the model — `graph.mjs` owns no state and reads
+  // nothing else — so an identical model renders identical DOM, and the comparison is
+  // sound rather than a heuristic. It also **fails safe in one direction only**: any
+  // instability in the serialization costs an extra repaint, never a stale page.
+  //
+  // Not throttled to the `dump` fetch's 1 Hz, which was the other candidate: that leaves
+  // the operator's selection being wiped once a second instead of five times, which is
+  // the same page. Not reconciled card-by-card as §15.65 reconciles the rail's rows
+  // either — measured, the residual after this skip is one repaint per *actual* graph
+  // change, which is a human-paced event.
+  if (view === "graph") {
+    const m = graphModel(lastDump, lastState);
+    const key = JSON.stringify(m);
+    // `firstChild` is half the condition deliberately: skipping is a claim that the pane
+    // already holds this model's rendering, and an empty pane is proof that it does not.
+    // It costs one property read and forces no layout. (`render` always leaves a child —
+    // the empty graph gets its `<p class="empty">` — so this cannot latch on.)
+    if (key !== graphKey || !graphViewEl.firstChild) {
+      graphKey = key;
+      renderGraph(graphViewEl, m);
+    }
+  }
   if (view === "editor") {
     renderEditor(editorViewEl, {
       dump: lastDump,

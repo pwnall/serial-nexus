@@ -9811,9 +9811,12 @@ reads as deliberate.
 easy to assume.** `AGENTS.md` §3 spelled the doctor gate `jq -f expectations/linux.jq`,
 without `-e` — and without `-e`, jq prints `false` and exits **0**, so the command reads
 as a gate and asserts nothing. Measured against a deliberately-gutted report: exit 0
-without `-e`, exit 1 with it. **CI always had `-e`** (`.github/workflows/ci.yml:195` and
-`:251`), so no lane was ever blind and nothing shipped unchecked; only the line a human
-copies was wrong.
+without `-e`, exit 1 with it. **CI always had `-e`** (the `doctor` job's `Capability report` step
+and the `macos` job's `Capability report + macos.jq gate` — cited by step rather than by line, because
+**the coordinates in this sentence read `.github/workflows/ci.yml:195` and `:251` until 2026-08-21 and
+were already wrong at `800915b`, where those two `jq -e -f expectations/` lines stand at 279 and 481
+and line 195 is a comment about `SNX_TLS`; see §3.148**), so no lane was ever blind and nothing
+shipped unchecked; only the line a human copies was wrong.
 
 **Filed, not fixed.** The Markdown value grammar is non-injective by construction —
 `", "`, `"="`, `"["` and `"]"` are unescaped inside values, so `{"note":"a","b":"c"}` and
@@ -13904,3 +13907,2223 @@ told me to stop. The cheap test — running the plain command that the `--verify
 shorthand *for* — was available the entire time and would have cost six seconds. **A flag that
 promises a safer version of a command is a claim that the two agree, and that claim is worth
 one invocation to check** when the answer is about to be written down as a blocker.
+
+### 3.125 A lint standing in for a test, in the one configuration the docs hand to codec authors
+
+**What was wrong is small; how it stayed wrong is the entry.** `cargo test -p serial-nexus-daemon
+--no-default-features --locked` read **`209 passed; 5 failed`**, measured three times on this box.
+Five tests in `daemon/src/registry.rs` hard-coded the presence of the `reference` codec with no
+feature gate — `with_builtins_registers_the_reference_codec`, `register_adds_a_codec_and_sorts_names`,
+`a_duplicate_name_is_a_startup_error`, `the_usable_names_include_the_reserved_exec_codec`,
+`an_unknown_codec_build_names_the_available_list`. Design §8 puts each built-in behind a Cargo feature
+"so minimal builds drop what they don't need"; `docs/codec-authors.md` repeats that to in-tree codec
+authors as the configuration their codec must keep working in; AGENTS §3 lists "the minimal-daemon
+clippy" among the gates. So `Registry::with_builtins()` has **two** contracts, and an ungated call on
+it asserts whichever one the person running it happened to compile. A red lib binary also means the
+doctests never run, so the configuration was not merely failing assertions — it was not completing.
+
+**The pattern was known and applied twice out of eight.** The same module's
+`the_reference_factory_satisfies_the_kit_attribute_suite` carries `#[cfg(feature = "codec-reference")]`,
+and `daemon/src/nodes/codec.rs:1501` gates a whole module with `#[cfg(all(test, feature =
+"codec-reference"))]`. This was not an unknown idiom. It was an idiom nobody was ever forced to apply,
+because nothing ran the configuration that would have complained.
+
+***The diagnosis I filed this under was half wrong, and the half that was wrong is the useful half.***
+All three of CI's `--no-default-features` clippy invocations omitted `--all-targets` while the
+workspace clippy standing beside them carried it, so no lane so much as **compiled** the minimal
+build's test targets. That is a real hole and it is now closed on all three sites. **But it is not the
+hole that hid this defect.** Measured on the unfixed tree:
+
+```
+$ cargo clippy -p serial-nexus-daemon-bin -p serial-nexus-daemon \
+      --no-default-features --all-targets --locked -- -D warnings
+EXIT=0        # while five assertions in that very build are red
+```
+
+Clippy compiles a test and never runs one. A failing assertion is a run-time fact. **A lint had been
+standing in for a test** — the instrument was of the wrong *kind* for the property, not merely of the
+wrong scope, and AGENTS §3 listing "the minimal-daemon clippy" among the gates is what made the
+substitution read as coverage. It is offered as a further register of the tell that file collects:
+*a gate that compiles the property it claims to check but never executes it*. It may fairly be judged
+a special case of the weaker-than-its-comment register; what separates it in practice is that reading
+the gate cannot reveal it, because the gate is not the thing that is missing.
+
+**Two plants, because two instruments were in question and neither substitutes for the other.**
+Re-ungate one test and `cargo test -p serial-nexus-daemon --no-default-features --locked` reddens at
+exit 101, while against that same planted tree minimal clippy with `--all-targets` exits **0**,
+workspace clippy with `--all-targets` exits **0**, and the default-features suite reads
+`221 passed; 0 failed` — the new lane is the only instrument in this tree that sees it. Separately, an
+ungated test touching the optional dependency exits **0** under CI's old spelling and **101** with
+`E0433` under the new one. So `--all-targets` earns its place on a class of its own and closes nothing
+of the class that was actually red. Both plants were restored in place, byte-identical (AGENTS §8's
+method; `git stash` deliberately not used).
+
+**The fix splits by property rather than spraying gates on five tests.** Gating all five would have
+left `--no-default-features` running the registry module and asserting nothing that distinguishes it.
+Instead: everything `Registry` promises regardless of which codecs are compiled in is asserted **once,
+ungated, running in both configurations** — rewritten to stand on registrations the test itself makes,
+so sorting is proven from an empty registry with two names registered in *descending* order instead of
+borrowing `reference` as its second name. Every original reference-bearing assertion survives verbatim
+under `#[cfg(feature = "codec-reference")]`. And a `#[cfg(not(...))]` arm finally states the minimal
+build's own promise, **which no test on any platform had asserted**: `with_builtins()` empty,
+`usable_codec_names() == ["exec"]` because reserved names are unioned rather than registered, and
+`build("reference")` refusing structurally by name — the whole operator-visible difference between the
+two binaries.
+
+**Declined, and written into the module comment so it is not re-introduced as a tidy-up:** driving
+these from a `cfg!`-chosen `BUILT_IN_NAMES` slice. Every assertion looped over an empty slice is
+vacuously true, so the minimal arm's passing output would equal its not-running output — plan §3
+rule 22's own shape, and the same one §3.103's vacuous doctor loop was replaced for. The expected names
+are written out literally, per configuration.
+
+**Placement of the new step is the other half.** It runs **last** in `check`, so a five-test failure
+cannot cost the reader the whole-workspace result behind it, and it carries `if: ${{ !cancelled() }}`,
+so a red format check, a red clippy, a red build or a red suite cannot hide it — §3.77's harm, the one
+that kept the macOS doctor gate from executing at all for two days. That property is runner semantics
+and is verified structurally rather than by a guard: a test asserting the `if:` string is present would
+be a proxy for it, not the thing. Likewise **no meta-gate asserts that a feature-dependent test is
+gated** — a scanner cannot decide feature-dependence, so it could only match spellings, and running the
+configuration is the direct instrument.
+
+**Counts**, both ends measured in one session with only `registry.rs` swapped between them: default
+features **217 → 221 passing**; minimal **209 passing / 5 failed → 214 / 0**; registry tests 7 → 11
+under default features and 6 → 6, *a different six*, under minimal. Those figures were then re-taken,
+and why is §3.126.
+
+### 3.126 "Strictly weaker" is not a description; it is a claim that one of two gates is droppable
+
+Item 102 landed the minimal-daemon test lane and, beside it, a sentence recorded twice — in
+`.github/workflows/ci.yml` and in `daemon/src/registry.rs`'s test-module preamble — saying the minimal
+clippy instrument was **strictly weaker** than the new test lane, finding compile failures "and nothing
+else". That sentence is the recorded rationale a future reader acts on, and *strictly weaker* is
+specifically a licence to drop one of the two. **Measured false.**
+
+Four plants, all in `registry.rs`'s `#[cfg(not(feature = "codec-reference"))]` test fn, one file, one
+stationary tree, `--no-default-features` throughout; `cargo clippy -p serial-nexus-daemon-bin -p
+serial-nexus-daemon --no-default-features --all-targets --locked -- -D warnings` against
+`cargo test -p serial-nexus-daemon --no-default-features --locked`:
+
+| plant | clippy | `cargo test` |
+|---|---|---|
+| an unused `use std::collections::HashMap;` | **101** | **0** (214 passed, warning printed and ignored) |
+| `codec_names().len() == 0` (`clippy::len_zero`) | **101** | **0** (214 passed, **no diagnostic emitted at all**) |
+| `!registry.contains("reference")` un-negated — item 102's own defect class re-planted | **0** | **101** (213 passed, 1 failed) |
+| `let _plant: u32 = "…";` | **101** | **101** |
+
+Read by axis: *compile* is shared, and there `cargo test` subsumes clippy; *lint* is clippy's alone,
+because the workspace lint table is `clippy::all = "warn"` with only `unused_must_use` denied, so
+`cargo test` compiles a lint plant green; *run* is `cargo test`'s alone. **Neither instrument contains
+the other. They are complementary, not ordered**, and dropping either step loses an axis rather than a
+margin. The second row is the sharpest of the four: a clippy-only lint produces no diagnostic
+whatsoever under `cargo test`, because rustc has no such lint to emit.
+
+**The asymmetry that decides where `--all-targets` is load-bearing rather than merely cheap.** On
+Linux its *compile* half is genuinely redundant with the new test step and only its *lint* half is
+unique. On the Apple cross-check's two triples nothing can be **run** at all, so there both halves are
+unique and that invocation is CI's only reader of this code. The comment now says which.
+
+**`--all-targets` had also shipped with only its *negative* measured** — exit 0 on the unfixed tree,
+which proves the flag was needed and not that it discriminates. Proved properly: a type error reachable
+only from the minimal test target reads exit **0** without the flag (with `Checking
+serial-nexus-daemon` in the log, so it recompiled and had nothing to look at) and exit **101** with it,
+naming `daemon/src/registry.rs:447` and `could not compile serial-nexus-daemon (lib test)`.
+
+***And the both-ends table of §3.125 had no stationarity, which is AGENTS §9's rule and not a
+nicety.*** It was taken inside a checkout carrying in-flight edits to `daemon/src/{daemon,lib,tap}.rs`
+— three files of the crate under measurement. Re-taken against a `git archive HEAD` copy of `800915b`
+in a scratch directory where the only file that ever differs from HEAD is `daemon/src/registry.rs`,
+swapped by `cp` and md5-verified each way; load average 5.78–20.70 on 20 cores, `-j 6`. **The passing
+counts held. The `ignored` column did not**: it is **0 in all four cells**, the `1`/`2` originally
+recorded having been the doctest result line misread. One further correction the first pass missed: the
+unfixed minimal end runs no doctest at all, because a red lib binary ends the run before cargo reaches
+them. The decomposition is now by test *name* — default +4, all in `registry::tests` (7 → 11 names);
+minimal +0 with exactly one name exchanged; and at the fixed end 213 shared names + 8 default-only + 1
+minimal-only, closing with nothing left over.
+
+**That the tree was moving is measured, not asserted.** The same day, the live checkout read 215
+minimal and 222 default against the stationary 214 and 221, and the whole difference is one test —
+`tap::tests::the_armed_wait_list_is_capped_so_per_chunk_work_has_a_stated_maximum`, added by the item
+64(a) lane (§3.135) and unrelated to item 102. **This is the mundane version of the v12 audit's
+35/43:** a moving tree does not usually invent a dramatic error, it shifts a column by one and the
+number still looks plausible.
+
+**The rule.** An instrument's recorded relationship to its neighbour is a claim, and it costs one plant
+per direction to check. Until those two plants are run, the sentence a future reader will act on is
+unmeasured. This is the first entry in AGENTS §3's register where the false part was an **ordering
+between two instruments** rather than a property of one — and the others are visible by reading the
+gate, while this one is visible only by running both.
+
+### 3.127 A bound with no gate, and the `exec` that had been living behind it
+
+**The finding.** `serial-nexus-devprep` — the one binary in this workspace meant to carry a
+root-equivalent Linux file capability — execed a `PATH`-selected binary while holding both of them.
+AGENTS §4 and design §15.45 list *no `exec` while blessed* among the bounds that make handing it
+`CAP_DAC_OVERRIDE` defensible at all. It had been in breach since `install` first shelled out to
+`getcap`.
+
+**Why nobody saw it, which is the whole entry.** The bound was not unguarded by oversight; it was
+guarded by an *argument*, written twice — in `install.rs`'s module doc (*"This module is the only
+place in the crate that spawns a process, and it is unreachable from a blessed process"*) and beside
+`main`'s dispatch (*"Refusing here is what keeps `CAP_DAC_OVERRIDE` and `Command::new` from ever
+being live in the same process"*). Both halves were true when written: `install` really did refuse
+while blessed, and `read_caps` really did live in `install.rs`. The argument became false when
+`preflight` acquired a second route to the same function — `preflight` → `install::inspect` →
+`read_caps` — and **nothing anywhere had to change for it to become false.** No line was edited into
+a violation; a call site was added somewhere else. The refusal guarded a *verb*; the spawn lived in a
+*module* that two verbs reach.
+
+**Measured, with a `PATH` shim that reads its *parent's* `/proc/<ppid>/status`** so the capability
+reading is the spawning process rather than the shim:
+
+```
+$ getcap .snx-bin/debug/serial-nexus-devprep
+.snx-bin/debug/serial-nexus-devprep cap_dac_override,cap_fowner=ep
+$ PATH=<shim>:$PATH ./.snx-bin/debug/serial-nexus-devprep preflight --json
+SHIM getcap invoked, argv: /…/.snx-bin/debug/serial-nexus-devprep
+CapPrm: 000000000000000a   CapEff: 000000000000000a   NoNewPrivs: 1
+```
+
+`0xa` is bits 1 and 3 — exactly `CAP_DAC_OVERRIDE|CAP_FOWNER`, the two the file carries. Reproduced
+three times, by three agents, on this box, twice before this session.
+
+**The harm is not "a child process ran", and this is the measurement worth keeping.** A shim that
+answers *this file carries nothing* turns a **correctly blessed** copy's own report inside out, on the
+same inode, one reader against the other:
+
+```
+old reader, no shim   : ready (mode 0700, cap_dac_override,cap_fowner+ep)   exit 0
+old reader, lying shim: Unblessed("(none)")
+                        fix with:  sudo setcap cap_dac_override,cap_fowner+ep …   exit 2
+new reader, lying shim: ready (mode 0700, cap_dac_override,cap_fowner+ep)   exit 0
+```
+
+So the *environment* chose the verdict of a binary whose first stated bound is that it reads none —
+and the verdict it chose is **§3.124's harm exactly**: a tool telling an operator to reach for `sudo`
+about a file that needs nothing. Item 101 arrived through a hardlink cargo re-pointed; this one
+arrives through `PATH`. Two mechanisms, one sentence, one wrong conclusion available to the next
+session.
+
+**`PR_SET_NO_NEW_PRIVS` does not cover this, and the reason is worth stating** because the design
+cites it as what makes the bound a kernel guarantee. It stops an `exec` from *gaining* privilege. It
+says nothing about an `exec` that inherits the `PATH` and the entire environment of a process that
+already holds it. The bit was established and read back — correctly, and against the wrong half of the
+hazard.
+
+**The repair.** A file's capability set *is* its `security.capability` extended attribute, so the
+honest reader is one `getxattr(2)`. It lives in `serial_nexus_sys::caps` because §16.3 puts every
+syscall there and this is the only `unsafe` involved; `devprep` keeps the vocabulary, since
+`REQUIRED_CAPS` is the one place a capability name is written. No new dependency; `cargo deny` does
+not move. `docs/vmcell-requirements.md` had already recommended exactly this for an unrelated reason —
+the pinned base image ships no `getcap`, so `the_sweep_removes_a_blessed_stray_and_never_the_copy_that_belongs`
+panicked on `ErrorKind::NotFound` before any new work started. Two arguments, one line of code.
+
+**A guard was deleted on purpose, and the deletion is the point.** The old pipeline parsed `getcap`'s
+stdout and carried a careful regression test for a real defect: `getcap` prints `<path> <caps>`, so a
+whole-line test for `ep` is satisfied by the *path* — `target/debug/deps/…` contains those letters,
+and so does any user named `steph` — and a `+p`-only binary read as blessed. There is no line and no
+path in a twenty-byte kernel record, so that class is **unrepresentable** now rather than guarded.
+Every *decision* the deleted tests protected is re-asserted on bits (`+p` is not blessed; half the set
+is not the set; the orphan matcher stays looser than the blessed matcher), and one case got stronger:
+`carries` now sees an inheritable-only capability, which the text era could see only if libcap happened
+to print the name. The rendering survives in libcap's own vocabulary, pinned to the stock tool's real
+output — `cap_dac_override,cap_fowner=ep` — against the same file's actual twenty bytes,
+`010000020a000000000000000000000000000000`, as the decoder's fixture one crate over.
+
+**Filed, not fixed.** `preflight`'s verdict sentinel names `sudo setcap` for **every** bless problem,
+`Stale` included — measured on this tree: `bless: Stale` followed by `REPLUG-PREFLIGHT:
+BLOCKED-ON-BLESS — ask the maintainer for one \`sudo setcap\``. That is §3.124's defect surviving one
+function over, in the sentence an operator actually acts on. `install --verify` was repaired and
+`preflight` was not, because the two print different strings and only one was under audit.
+
+**What could not be measured here, said plainly.** The new binary has never run *blessed*. There is no
+passwordless `sudo` on this box and no user-namespace route — `unshare -Ur` answers `Operation not
+permitted` writing `uid_map` — so no unprivileged process here can create or refresh a file
+capability. "Does not exec while blessed" therefore rests on two things that *were* measured: the code
+path execs nothing at all, proven on the identical route with the identical shim against a binary built
+from the unfixed tree in the same scratch harness; and the construct is now forbidden by a gate shown
+to redden on every spelling it claims. `sys/` changed, so §15.45's standing re-bless applies and the
+next rig lane must run `scripts/bless` first.
+
+**The register entry.** This is the sharpest member of AGENTS §3's family of gates whose passing output
+is identical to their not-running output: **a gate that does not exist, standing in for one because a
+comment argues the case.** Its passing output is identical to its not-running output for the simple
+reason that it is not running. The remedy is the one already written, aimed one level up — for each
+invariant stated as absolute, ask not "is this true" but "what would go red", and if the answer is a
+paragraph, the answer is nothing.
+
+### 3.128 Three holes in the new gate, all opened by planting and none by reading
+
+The gate item 104 filed is `meta_gates::the_privileged_helper_neither_spawns_a_process_nor_reads_the_environment`,
+scanning the first-party crates that link into the blessed binary — `devprep/src` **and** `sys/src`,
+enumerated from the manifests rather than typed, because the change that removed the `getcap` spawn
+added a syscall to `sys/src/caps.rs` and was therefore moving code *into* the blessed process on the
+same day it moved code out of the scan.
+
+Three things it needed that a first draft did not have, and each was demonstrated rather than argued:
+
+1. `Command` matched as a **substring**, not a whole word. `use std::os::unix::process::CommandExt;`
+   is the counter-example, and it is in the fail-first set for that reason.
+2. A **separate attribute pass with bracket-depth tracking**. clap's `#[arg(env = "SNX_X")]` reads an
+   environment variable with none of the obvious tokens present — the one env-read spelling in reach
+   of this crate that does not look like one — and rustfmt may put the token on a continuation line.
+   The four-line plant reddened naming the *third* line of the attribute; a first-line-only scanner
+   would have passed it while claiming coverage. The class is additionally closed at the manifest,
+   because `#[arg(env)]` needs clap's `env` feature to compile at all, and an assertion on the
+   dependency list covers spellings rustfmt has not invented yet.
+3. **The token list proven load-bearing.** Removing any single spelling from either list reddens the
+   gate's own step-0 matcher proof. Without that, a gate can list five spellings and match two, and its
+   passing output is identical to its not-running output.
+
+***Then an adversarial plant pass opened three holes in that draft, and all three are one root
+cause.*** They are kept in the gate as permanent cases rather than described in a comment:
+
+* **A line whose string literal contains `//`.** The real defect restored into `read_caps` with a URL
+  ahead of it on the same line — `"https://man7.org/x/getcap.8.html"` — reported **GREEN**, while the
+  binary built from that tree execed `getcap` from `preflight`. The scanner was treating the `//`
+  inside the string as the start of a comment and blanking the rest of the line, spawn included.
+* **`#[cfg(test)]` on a non-module item.** The scanner blanked everything after it, so
+  `#[cfg(test)] const X: u32 = 1;` followed by a product function put the *product* function under
+  test-module immunity. The repair blanks a `mod`, and only a `mod`.
+* **An unbalanced `]` inside a string, in an attribute.** `help = "a ] bracket"` ahead of `env =` in
+  the same `#[arg(…)]` defeated the bracket-depth tracking the whole attribute pass is built on. The
+  mirror direction turned up in the same sweep: a `}` inside a string inside a test module ended the
+  module early and dragged the rest of the file back under the ban — a loud false positive, but the
+  same root cause.
+
+**One root cause: a character walk that did not know what a Rust string literal is.** All three are
+closed by masking comments and literals before any of the passes run, which is why the gate's doc can
+now list what it covers instead of hedging. **None of the three was findable by reading the scanner**
+— each requires a *witness* whose text does something the reader's model of the text does not.
+
+**What it still cannot see, stated at the gate rather than left to be discovered.** A spawn or
+environment read performed for the helper by a **third-party dependency** is invisible to it, which is
+why `devprep/Cargo.toml` says in as many words that its dependency list is part of its security
+argument and why the gate pins that list. And `#[command(version)]` expands to an
+`env!("CARGO_PKG_VERSION")` **inside clap's macro**, so this binary does contain a build-time
+environment read no source scan of these crates can see — the accepted instance, named at the gate so
+the claim reads *"no such spelling in these sources"* rather than the larger claim it might be mistaken
+for. Macros are not expanded and `include!` is not followed; neither construct exists in either crate.
+
+**Proof.** Twenty-six plants → twenty-six RED, including the original `getcap` spawn restored in place,
+an aliased import, `CommandExt`, all four method spellings, eleven environment spellings, three
+clap-attribute spellings, a spawn in the *macOS* arm, a spawn in `main.rs`, the clap `env` feature at
+the manifest, and the walker floor. Three negative controls → GREEN (a spawn inside `#[cfg(test)]`,
+`Command::new` in a comment, a local variable named `env`). Six token-removal probes → RED on the
+gate's own matcher proof. Every restore verified byte-identical with `md5sum -c`. The decoder's
+arithmetic was proven separately: dropping the `<< (32 * pair)` high-word shift reddens
+`a_capability_above_thirty_one_decodes_out_of_the_high_word` (`left: 256, right: 1099511627776`) and
+nothing else, because the two capabilities this tree grants are bits 1 and 3 and a low-word-only
+decoder gets both of them right.
+
+### 3.129 A test runner that scores an empty file as a pass, and a parser that scored my own promise as one
+
+**The defect, and how little it took to see it.** `itest/tests/p8_web_history.rs` is the only place in
+CI the browser console's pure ES modules are tested — the offset-splice core, the OPFS write
+serializer, the ANSI subset, the graph shape helpers. It ran them with one `node --test` over every
+`*.test.mjs` under `web/src/assets/` and asserted `out.status.success()`. **`node --test` counts a file
+that declares no tests as a passing test.** Replace the three files with a single comment line each and
+node v24.19.0 prints
+
+```
+✔ ansi.test.mjs (26.1ms)
+✔ graph.test.mjs (24.2ms)
+✔ history.test.mjs (23.1ms)
+ℹ tests 3
+ℹ pass 3
+ℹ fail 0
+```
+
+and exits **0**, where the real files print `tests 56 / pass 56`. The old gate reports
+`1 passed; 0 failed` on that input, byte-identically to what it reports on the real one. Fifty-six
+assertions to zero, green — AGENTS §3's tell with nothing in front of it, and the *weaker than its
+comment* register beside it, since the module doc had claimed this gate "covers the logic that must be
+correct".
+
+**What the gate asserts now.** Each discovered file gets its own `node --test --test-reporter=tap` run;
+the reporter's summary block is parsed out of the TAP stream; the file is held to `fail == 0` (read
+from the summary, **not** from the exit status — a gate that reads one signal twice reads one signal)
+and to `pass >= declared`, where `declared` is the count of top-level `test(` declarations in that same
+file. It agreed with node exactly when it was measured — 16 + 10 + 30 = **56** against `# pass 56` —
+and the tree already reads **58**, because §3.136 added two tests to `graph.test.mjs` later the same
+day. **Nothing had to be edited here for that**, which is the whole argument for a derived floor over a
+transcribed one, and it is the strongest thing this entry can say about the design.
+
+***A floor derived from its own subject collapses with the subject, and that is the entry.*** The
+derived floor does not catch the plant it was written for: gutting a file removes its declarations
+*and* its executions, so `pass >= declared` reads `0 >= 0` and stays green. What catches the gut is the
+companion assertion that **every discovered file declares at least one test**. Node cannot supply that
+assertion either — an emptied file run on its own reports `tests 1 / pass 1`, the single test point
+named after the file, which is a *passing* answer about a file with nothing in it. And the same
+assertion is what stops the matcher going blind: it is deliberately one spelling wide (`test(` at
+column 0, the only spelling in this tree), because a broader regex starts counting occurrences in
+comments and template literals and would let `test.skip(` raise a floor that `pass` can never meet. A
+narrow matcher's failure mode is undercounting, and undercounting a floor is silent — so a file written
+in `it(`/`describe(`/indented subtests becomes a red test naming that file and asking for the spelling
+to be added *and planted*, rather than a floor quietly sliding to zero. Proven rather than argued:
+indenting every `^test(` in `ansi.test.mjs` leaves node executing all sixteen and reddens the gate at
+the `declared > 0` arm. A gate checking only `pass >= declared` would have been green there too,
+16 ≥ 0.
+
+***One of the five plants failed, and it was against my own repair.*** `tap_summary` carried a comment
+saying it reads the counts only from *after* the TAP plan line, because a test's own stdout rides the
+same stream. It took the **last** value for each key. Under last-writer-wins that promise asserts
+nothing at all: a test's forged lines necessarily precede the reporter's block, so the real values
+overwrite them and a whole-stream scan returns the identical answer. Planting exactly the defect the
+comment named — the loop widened from `&lines[plan + 1..]` to `&lines[..]` — left the fixture
+**green**. Two things were wrong at once and only one of them was interesting. The dull half: the
+fixture used the *escaped* forgery, and node renders `console.log("# pass 999")` as `# \# pass 999`,
+three tokens, rejected by the shape check before position ever mattered. The half that matters: node
+escapes a leading `#` and **nothing else**, so a test that logs `tests 999` comes out as `# tests 999`
+— byte-identical to the reporter's own summary line. There is no shape a parser can use to tell them
+apart; **position is the only thing that separates them, and last-writer-wins had made position
+unobservable.** The parser now takes the **first** value per key. It costs nothing on real output (the
+reporter prints each key once) and turns the same plant red, `tests: 999` against `tests: 2`. A missing
+or partial block is `None` and the caller panics on it, never a default-zero struct, for the same
+reason the whole file exists: `0 >= 0` is green.
+
+**The sibling sweep.** Three gates under `itest/` shell a foreign runner and adopt its verdict.
+`p8_web_ui.rs` had already learned this one and holds `npx playwright test` to a count of specs
+(§3.131 rebuilt that count). `p8_external_codec.rs` runs `cargo test` over the external-consumer
+template and carried the same defect at `800915b` — `.status()` and nothing else — repaired in its own
+change (§3.130). Everything else that shells out (`python3`, `bash`, `sh`, `stty`, `mkfifo`, `curl`,
+`id`, `kill`, `ps`, `systemd-run`) is a fixture whose behaviour the Rust test measures itself. The
+borderline case is `jq` in `expectation_gates.rs`, whose verdict *is* adopted — it already passes `-e`,
+this tree's first recorded instance of the same tell, and that gate asserts the reject direction as
+well as the accept one.
+
+**What it still cannot see, stated rather than implied.** A file whose thirty tests are rewritten down
+to one trivial passing `test()` reads declared 1 / executed 1 and is green. The promise here is that
+every test a file *declares* is a test node ran and passed. Whether the declarations are worth anything
+is review's job, and no count can stand in for it.
+
+**Cost.** Per-file runs are 0.327 s against the batch's 0.116 s for these three files. The batch TAP
+stream is flat — one numbering, no file names on the test points — so a batch run can say "56 passed"
+and cannot say which file contributed none of them. That binding is the entire assertion, and 0.21 s
+buys it.
+
+### 3.130 A conformance kit that could leave the build without leaving a trace
+
+**The gate's own comment is what convicted it.** `itest/tests/p8_external_codec.rs` step (1b) is the
+consumer-position half of the extension-surface promise — AGENTS §11's "the external-consumer template
+built from the consumer's position on every push" — and its comment says, in as many words, that
+**both** codec crates *pass* the `serial-nexus-codec-api` conformance kit, naming the three suites
+`tinymux` exists to carry that a passthrough cannot reach (plan §18 item 39). Underneath it, the
+assertion was `Command::status().success()`. Those two sentences describe different properties, and
+only the weaker one was enforced.
+
+**Measured, on the unfixed tree.** Drop `--features conformance` from that one invocation and
+`cargo test -p acme-codec` runs **1** test instead of 2, `-p tinymux-codec` **3** instead of 4. Both
+exit **0**, and the gate reports `1 passed; 0 failed`. The whole conformance kit can leave the build —
+every suite the codec API publishes, including the three that exist only because `acme` cannot reach
+them — and the gate that says it passes them reports success. **`cargo test` exits 0 for "everything
+passed" and for "there was nothing to run", and the gate could not tell them apart.**
+
+**A second spelling, which is why the fix is not just re-adding the flag.** The kit can also be
+compiled in, listed, and still not run: append `-- tests::` to the invocation and libtest reports
+`1 passed; … 1 filtered out` / `3 passed; … 1 filtered out`, exit 0, gate green. Any repair that only
+pinned the command line would miss this one. So the property to assert is *these tests ran*, not *this
+flag was passed*.
+
+**The expectation is derived, and that is the design decision worth recording.** A literal floor —
+"acme runs 2, tinymux runs 4" — would work today and would be a transcription of the template rather
+than a reading of it: it goes stale when a suite is added, and its measurement has to be carried in a
+comment forever. Instead, per crate, list the tests **with** `--features conformance` and **without**
+it, and take the set difference: that *is* the set the conformance feature contributes, by
+construction. No count to keep, no module name to keep (renaming `mod conformance` cannot redden this
+spuriously), and the derivation is itself the first assertion — drop the feature from the listing and
+the two sets coincide, which is the emptiness arm. The run is then required to print
+`test <name> ... ok` for every name in the difference. `... ok` rather than the bare name, because a
+test that is listed but `ignored`, or filtered out by a stray argument, is exactly the case being
+reddened; **not** line-anchored, because §3.78 and §3.101 have now recorded twice that a line anchor
+over captured test output is unstable — a splice breaks the anchor and takes the name with it — and a
+libtest result line is unique enough without one.
+
+**The mechanism was chosen against a measurement, not a memory.** `--format json` is the tidier parse
+and is unavailable: it is still `-Z unstable-options`, and CI's `external-codec` job pins the **MSRV**,
+so a gate built on it would work on a nightly developer box and die in CI. What is used instead is
+libtest's `--list` (`<name>: test`, a bench ending `: bench`, hence a suffix filter) and its default
+human run line, both measured byte-identical on cargo **1.97.1** (this box's stable, equal to the CI
+MSRV) and **1.98.0**. cargo 1.96.1 refuses on `rust-version` before printing anything — and the listing
+helper asserts its own exit status, so that case reddens naming the permutation rather than handing
+back an empty set that would satisfy nothing quietly. Cargo's own `Finished` / `Running unittests` /
+`Doc-tests` lines are on **stderr** in both the `-q` and non-`-q` spellings, measured, so stdout is
+libtest and nothing else.
+
+**`-q` had to go from the run, and that is why the listing is a separate step.** Quiet libtest prints a
+dot per test and no names, so a quiet run can report `ok` for having executed something else entirely —
+the same shape as the defect, one level down. The run therefore captures instead of inheriting, which
+also fixes something never filed: the old `.status()` form leaked the inner run's entire transcript
+into this suite's stdout on every **green** run, and on a red one said only "conformance-kit test
+failed". Both streams now ride the failure messages verbatim (AGENTS §6 — never filter suite output
+before the failing test's name is captured).
+
+**Cost, because the derivation is not free.** The no-feature listing is a second feature permutation of
+each crate's test target: **+0.75 s cold** across both crates against **12.89 s** for the rest of step
+(1) (build 9.72 s, acme 2.40 s, tinymux 0.77 s in a scratch `--target-dir`), and **+0.12 s** warm —
+cargo keys the two permutations to different metadata hashes and keeps both, so toggling recompiles
+nothing. It buys a property worth having on its own: the template still builds with the optional test
+feature **off**, which is how a consumer builds it by default. ***An end-to-end cold pair was also
+taken and is deliberately not quoted as a delta*** — 15.53 s new against 21.44 s old, on a 20-core box
+carrying five concurrent agents at load 4.73 with the itest binary recompiling in between. The new gate
+is not six seconds faster; that is the box (AGENTS §8), and it is recorded here so the number is never
+lifted as a speedup.
+
+**Fail-first, three plants, both arms.** Feature dropped from the run only: old gate exit 0, new gate
+exit 101 at the per-name arm, its message carrying the run's whole transcript so the `1 passed` where 2
+were expected is visible. Feature dropped everywhere including the listing: new gate exit 101 at the
+emptiness arm, printing both listings. Kit compiled and listed but filtered out (`-- tests::`): old
+gate exit 0 with `1 filtered out` twice, new gate exit 101. Restored byte-identical after each
+(`md5 6c4414d3b277bf23f38c786bf75ccb41`, `git diff` empty). **The `#[ignore]` arm was not planted end
+to end and is not claimed as such**: libtest has no runtime ignore flag and the template is not this
+change's to edit, so the matcher was checked against a real ignored line captured on this toolchain —
+`test soak_endurance ... ignored, endurance soak; …`, which does not contain `... ok`.
+
+**What is still not proven, filed rather than implied.** This asserts that the kit's *tests* execute,
+not that the kit's *suites* are all called. `tinymux_conforms`'s body could be reduced to one
+`kit::round_trip_identity` call and this stays green — item 39's property one level down. Reaching it
+needs source parsing or one `#[test]` per suite inside `examples/external-codec/`, and any such gate
+owes an allowance for `recovers_after_garbage`, which `tinymux` declines for a recorded reason (its own
+framing; `resync_is_counted` carries the property with this codec's own malformed unit).
+
+**The general lesson is the one worth keeping**, and it is the same sentence §3.129 arrives at from the
+other side: *a subprocess's exit status answers "did anything fail", never "did the thing happen"*, and
+every gate in this tree that shells out to a test runner is asking the first question while its comment
+claims the second.
+
+### 3.131 The browser suite's floors: slack in three directions, and a nightly lane holding itself to the day lane's number
+
+**Three defects in one pair of constants.** `itest/tests/p8_web_ui.rs` held the Playwright suite to two
+hand-kept floors, `SPECS_WITH_DEVICE = 25` and `SPECS_DEVICE_FREE = 14`.
+
+*First, the slack.* Measured on this tree, Linux 7.0.0-30, 2026-08-21, all four arms executed on one
+box in one session:
+
+| lane | fixture | passed | skipped | wall |
+|---|---|---|---|---|
+| per push | with device | 28 | 0 | 28.5 s |
+| per push | device-free | 17 | 11 | 13.4 s |
+| `SNX_UI_SLOW=1` | with device | 30 | 0 | 2.6 min |
+| `SNX_UI_SLOW=1` | device-free | 18 | 12 | 2.2 min |
+
+Against floors of 25 and 14 that is **three, three, five and four specs of slack** respectively. Any
+three specs could vanish — a deleted file, a rename off `*.spec.mjs`, a `testDir` typo, a `--grep`
+mistake — and the gate stayed green while its own message promised that "a *removed* spec … trips it".
+
+*Second, the `@slow` lane was unfloored.* Both lanes asserted the **same** floor of 25 while a per-push
+run reports 28. So `web-ui-nightly`, a job whose entire reason to exist is the two `@slow` specs,
+cleared its own bar by three specs it had not run — and could not have noticed either slow spec
+disappearing, because the number it was held to was already met without them.
+
+*Third, the arithmetic in the comment contradicted itself.* One paragraph said twelve specs carry a
+device skip; the next said eleven; both then called their own totals "per-push counts". Measured with
+the tool: **twelve in the suite, eleven in the per-push selection** — the twelfth is `@slow`, so the
+per-push lane never sees it. Both prose statements were half right and neither was checkable, which is
+why the count is no longer prose at all.
+
+**The repair is plan §3 rule 7 — "CI loops enumerate from the tool, never a hand-kept list" — applied
+to the last gate in this tree that was still keeping a list by hand.** Before asserting anything, the
+gate asks Playwright, **with the same filters the run just used**, how many specs that selection holds
+(`--list`: no browser, no spec executed), how many of them carry `@device`, and, in the slow lane, how
+many carry `@slow`. The pass/skip split then falls out as an *equality* rather than a floor: with a
+device every selected spec runs, device-free exactly the `@device` ones stand down. Adding a spec edits
+nothing here. The listings and the run go through one helper so a listing can never describe a
+differently-configured suite than the one that ran — a count derived from a different selection is a
+count about nothing, and it fails in the reassuring direction, since a broader listing only raises the
+number the run is then held to. The tool's readings: **30 selected unfiltered · 28 under
+`--grep-invert @slow` · 2 under `--grep @slow` · 12 under `--grep @device` · 11 under
+`--grep-invert @slow --grep @device`.**
+
+**One number survives the derivation, and the reason is this file's own tell.** A count taken from the
+tool cannot see the suite get *smaller*: delete a spec file and `--list` reports one fewer, every
+equality holds against the smaller answer, and the gate goes green over exactly the hole it exists to
+catch. So `SPECS_TOTAL = 30` and `SPECS_SLOW = 2` stay hand-kept and stand outside the tool's answer,
+with each lane's minimum derived from the pair — `SPECS_TOTAL - SPECS_SLOW` per push, `SPECS_TOTAL` in
+the slow lane, and the slow lane additionally holding its own `@slow` selection to `SPECS_SLOW`, a
+count the per-push lane cannot reach at all because its `--grep-invert @slow` leaves that listing
+structurally zero.
+
+**Two independent statements of the same set, held equal.** Twelve specs now carry a `@device` tag
+beside the `test.skip(!ECHO, …)` / `test.skip(!HOSE, …)` guard they already had. The tag is what
+Playwright can be asked about *before* the run; the guard is what the spec does *at* run time. On the
+device-free arm the gate asserts `skipped == device_gated`, so a device-gated spec that lands without
+its tag is a failure with a name rather than one spec of quiet slack in a floor.
+
+**And the tag's matcher is asserted rather than assumed**, because on a device-bearing fixture — which
+is every CI run of this job — a tag that stopped matching leaves `device_gated` at 0 and *both*
+assertions below still hold at 0 (`passed == selected - 0`, `skipped == 0`). That is the tell in
+its plainest form, so `device_gated` is required to lie in `1..=selected`.
+
+***The re-measurement the superseded comment owed was never blocked on what it said it was blocked
+on.*** It called itself blocked on "a Linux rig". `serial_echo()` is unconditionally `Some` on Linux —
+a `serial-nexus-sim` pty stands in for the port — so the *with-device* arm is the one a Mac cannot
+reach, and it was the **device-free** arm that no Linux box could produce. It never needed a rig; it
+needed the device-free fixture to be a *choice* rather than a platform accident. `SNX_UI_DEVICE_FREE=1`
+makes it one, and the four rows above were taken through it on a single box. The knob only ever
+*removes* a device, so it cannot make a device-bearing run look healthier than it is, and it is off
+unless spelled.
+
+**Two details that are load-bearing and easy to miss.** `listed_specs` **panics** on a missing or
+unparsable `Total: N tests` footer rather than returning 0, because every assertion built on that
+number is an equality or a floor against it and a silent zero would relax all of them at once while
+reading as a clean run. And the footer is read from the **last** matching line, for `count_before`'s
+reason one parser over: the listing prints every spec title before its footer, and a spec title is free
+to contain anything at all, that line included.
+
+*Owed, and small:* the two comments recording the listing's cost disagree — the call site says
+`4.7–5.8 s` per listing on this box, the helper's doc says "roughly a second per call on this tree".
+Both are plausible readings of a warm and a cold `npx` spawn, and neither carries the load average it
+was taken at. The gate is correct either way; the figure is not quotable until one of them is re-taken
+with its scope.
+
+### 3.132 Item 84: the comment was right, the item's route was not, and the sweep it asked for found a sibling
+
+**The defect, restated so the register is unmistakable.** `itest/tests/p8_packaging.rs` carried four
+lines — `section.matches(class).count() > 0` for each of `measured`, `man-page`, `unverified` — under a
+comment reading *"The table's own vocabulary is closed: three class words and no others. A row that
+invents a fourth is a claim nobody can weigh."* The comment is a claim about **every row**. The code is
+a claim about **the whole section**, and a weak one: `packaging/README.md`'s evidence section is ~100
+lines of prose that uses all three words in ordinary sentences, so three unrelated rows hold all three
+counters positive forever. A row whose Class column read `assumed`, `probably`, or nothing at all
+passed untouched, and so did `measured (partially)` for as long as it stood.
+
+**The item's route was refuted by the table it was written about, and that is the more useful half.**
+Item 84 prescribes: "parse the class column per row … and reject any cell not exactly one of the three
+words." Measured against the real table, that rejects **7 of 28 rows**. Five carry a scope —
+`measured (the mode)`, `measured (the loopback default)`, `measured (the faulted arm)`, and two
+`**measured** (CI root arm, run 31695823765, 2026-08-13; …)` — and two carry *two* classes for two
+sub-claims: `man-page for the effect; **measured for acceptance**`, `man-page for the premise,
+**unverified** for the recipe`. Every one is doing work. `measured (the mode)` sits on the row "The
+control socket is mode 0600, and whoever can open it owns every console": the mode is measured by
+`p9_permissions.rs`, the consequence is `../docs/security.md`'s threat model. **Flattening it to
+`measured` would make the row overclaim**, which is the opposite of the item's purpose. So
+`packaging/README.md` was not edited — not one row was malformed — and the whole difficulty moved to
+where it belonged: separating a scope from a hedge.
+
+**Where the line went, and why it is drawn positively.** A Class cell is one or more class terms, split
+at the top-level `;` and `,` (paren- and code-span-aware, because two rows carry a whole citation
+inside their parentheses and a flat split would tear `run 31695823765, 2026-08-13` into segments and
+redden the two best-evidenced rows in the table). A term opens with one of the three words, exactly and
+in lower case after markdown emphasis is stripped. A restriction after it must **name the part of the
+claim it applies to**: a determiner opens it (`the mode`), or it cites (a code span, or an ASCII digit
+— a run number, a date), or every substantial word in it is a word the row itself uses elsewhere. That
+last arm is what lets `measured for acceptance` stand, because that row's Evidence cell opens
+"Acceptance — that systemd parses every one of these…" — and the row's *own Class cell is excluded*
+from that vocabulary, without which the rule would be satisfied by the restriction quoting itself and
+would assert nothing. There is a direct negative control on exactly that: the same cell must be
+**rejected** when the row's other text no longer contains the word.
+
+**This is an allowlist of shapes, not a blocklist of hedges, and the direction is the whole design.** A
+blocklist passes every hedge nobody thought of. This refuses `(mostly)`, `(roughly)`, `(broadly)` and
+`(probably)` without ever having been told about them, because no bare adverb takes any of the three
+shapes. The cost is that a legitimate new restriction has to be written in one of them, and the failure
+message says which — a loud false red is the cheap direction of that trade. **The residual is stated
+rather than papered over:** what is checked is *shape*, so a hedge wearing a determiner — `measured for
+the most part` — passes. That went into the module doc's "what this gate provably does not catch",
+beside the older bounds, rather than into a comment nobody would test. The lexicon is derived from the
+README's own `| Class | Means |` legend and held against the `CLASSES` constant, so neither side can
+move in silence.
+
+**The sweep the item asked for found a sibling, one assertion over.**
+`every_directive_the_packaged_unit_sets_has_a_recorded_evidence_class` derived its "recorded" roster
+from a **section-wide** backtick scan and used the one roster for both halves of its verdict. For the
+half that matters to item 31 — every shipped directive has a recorded evidence class — that is the same
+substring-standing-in-for-a-row shape: a directive named *anywhere* in the section satisfied it,
+including in another row's Evidence prose. The `PrivateDevices=` row's Evidence cell quotes
+`` `PrivateDevices=` `` back while citing `systemd.exec(5)`, so the Directive-column entry could be
+deleted and the roster still held the name. Measured: **section-wide 44, Directive-column 41.**
+Deleting `` `PrivateDevices=` `` from the Directive cell alone leaves the old gate `6 passed / 0
+failed` and reddens the new one naming `PrivateDevices=`.
+
+***And the fix had to be asymmetric, which is the part worth remembering.*** The *phantom* half — "the
+table records a directive the unit has stopped naming at all" — genuinely is section-wide, and
+narrowing it would have made it **weaker**: the three directives separating the two rosters are exactly
+`User=`, `Group=` and `ReadWritePaths=`, which the page records in prose and Evidence cells because the
+unit carries them as commented alternatives an operator applies by hand. A per-row read is the stronger
+form for *did anyone record this*; a section-wide read is the stronger form for *is anything here
+describing a unit that has moved on*. One roster could not be both, and reading one for both is how a
+gate ends up strong in one direction and blind in the other. The mutation that proves it lives **in the
+test** and asserts both arms — the column roster must lose the name **and** the section-wide scan must
+still be green — so the day that arm stops demonstrating the difference it was written to demonstrate,
+it says so instead of quietly passing.
+
+**Proof.** Every plant was taken atomically — plant, assert present, run, assert still present, restore
+— and the working copy restored byte-identically. The three spellings item 84 names (`assumed`,
+`measured (partially)`, an empty cell) and the sibling mutation each leave the HEAD gate at `6 passed /
+0 failed` and each redden the new gate naming the row. Both halves of the new guard were
+mutation-proven besides: making the class matcher accept everything reddens the plant sweep, and
+stopping the walker after the first row of each table reddens the row floor. The standing validation is
+186 planted re-parses per run (6 spellings × 31 rows, each first asserted to have landed), 3
+header-rename plants, 3 ragged-row plants, a whole-table collapse, a legend plant, and 13 matcher
+literals.
+
+***A process note, because it nearly produced a false record and is the same tell in the harness rather
+than in the guard.*** An early round of these proofs ran while another session was writing to the
+shared scratchpad directory; the plant script was overwritten by that session's, so the plant silently
+stopped landing, the script still exited 0, and the gate went green. **A run whose green was
+indistinguishable from *the plant never happened*.** Every figure above was re-taken in a uniquely
+named directory with the plant's presence asserted on **both** sides of the run; the earlier round is
+discarded, not quoted. The rule it leaves: a fail-first proof must assert its own stimulus landed, at
+the moment the measurement is taken, and not merely that the mutation command returned 0.
+
+**Two further weaknesses were found and deliberately left filed rather than fixed**, both in
+`dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown`, which self-skips on any
+box without passwordless root. `assert!(r.len() >= 8)` sits under a message reading "it is meant to
+print nine" — the assertion admits an eight-reading run its own sentence calls a partial death
+(harmless today only because the `get()` closure panics on any missing key, i.e. the property is
+carried by a different line than the one claiming it). And `assert!(real.contains("private"))` stands
+for "a symlink into `private/`", where the property is `starts_with("/var/lib/private/")`. Both are
+one-line tightenings and both would be **guards shipped on an argument rather than a measurement** on a
+box that cannot run the test, which is what AGENTS §9 forbids. They want the next session that has
+root.
+
+### 3.133 Item 99: the third extent rule was the defect, and deleting it was the fix
+
+**The two halves were one bug.** Item 99 filed a hole (two adjacent headings planted inside the Status
+table leave the gate green while both renderers show 16 body rows of 39) and a false alarm (a correct
+three-column table below the Status table reddens it, with a message naming *all* the rows as the
+truncated surface). The item named the shared cause — the surface walk's extent is a whole-section
+window — and left the direction uncosted. It is the same sentence read twice: **a rule that decides
+"does the table continue?" by looking ahead over a window puts everything in that window inside its
+scope, and lets anything that moves the window's edge move the yardstick.** Three successive rules had
+that shape here: the first non-row line, then the first non-row line with no rows under it, then the
+first heading with no rows before the next heading. Each repair was the previous rule with a wider
+lookahead, and each one shipped a new way to be truncated from inside. **Widening it a fourth time was
+available and was not taken.**
+
+**What replaced it has no window.** The gate stopped asking where the table ends and started asking
+what plan §3 rule 19 asks: *is there a figure below this table that GitHub renders in no table at all?*
+GFM answers that structurally — a row-shaped line belongs to a table iff a **frame**, a header over a
+matching delimiter row, introduced it. So `authority_surface` walks from the Status table's own header
+to the **end of the document**, consumes each table frame-first, skips fenced blocks, and reports every
+row-shaped line that lands between tables. The expectation is the constant zero. `is_atx_heading`,
+`section_end_below`, `row_shaped_below` and `row_shaped_surface` are gone. There is nothing left for an
+edit to move, which is the property the previous three rules were each one counter-example short of.
+
+**The extent was costed rather than argued.** Running to the end of the document risks a false orphan;
+measured on this plan it costs nothing: 4107 lines below the Status header, 80 carrying a pipe and 74
+carrying two, three tables consumed as frames, **zero** orphans. Exactly five non-table lines split
+into three or more cells — `` `KERNEL=="tty[A-Z]*[0-9]|ttymxc[0-9]*|…"` `` among them — and all five
+are §18 continuation lines indented four columns, which `ends_gfm_table` already reads as code. The
+residual is a future *unindented* prose line carrying two bare pipes; the failure message names its
+remedy (escape them, or indent) beside the real one, so a false positive costs a reader one line rather
+than a deleted gate.
+
+**The cry-wolf half needed no special case, and that is the tell that the shape was right.** A
+legitimate second table is a frame, so its rows are never orphans — at any column count. The retired
+trigger had been a three-cell floor, which is why a two-column table below the Status table passed and
+a three-column one reddened, on two pages a reader cannot tell apart. The one shape still worth
+reporting is a second frame stacked under this table's run with **nothing but blank lines** between
+them, which is what the retired check's own comment always said it was for; a table separated by so
+much as a sentence is a different table and is left alone.
+
+**Three defects the filing did not name, all found by the plants and none by reading.**
+`table_starts_at` never required the delimiter row to carry the header's cell count — `| a | b | c |`
+over `| --- | --- |` renders as **no table at all** in both renderers, so a frame-consuming scan would
+have swallowed the pair and gone silent about every row beneath it, which is the exact silence this
+gate exists to remove, one layer down. Its doc comment also asserted a renderer reading that is false:
+*"only ever asked after a block boundary, because that is the only place the answer is yes"* — a frame
+directly under `Some prose` or `**bold prose**` renders as a table in both, and requiring a boundary
+would have called a real table's rows orphans. And the retired gate reddened on a **fenced example** of
+a broken table, printing *"Both reference renderers agree that is two tables"* about a fence both
+renderers render as code and no table at all. **A message that cites a measurement it never took is the
+weaker-than-its-comment register with the comment promoted to an assertion.**
+
+**The item's own measurement had gone stale before it was fixed.** The filing says 16 rows of 33, with
+seventeen leaving. The table is 39 rows now, so the same plant strands 23. Nothing was wrong with the
+filing; the number was a fact about a document that kept moving. It is the argument for the way the new
+proofs are written: the plant lands above a well-formed row *taken from the table*, and the orphan count
+is compared against the rows the walk lost, so no count in the test can go stale as the table grows.
+
+**Proven without touching a document.** `repo_root()` is `env!("CARGO_MANIFEST_DIR")/..`, resolved at
+compile time, so HEAD's gate and the new one were each compiled against a scratch root and run against
+eleven planted copies of the plan. `marked@15` and `micromark` + `micromark-extension-gfm-table` agree
+on all eleven. Four plants GREEN → RED (two, three and four adjacent headings, each with a surplus cell
+below; and a row on the document's last line); three RED → GREEN (a correct 3-column neighbour, a
+6-column one, a fenced example); four unchanged and correct (clean, the 2-column neighbour, the stacked
+frame, the blank interruption). Five mutations of the new code, 5 of 5 detected. The plan's md5 was
+`b8fe238235a888ee51ebd4863fe0baf7` before and after, which is HEAD's.
+
+***One of those five mutations did not redden on its first run, and the reason is the finding worth
+keeping:*** the mutation string had not matched the source at all, so nothing had been planted. **A
+plant that does not land looks exactly like a guard that holds.** The second attempt asserts the
+substitution count before it writes the file — the same tell, arriving inside the apparatus that was
+checking for it, and the second instance of it this session (§3.132 is the other, by a different
+mechanism).
+
+### 3.134 Item 100: a guard's coverage is bounded by the edits its plant generator can spell
+
+**The defect.** `itest/tests/meta_ledger.rs`'s `continues_with_a_clause_statement` decided whether a
+sentence stop inside a §18 declaration separates two clause statements or ends the declaration. It said
+yes when the stop ended *inside* an open `**` run, and yes when the statement after it opened one. That
+pair is not a partition. A stop just **past** a run's close, with `*` after it or with nothing,
+satisfied neither — and neither did a joint written with the word `and` in it. Punctuation-only
+rewrites of the ledger's own mixed-clause entries therefore cut the declaration before the open clause
+and moved the item to `EXECUTED` with no error, whereupon the gate reported drift against AGENTS §2 and
+told its reader to repair the copy rather than the document. That is the "worse than no gate" outcome
+this file already records twice, reached a third way.
+
+***The finding is the plant generator, not the rule.*** The on-tree guard that existed for exactly this
+class rewrote each mixture's separator `;` **in place**. A `;` rewritten where it stands always leaves
+the sentence stop at the `;`'s own offset — so the whole family of edits that move the stop across a
+`**` boundary was outside what the plant could express, **by construction**, and nothing in the guard's
+passing output said so. **A guard's coverage is bounded by the edits its plant generator can spell, and
+that bound is invisible in a green run.** It is one more register of AGENTS §3's tell and the closest
+sibling of §15.65's *stimulus gentler than the product's*: there the stimulus was too kind, here it
+could not be aimed.
+
+**The family is twice the size it was filed as.** The replacement reads each mixture's joint from the
+document — the head's closing `**`, the punctuation, an optional `and`, the continuation's emphasis,
+and the run-closing `**` where the joint sits inside a run — and rewrites the whole of it, scoring every
+result end to end through the gate. Against the rule as it stood, **10 of 16 rewrites go silent, not
+the 5 the item named**: item 13's joint is silent under all six of its rewrites, because the `and`
+defeats the test at both stop placements and in all three emphases rather than in the single spelling
+the item happened to write down. A guard built to the filed count would have covered half the family
+and passed. **The item was filed from a reading of the rule rather than from a failure, precisely
+because no run had ever printed the family together** — which is why the battery collects its failures
+and reports them as one list instead of stopping at the first.
+
+**The rule gains three lines**: a third arm — the sentence stop sits immediately past a `**` delimiter
+— and a tolerance for a single `and` in the joint before the clause marker. The arm is the *local*
+statement of what the parity arm states globally: a `**` behind the stop is the ledger closing one
+bolded statement at the sentence boundary, exactly as an odd delimiter count is the ledger splitting an
+open one. Local deliberately, because several of the item's own plants leave emphasis unbalanced and a
+parity-only rule would answer differently for a reason the edit never touched. The `and` is not a new
+tolerance but the clause grouper's own joiner vocabulary applied one level up.
+
+**The property scored is weaker than "the verdict survives", deliberately.** Two of the rewrites move
+the very `**` that item 78's open clause is *spelled* with (`) open**`), so an entry that stops
+spelling its status recognisably must be refused, loudly, naming itself. Each rewrite must land in
+`Green` or in `Refused` naming the entry; `Drift` is the defect. Measured with the fix: **3 mixtures,
+16 rewrites, 10 green, 6 refused, 0 silent.**
+
+**The widening costs were re-measured before the rule moved, and one of the four is refuted.**
+Accepting a leading single `*` still refuses **{64, 65}**; dropping the emphasis condition still refuses
+**{55, 64, 65}**, a strict superset now asserted as one; the shipped rule's own cost is **zero across
+101 entries, no verdict moved**. But `loose_head_number`'s recorded reason for refusing `NN)` was
+**wrong twice over**: it named item 66's wrapped CI run id `31689537882)` when the line is item
+**68**'s, and that number exceeds `u32::MAX` — the type head numbers parse into — so the widened
+matcher answers `None` on it for a reason the bracket has nothing to do with. The document's other
+`NN)` line, item 41's wrapped baud rate `9600); two pty itests…`, escapes on the byte *after* the
+bracket. The widening would cost **0 of 2** bracketed lines today. **It was still not taken** — it buys
+this repair nothing, and both members of the family are wrapped numbers in prose escaping by accidents
+of their own. A near miss is not a licence, and the narrowness is now asserted against every `NN)` line
+the document spells rather than argued from one. **Three frozen numbers went with it:** two comments
+claiming the matcher's highest reading "is still 98" against a ledger at 101, and a third claiming the
+rule "refuses none of the 98". All three are derived by tests that measure and print now, chosen over
+dating them, because the ledger is append-only and a dated number still has to be re-taken by hand.
+
+**Fail-first was made permanent.** The rule as it stood is kept as a `Continuation` variant beside the
+shipped one, so the proof runs on every invocation rather than living in this session's scrollback.
+Seven plants against the finished tree all redden: the whole old rule; each of its two halves alone (6
+and 6 silent, overlapping in 2, which is how the ten decompose); each widening neutered; the widened
+head matcher made identical to the shipped one; and the plant machinery's line-wrap tolerance deleted.
+
+***That last plant reddened nothing on its first attempt, and is the most useful of the seven.***
+Deleting `find_normalised_all`'s whitespace tolerance left all 26 tests green — the mechanism had never
+been seen to do anything, the tell arriving inside the plant machinery rather than inside a gate.
+Measured: **0 of 4** needles on this tree span a line break, because needles are widened backwards only
+until unique and every one lands inside a single line. It was **kept** rather than deleted, for a reason
+now written where it lives: byte-exact matching does not *miss* a wrapped joint, it **panics** out of
+`unique_needle`, leaving the battery unable to reach that entry at all — this item's own failure mode
+one level down. It is proven as a unit instead, and the count it costs is printed rather than claimed.
+**An inert mechanism kept for a stated reason is not the same thing as one nobody has looked at, and
+the difference is the comment.**
+
+Validation: `cargo test --test meta_ledger` counts **27** tests where it counted 24 (−1 replaced, +4
+new), and was recorded as 27 · 0 · 0 when this item landed. ***It does not read 27 · 0 · 0 on the tree
+this session closed on, and the count is the only half of that line that survived.*** Two later
+readings on this box, both 2026-08-21, both quoted with the tree they belong to:
+
+* while plan §18 carried the numbering gap of §3.144 — **15 passed · 12 failed · 0 ignored**, all
+  twelve on one panic from `parse_ledger`'s contiguity refusal, none of them on anything this item
+  touched;
+* after items 109, 111 and 112 were filed and §18's heads ran `1..=113` again — **24 passed · 3 failed
+  · 0 ignored**, the contiguity refusal gone.
+
+**None of the three remaining failures is this item's rule**, and plan §18's *Items 102–113* section
+header carries the full account of them rather than this entry. Two are worth naming here because they are this item's own
+construction working: `meta_ledger.rs` asserts **liveness** for every row of its status vocabulary and
+for both mixture shapes it can parse, and this session closed `64(a)` and `78(b)` — between them the
+ledger's only `PARTLY` declaration and its only mixture whose halves share one bold run. **The battery
+refuses to run at reduced coverage rather than passing quietly at it**, which is the failure mode this
+entry is about, reaching the guard built for it on the first ledger edit after it landed. The third is
+AGENTS §2's `Still open:` list, moved by those same filings; the gate prints the corrected list in its
+own message. All three are repairs in files this pass does not own. Nothing keys on the current highest
+item number — the battery derives its mixtures from the parsed
+status and the floor test from the document — so both hold as §18 is appended to. **Not one of this item's numbers
+survived unchanged:** three of four widening costs reproduced, the fourth is refuted, and the
+silent-rewrite count doubled.
+
+### 3.135 Item 64(a): the factor that had no maximum, a plant that reddened nothing, and what a cap does not buy
+
+Item 64(a) named three cost surfaces on the pattern wait's active path. Its filed remedy — a
+max-lookback `tap.wait` over the firehose graph — had already been **built, measured and removed**
+(§3.106, §3.109): six runs read a wall ratio of 0.86–1.13 with `gaps: 0` in all six, so the guard
+landed on the mechanism instead and two of the three surfaces were covered. The third, quoted from the
+entry: *the `waits` list is iterated per chunk and uncapped*.
+
+**The cost model, stated once because everything below is arithmetic on it.** `TapHub::ingest` walks
+the endpoint's armed-wait list on every chunk and each entry rescans its **whole** retained window, so
+the hub's per-chunk work on the single runtime thread is
+
+    waits × lookback × the pattern's cost per byte
+
+`MAX_LOOKBACK` caps the second. Nothing caps the first, and — this is the finding nobody was looking
+for — nothing caps the third either.
+
+**Measured in the product path before any number was chosen.** Release build, 4 KiB chunks fed straight
+into `TapHub::ingest`, windows warmed to `MAX_LOOKBACK`, on a 20-core box under load 3.6–5.7 (loaded,
+so these are ceilings on a busy machine rather than best cases; the ladder was read three times):
+
+| reading | figure |
+|---|---|
+| per armed wait per chunk, literal `login:` | 6.1–6.2 µs — **0.089 ns per scanned byte** |
+| per armed wait per chunk, `(?-u)[a-zA-Z0-9]{200}` | 111.4–112.3 µs — **1.61 ns/B** |
+| per armed wait per chunk, `(?-u)[^\n]{4000}` | 111.2–111.7 µs — **1.60 ns/B** |
+| per **open tap** per chunk, same list, same run | **20–22 ns**, flat |
+| per-wait cost against list length | flat 2.7–4.0 µs from 8 waits through 128; 3.5–4.1 at 256; 4.8–5.1 at 512; 5.4–6.0 at 1024 |
+
+**A wait is not a tap, by 130× to 5300× per element.** That single comparison kills the argument the
+surface had been surviving on — that `taps` rides the same per-chunk list uncapped, so `waits` may too.
+It rides uncapped for a measured reason (a pointer, a clone and a `try_send`), and the reason does not
+extend to a full window rescan.
+
+**Reachability, established before the cost mattered.** Every armed wait is one control-socket
+connection: §15.20 runs one waiting verb per connection, and §10 clause 8 keeps `tap.wait` off the web
+bridge's allowlist — asserted rather than merely absent, which is the difference the bridge's own test
+exists to hold. So the caller is already through the 0600/0660 socket and could call `shutdown`
+instead. **That argument is not available here, and §15.56 is why**: a backtracking engine and an
+unbounded lookback are refused *by design* for the same caller on the same socket. The settled posture
+is that this verb's cost dimensions carry stated maxima regardless of who can reach them, and the
+accidental case decides it as firmly as the adversarial one — a client that leaks connections reaches
+an unbounded list by accident, and today that degrades every console the daemon runs.
+
+**The end-to-end reading, which is also the one that limits the claim.** A `sim pty --source` firehose
+into one serial endpoint, no consumer, ring off, `info` timed over the control socket; three runs at
+load 9.9–19.0. p50 **0.11–0.22 ms** with nothing armed, **7.8–11.7 ms** with *one* max-lookback regex
+wait, **60–72 ms** with eight, and a p90/max of **0.63–1.06 s** with 64. The MiB actually ingested
+inside each window differs per rung (the producer→hub feed hop drops when the hub is slow), so no ratio
+is derived across rungs and the n=64 median is bimodal — the tail is the reading. One wait already
+costs 40–110×, and **a cap cannot touch that**: the dominant term is `lookback × ns-per-byte`, both of
+which the design already accepts. So the cap is a stated maximum on the factor that had none, not a fix
+for the worst case, and the constant's own doc says so in those words. These are figures for the worst
+case the tree can build — a software firehose, the maximum lookback, a prefilter-defeating pattern —
+and are **not** console figures.
+
+**`MAX_ARMED_WAITS = 64`, from the ladder rather than from taste.** Per-wait cost is flat from 8
+through 128 and climbs past it as the retained windows outgrow cache — beyond that knee each additional
+wait costs more than the one before, so the operator's input stops buying linear cost. 64 is a binary
+step inside the measured flat region: 4 MiB of retained windows per endpoint at the maximum lookback, a
+stated 0.40 ms (literal) or 7.2 ms (no-prefilter regex) of hub work per chunk, and 8× `MAX_PATTERNS`,
+which is the escape hatch that constant's own doc names — 512 patterns still watchable on one endpoint
+at once. It is occupancy and not a quota: a wait that ends frees its slot, so the refusal's retry advice
+is true and the guards assert it.
+
+**The check is `arm_wait`'s first statement, and the reason is a third measurement.** A hub at its cap
+that still scanned the replay ring would hand a *refused* caller a bigger lever than an accepted one:
+**14.984 ms** (literal) and **91.997 ms** (`[a-zA-Z0-9]{200}`) per `tap.wait --replay` over a ring at
+its 16 MiB maximum, repeatable per call with no wait ever registered to be capped.
+
+**The refusal is `-32602`, and the better typing is declined out loud.** A cap is a transient state
+refusal — closer to `EdgeInboxFull`'s shape than to "your params are wrong" — and a caller cannot today
+distinguish "shrink your regex" (never retry) from "wait for a slot" (retry) by code alone. It reuses
+`-32602` because that is what every other §10 clause 2 maximum answers, and because a ninth `AppError`
+is a `docs/rpc` table row plus a two-way registry gate: a code with no documented row is the one thing
+that gate exists to stop, and shipping it half-done to get better typing would have been the trade
+running the wrong way.
+
+**Three things the work found about its own guards.**
+
+***A plant that reddened nothing, and it is the most useful of the four.*** Moving the cap check below
+the ring scan but **above** the `AlreadyMatched` return still answers `Refused` — the scan runs, the
+cost is paid, and no assertion anywhere can see it, **because a cost leaves no outcome behind.** The
+guard's doc now says which mis-placements it catches (below the `AlreadyMatched` return) and which it
+does not, and states that the ordering is held **by construction** — the check is the function's first
+statement — rather than by assertion. This is the weaker-than-its-comment register met head-on, and the
+remedy was not a cleverer assertion: it was writing down what the assertion actually holds.
+
+*An off-by-one that only a "the bound is reached" assertion can see.* Spelling the arm `>` instead of
+`>=` lets 65 waits arm against a stated 64. A `<=` check would pass; so would any assertion that merely
+counted refusals. Both guards assert that the count accepted **equals** the maximum the daemon's own
+refusal names — and the itest reads that maximum out of the refusal rather than hard-coding it, because
+a copy of `MAX_ARMED_WAITS` in the test file would be a second implementation of the thing under test,
+which is the shape §7.1 clause 2 forbids one surface over.
+
+*A guard whose first version named the wrong defect.* "The 65th is refused" and "a capped endpoint does
+not scan the ring anyway" were probed by one `replay: true` request, so deleting the cap reddened on
+the ring-ordering message. Split into two probes; each plant now reddens on its own defect's sentence.
+A guard that fails for a true reason that is not *the* reason costs the next reader the diagnosis.
+
+**Two measurement attempts produced nothing and are recorded so they are not repeated.** Driving the
+endpoint with `send` round trips never completed its payload inside a 60 s deadline in five of five
+rungs at load 10–26, and its CPU figures were dominated by the round trips rather than by the bytes.
+Arming the waits before `load` failed on its own precondition — there is no hub to arm on until the
+graph loads, and 16 MiB drains in 0.04 s. Neither shape's numbers are quoted anywhere.
+
+**Residual, and it is two measurements rather than two fixes.** The pattern's cost per byte is an
+uncapped factor and is the **dominant** one — `MAX_COMPILED_BYTES` bounds the regex *build* and nothing
+bounds match throughput, an 18× spread the caller chooses; and `tap.wait --replay` is a repeatable ring
+scan with no cap on the repetition, which item 64(a) bounded in its *concurrent* half only. Both were
+measured here for the first time and are carried as this item's stated residual. **This session filed
+no ledger number for either**, which is a gap a later session should close rather than re-derive.
+
+**Box discipline.** The whole lane ran on a box shared with other sessions, at load averages between
+3.6 and 31 on 20 cores; every figure above carries its load. Its workspace run ended with two failures
+**proven not to be this change** by reverting `daemon/src/tap.rs` and `daemon/src/daemon.rs` to HEAD in
+place (AGENTS §8's method; `git stash` deliberately not used): the OS-thread meta-gate, which was
+reporting the leash hoist from an unrelated lane (§3.138), and
+`p3_idle_cost::thirty_two_idle_tty_fds_stay_under_the_recorded_cpu_budget`, which read 0.2375 and
+0.2292 %/fd with the change and **0.2042 %/fd with it reverted**, at loads of 26.9, 28.1 and 30.0
+against a 0.1274 %/fd ceiling. That is the box, and it is exactly the axis §3.69 and `p3_firehose`'s own
+header record as moving 30× with load.
+
+### 3.136 A page with no handlers still had an interaction to lose
+
+Item 91 was filed by the web-console latency session with an explicit instruction: measure before
+choosing, and do not borrow §15.65's evidence. It also carried a piece of reasoning that had been
+checked rather than assumed — `graph.mjs` has no click handler, no button and no input, therefore no
+interaction can be lost there, therefore all that remains is wasted main-thread time on a page an
+operator watches rather than drives.
+
+***The check was right and the conclusion was wrong, and finding that out cost one measurement taken
+only because the item asked for it at a realistic size.*** Chained `map` graphs of 12, 48, 96 and 192
+nodes were stood up against a real daemon and driven with the §15.63 apparatus — a headless Chromium
+whose own `WebSocket` is wrapped by an init script, with the client's message handler bracketed by a
+listener registered in the constructor and one registered from a microtask (§3.115's working form). The
+CPU answer came out as the item predicted: **11.8 ms of main thread per snapshot at 48 nodes** (4.8 ms
+layout, 1.5 ms style recalculation, 1.3 ms script, plus paint), which at §10's 5 Hz is ~6 % of the main
+thread for as long as the page is open, 3.8 ms at 12 nodes and 25 ms at 192, linear in the graph, and
+**28 %** on the 48-node page under concurrent load. Real, unpleasant, and — on an unloaded box — not
+something anyone would file a report about.
+
+Then the question became what an operator can actually *do* on a page with no controls. There are
+exactly two things: hold a scroll position, and select text to copy. **The scroll was expected to be
+the casualty and is not**: 400 px held 10/10 across five repaints, because the removal and the
+re-insertion happen inside one task with no interleaved layout, so the scroll clamp never observes an
+empty box. Recorded as refuted (AGENTS §9). The selection is the casualty, and completely:
+
+```
+  48 nodes, 10 drags per row      correct at release    still there 1 s later
+  shipped, instant drag                 4/10                   0/10
+  shipped, held 400 ms                  0/10                   0/10
+  repaint suppressed (control)         10/10                  10/10
+```
+
+The control is the same running page with `#graphview`'s children frozen from the init script and
+everything else — the 5 Hz stream, the 1 Hz `dump` fetch, the rail — still live, so the loss is
+attributable to the repaint and not to the mouse path. **An operator could not copy a node address off
+the graph page.** That is §15.65's harm class — an interaction destroyed by a rebuild under the press —
+on the page whose freedom from it had been established by grepping for handlers. **A selection is an
+interaction that no handler mediates**, and no amount of reading the module would have found it;
+driving the page the way an operator drives it found it in one run. It is also not a large-graph effect:
+the unfixed page performs 18 DOM mutation records per six snapshots on the browser gate's own **two-node**
+fixture. The size mattered for the CPU story and not at all for this one.
+
+**The measurement then chose between the three candidates, which is what it was for.** Throttling the
+*render* to the `dump` fetch's 1 Hz divides the CPU by five and leaves the selection wiped once a second
+— the same unusable page, and it would have been the obvious "fix" from the CPU number alone.
+Reconciling the cards the way §15.65 reconciles the rail's rows is the thorough answer, and with the
+cheap answer in place there is nothing left for it to buy: an idle graph now costs **0** repaints per
+3 s window and a real graph change costs **1–2** (`disconnect` 2, `connect` 1–2, 3 of 3), which is human
+pace — and reconciliation trades a class of drift for its saving, §15.65 recording the badge
+transposition it introduced there. So the skip: serialize the model, repaint when it differs. That is
+sound rather than heuristic only because `render` is a pure function of the model (§15.35) — `graph.mjs`
+owns no state and reads nothing else — and it fails safe in one direction, an unstable serialization
+costing an extra repaint rather than a stale page. The condition additionally requires the pane to hold
+a child, so "skip" can never mean "leave it empty". Measured after: repaints per 10 s window
+**49 → 0**, Layout **463/863/327 ms → 0/0/0**, main thread **14.2/28.1/10.4 % → 5.6/5.5/2.5 %** (two
+binaries alternating on one loaded box); selections **0/10 → 10/10**; the skip's own cost 0.1 ms at 48
+nodes and 0.2 ms at 192.
+
+***And the unit guard was weaker than its own comment, which is known because the defect it names was
+planted.*** The test that holds the model's discrimination — every field the page draws must move it —
+compared each mutation to one shared base, and its waiter-count case moved the lock *holder* along with
+the waiter list. Dropping the waiter list from the model left it green. Rewritten as pairs differing in
+exactly one drawn field (holder pinned on both sides for the waiter case, `pty` → `log` for the type
+case, since both draw one target-facing endpoint), the same plant reddens it. This is an instance of
+that register created and caught inside one session, and the only thing that caught it was planting
+rather than re-reading.
+
+***The two browser guards this item is validated by are not in the tree, and that is the sharpest
+thing to record about it.*** They were written and proved fail-first against a binary with the repaint
+restored in place — 18 mutation records, and a selection that spilled from one address to a whole card,
+three runs of three — and each counts `state` notifications inside the very window it asserts over,
+because "zero DOM mutations" is also what a page with a dead socket reports, so without the counter the
+passing output would be identical to the not-running output. But `web/ui-tests/tests/graph-editor.spec.mjs`
+belonged to another lane, so they were returned as a **handoff hunk** rather than applied, and nothing
+applied them: measured at the end of the session, that file's only change is the `@device` tag §3.131's
+lane added, and Playwright's own `--list` reads the suite at **30** specs, not the 32 those two
+device-free specs would have made it.
+**What landed is the pair of unit tests on the pure model** — it carries every field the page draws, and
+no counter and no clock, the latter being what would silently return the page to five rebuilds a second
+with everything else green. **A fail-first proof taken against a file its author cannot write is a proof
+about a tree nobody committed**, which is §3.137's stale-binary hazard with the ownership boundary
+standing in for the build step. The item's own record should not be read as saying the browser suite
+holds this property; it does not, yet. And the positive control against
+the failure mode a skip can introduce was free: the suite already has a spec that disconnects an edge
+over the control socket and requires the graph page to flip to `waiting` and back off the live stream,
+and it passes with the skip in place. Checked and cleared while there: the editor view is not rebuilt
+per snapshot — `case "state"` reaches `renderView` only while the graph view shows, and so does
+`case "lock"`. Nothing was changed about `state` itself, per the item's instruction.
+
+### 3.137 One leash, three binaries, and a predicate that had never been asserted anywhere
+
+**The hoist, and the one place the item's own framing was wrong.** Plan §18 item 79 filed a third copy
+of §15.43's stdin-EOF watch: `daemon/src/lib.rs` and `web/src/main.rs` byte-for-byte — same loop, same
+`Interrupted`/`Err(_) => break` arms, same `"stdin-eof-watch"` thread name, same `tracing::info!`
+string, same `_idle_tx`/`idle_rx` held-sender idiom — with the double carrying "a third variant". It is
+now `serial_nexus_rpc::leash`, all three on it, −162/+42 across the callers. **But the double's variant
+was not a lesser third copy; it was the correct one.** The double is the only binary with two waiters on
+one EOF — `--exit-on-stdin-eof` and `client --hold-stdin-eof` — so it already had what the other two
+lacked: a process-wide `OnceLock` singleton, because two threads reading one stdin race for the bytes.
+The daemon and the console spawned a reader *per arming*. So the shared module keeps the double's shape
+and the other two moved onto it, which is the opposite of the direction the item implies; both of the
+double's `wait()` call sites are unchanged.
+
+**Three call sites, three runtime shapes, and a fourth crate that must not pay.** The daemon runs a
+current-thread tokio runtime, the console a `LocalSet` on one, the double no runtime at all — and
+`serial-nexus-ctl`, which also links `serial-nexus-rpc`, is deliberately runtime-free. Giving the crate
+even an *optional* `tokio` feature so the shared function could return a `oneshot::Receiver` was
+**declined with the cost stated**: cargo unifies features across a workspace build, so `ctl` would link
+tokio's sync module in every `--workspace` build. The module therefore exposes a blocking
+`StdinEof::wait()` and a `StdinEofSignal` future hand-rolled over `std::task` — about forty lines, no
+dependency, and `rpc/src/leash.rs` declares nothing at all beyond `std`, so a crate that links
+`serial-nexus-rpc` for its wire types pays nothing for a leash it does not arm. The home is item 51's
+precedent: `serial-nexus-rpc` is where the other cross-binary policy separate processes must agree on
+already lives. `serial-nexus-core` was rejected because the double depends on neither it nor the daemon;
+`serial-nexus-sys` by the reasoning `rpc/Cargo.toml` already records against `nix` — it would make the
+console link IOKit and CoreFoundation on macOS. The double gains one internal edge; `Cargo.lock` moves
+by one line.
+
+**The `_idle_tx` idiom is closed by deletion, not by sharing.** §15.43 clause 2's "leash off" arm was a
+one-shot sender held alive for the life of the `select!` so its receiver never resolved. It is
+`StdinEofSignal::never()` now — a future that *cannot* resolve. Strictly stronger, and not a tidiness
+point: the old shape's correctness rested on nobody dropping that sender, and a dropped
+`oneshot::Sender` resolves its receiver with `Err`, which a `select!` arm takes.
+
+***The finding worth more than the hoist: a predicate that had never been asserted in any of the three
+binaries.*** Item 59(d)'s lesson is that a hoist moves a predicate and nothing asserts it. Here the
+predicate was *older* than the hoist — that an **unleashed** process does not consume its own stdin —
+and nothing had ever asserted it. Measured, with an unarmed leash planted to drain stdin silently:
+`p8_web_leash` `2 passed; 0 failed`, `harness_contract` `9 passed; 0 failed`. **Invisible, because it
+changes no lifetime**, and the tree has a live consequence for it: the double's `transcript` mode stands
+where a codec child stands and its stdin *is* the daemon's envelope pipe (§7.6), which is the whole
+reason `--exit-on-stdin-eof` is refused there.
+
+**The instrument, and why it is not a proxy.** The process under test is handed a **512 KiB file** as
+its stdin and the harness reads the offset off its own `dup` of that descriptor: `dup` and `fork` share
+the open file *description*, the same POSIX sharing that makes a shell's `>>` work, so the offset the
+child moves is the offset the parent reads — observable from outside the process on both kernels with
+no instrumentation in the product. Calibrated against stand-in children before anything was written —
+read-to-EOF `524288`, one-byte read `1`, no read `0` — and then against a Rust child with the real
+loop: shipped `524288`, `Ok(_) => break` **`8192`**, which is `std`'s `StdinLock` buffer. That last pair
+is the whole point: **a leashed process planted with `Ok(_) => break` still exits**, so the "it stopped"
+assertion goes green and only the offset separates them. 512 KiB is 64× the buffer, so the
+discrimination does not rest on that buffer being any particular size.
+
+**Fail-first, four plants, all restored byte-identically (`md5sum -c`, seven files `OK`).** A single
+`Ok(_) => break` in the shared loop reddens `a_leashed_{daemon,web_console,double}_drains_its_stdin…` —
+a guard on each of the three sides from one defect, which is item 79's stated validation. `Ok(0) =>
+continue` additionally reddens
+`p8_web_leash::the_web_console_stops_when_its_supervisor_lets_go_of_the_pipe` and
+`harness_contract::a_sigkilled_test_process_leaves_no_daemon` (`daemon 3654411 outlived the SIGKILLed
+test process`) — which is what says the *pre-existing* callers are on the one implementation rather than
+agreeing with it. The unarmed-drain plant reddens the daemon and console unleashed arms only, correctly:
+the double does not route through `stdin_eof_signal`, so it got its own plant in `sim/src/main.rs::main`
+and reddened. The source gate was proven on **both** markers separately and in the *wrapped* spelling —
+the thread name split as `"stdin-eof-\` / `watch"`, the log line split mid-token as `--exit-on-\` /
+`stdin-eof:` — which a naive `contains` misses entirely, and which is why the matcher joins
+backslash-newline continuations before matching. Every copy this tree ever held wrapped those strings.
+Stated rather than implied: a fourth copy that renames its thread *and* rewords its log line escapes
+that gate; the two markers were chosen because they are the operator-visible ones — the name in `ps -L`,
+the line in the log — so a copy that changes both has already broken the thing the sharing exists to
+protect.
+
+***And a fail-first proof that measured the previous tree, for four minutes.*** Plant 1's first two runs
+read `7 passed; 0 failed`. `cargo test -p serial-nexus-itest` does not rebuild the plain
+`target/debug/<bin>` artifacts that `serial_nexus_itest::bin()` boots — the helper's own doc says so —
+and `ls -l --time-style=full-iso` put the three binaries at `11:48:11` against a plant made at
+`11:53:57`. Same class as §3.124's `--verify` and item 101's rule, one instrument over: **a proof that
+skips the build is a claim about the tree that was there before.** Every reading recorded here is from a
+run taken after `cargo build --workspace --locked` *and* after confirming the binary mtimes moved.
+
+**Two measurement notes about a busy shared box** (load average 1.7 → 29.9 throughout, 20 cores, other
+sessions building and testing the whole time). First: `meta_ledger` (2 tests) and `meta_skip_names` (1
+test) failed in the whole-workspace run and pass `27/0` and `4/0` alone — **a tree-scanning gate run
+while another process is rewriting the tree can go red for a reason that is in nobody's diff.** Second:
+`p3_idle_cost` read `0.1500 %/fd` against its `0.1274 %/fd` ceiling in that same run and is green 5 of 5
+alone at higher load — 28.94, 29.88, 26.80 captured, then `0.0625 %/fd` at load 21.64 and `0.0208 %/fd`
+at 16.29 with `--nocapture`. The first three printed no figure at all, because `cargo test` captures a
+passing test's stdout: §3.78's register, met again while chasing something else.
+
+### 3.138 A gate whose subject moved, and two plants of mine that proved nothing
+
+`meta_gates::the_daemon_starts_an_os_thread_only_in_the_supervisor_and_the_leash` went **red** when
+§3.137's hoist landed, and it went red for the right reason. §16.1 gives the daemon one boundary
+supervisor; the gate is an allowlist of the two sanctioned OS-thread starts in `daemon/src`, plus a
+second half asserting that **the allowlist is still reached** — *"or this gate passes because the scan
+found nothing at all rather than because it found the right things"*. Moving the leash to
+`rpc/src/leash.rs` left `daemon/src/lib.rs` an entry naming nothing, and the gate said so by name,
+printing the one start it did find.
+
+**Both halves are worth stating, because only one of them is loud.** The *reached* half went red, which
+looks like bookkeeping. The *stray* half went **quiet about the leash entirely** — the code had moved
+out from under the scan, so a second start landing beside it in `rpc/src` would have gone unnoticed
+while the whole gate still read as a §16.1 gate. **A gate whose subject moves must move with it, or its
+stray half goes silent about the thing while its anchor half goes red for what looks like a chore.** The
+loud half is what stops the quiet half being papered over with a one-line allowlist edit.
+
+**The repair, and it is stronger than the gate was.** The walk now covers `rpc/src` beside `daemon/src`,
+and the allowlist is a **per-crate pair** — `("daemon/src", "daemon/src/boundary.rs")`,
+`("rpc/src", "rpc/src/leash.rs")` — with each crate asserted to hold **exactly one** sanctioned start.
+The old flat list of two files was satisfiable by two starts in one file and none in the other. Each
+walk also carries its own file floor, because a walk that stops finds no strays.
+
+*This is the opposite of what the implementing lane proposed*, and the disagreement is recorded rather
+than smoothed: that lane deliberately declined to widen the walk, on the grounds that §16.1's subject is
+the daemon's boundary supervisor and `serial-nexus-rpc` holds no boundaries, so widening a §16.1 gate to
+a crate the section does not speak about is an amendment rather than a patch. The counter-argument that
+won is the *stray* half above: the gate's coverage is not §16.1's subject matter, it is the set of files
+a hand-rolled thread could be added to without anyone noticing, and the leash's new home is now one of
+them. The narrowing that lane wanted — a gate about `daemon/src` alone — is available and would have
+left `rpc/src` unwatched by anything, since `p13_stdin_eof_leash.rs`'s tree-wide source gate holds *one
+leash*, not *one thread*.
+
+**Fail-first, three plants, all restored byte-identically (md5 verified).** A stray `thread::spawn` in
+`rpc/src` — the newly walked tree, and the case the old gate could not have seen — reddens. A stray in
+`daemon/src` reddens. A **second** start inside the sanctioned file reddens on the exactly-one message,
+which the old flat list would have passed.
+
+***Two of my own plants were bad plants, and it is worth saying so because both failure modes are
+cheap to repeat.*** Renaming `thread::Builder` to `thread::BuilderX` still matched, because the gate's
+spelling list is matched as a **substring** — the plant did not remove the match, so a green run proved
+nothing about the matcher. And replacing the call with an undefined function broke compilation, so the
+gate never ran at all — and a test binary that does not build is not a test that passed or failed. **A
+plant that does not compile proves nothing; a plant that does not remove the match proves nothing.**
+Both look like a completed fail-first proof from the transcript, which is the whole hazard: the
+transcript records that a command was run, not that a stimulus arrived. §3.132 and §3.133 each hit a
+third variant of the same thing this session — a plant that silently failed to land — and the common
+remedy is the one §3.132 states: assert the stimulus, at the moment of measurement, in the same script
+that takes the reading.
+
+### 3.139 The mirror class: design prose that four ledger executions had left behind
+
+AGENTS §2 tracks **design-ahead-of-tree** surfaces by name and got the last one to zero on 2026-08-15.
+This session read the other direction — settled-system prose that a ledger item's *execution*
+falsified — and found four sites plus one decision-record entry, all in
+`docs/43-design-claude-fable-v17.md`, all corrected in place per AGENTS §5 with the §15 entry annotated
+rather than rewritten. **No gate in this tree can see this class, because nothing reads that document
+against plan §18.** Each site was verified against the code before editing; the brief was right on all
+four.
+
+**(a) The `exec` teardown floor, alive in three settled-system clauses nine days after item 21 closed
+it.** §5's teardown-ledger clause 9, §7.6 clause 8 and §8's codec-contract clause 14 each called
+`exec`'s `discarded_at_teardown` a **floor** with an open residual in the ledger. The tree says
+otherwise in four places: `daemon/src/nodes/mod.rs:302` ("Every kind's answer is now exact, `exec`'s
+included"), `exec.rs:385`'s `self.teardown_loss.watch(src_rx)`, `exec.rs:72-83`'s
+`FeedItem`/`TeardownBytes` impl charging the reserved MUX identity `0`, and
+`p13_teardown_accounting.rs:634`'s guard against `tests/ext-codec/deaf.py`. **The document was already
+contradicting itself and nobody read across the gap**: §8's fixture register, some 160 lines below
+clause 14 *in the same section*, described `deaf.py` as "what makes plan §18 item 21's guard measure a
+real quantity instead of a zero" while clause 14 called that same work an open residual. The correction
+keeps the floor rather than deleting it — it is the shape item 21 closed and this document values a
+superseded shape — and renames what actually survives: a **boundary**, not a floor, because bytes
+already in the child's stdin pipe are delivery exactly as bytes written to a device fd are.
+
+**(b) A clause that asserted a gate the tree had removed, and a causal claim measurement had already
+refuted.** §7.2 clause 12 called `p9_pty_collapse`'s anti-spin guard "the tree's sharpest known
+proxy-in-space: **it self-skips off Linux**", and predicted that a widened last-close predicate "would
+burn a core — and release operator-held write locks — on macOS with the suite green", filing the gap as
+open work. `p9_pty_collapse.rs` contains no `cfg(target_os` attribute at all; the only occurrence of
+that string in the file is the comment recording that the gate is gone. And item 12, executed
+2026-08-13, took the prediction on the platform it named: on Darwin the ungated `|| closed` arm reads
+**1.81/1.88/1.81 %** of a core against an unplanted **1.87/1.88/1.81 %** — identical bands, the plant
+moving nothing, matching the null Linux had already given. **A refuted causal claim was standing as
+normative prose in a settled section**, which is sharper than a stale citation: a reader reasoning from
+§7.2 would have reasoned from a mechanism neither kernel exhibits.
+
+**(c) An era record that named two current eras and closed neither.** §13's table read "the current era
+… open" on both `e79f5fcd86a2e5f0` and `4317ea5ac187f506`, and the older row named no bounding
+artifacts where all four of its siblings do. Three authorities said otherwise: §13's own era law clause
+1 two paragraphs above, `docs/doctor/README.md` in two places, and AGENTS §2. Closed from the committed
+artifacts rather than from memory — the six `2b44c17` rows at its opening and the `8c00078-dirty`
+Tier-3 triple at its close, an era-mate under clause 4 because items 14 and 22 moved `field_set` only —
+with the closer named as P16's arrival carrying P15's widened `question`, one boundary and two changes.
+**Two halves of that era are now unobtainable rather than owed** and the row says so: no Darwin capture
+was ever taken in it, and the closing triple has no passive counterpart. That is the cost
+`docs/doctor/README.md` already records for taking a rig capture and an instrument change in one
+session, and it belonged in the table too.
+
+**(d) A remainder discharged in one copy and not the other.** §13 clause 8's "the parity-mismatch and
+break-reception remainder is plan §18 item 17" appears near-verbatim at §15.21 — and *there* it is
+annotated with the 2026-08-15 answer. The body copy was not. **The tell for the whole class is in that
+pair: a document with two copies of a sentence gets one of them fixed, and the unfixed one is the one
+in the section a reader treats as the system.** Corrected with the measured answers only — `brk +1`
+with `frame +0`, parity **counted, not lost** (`+2` for a 43-byte payload arriving byte-exact) — and a
+pointer to §15.21's annotation rather than a second copy of it. Both those readings are `ftdi_sio` on
+Linux 7.0.0-29 on a cross-wired FT232R pair (item 17), and both guards self-skip off Linux on
+`ICOUNTS_SUPPORTED` — a real gap, Darwin having no equivalent input-error counter, and the scope was
+missing from the clause entirely before this pass.
+
+***Costing the gate found a fifth defect, which is the session's most useful result here.*** The
+obvious gate is citation-keyed: `meta_ledger` already parses plan §18's item states, so for every
+`plan §18 item NN` in the design's normative half, flag an open-work vocabulary near a citation the
+plan records executed. The population is **18 citations over 11 distinct items** — against item 96's
+937 tokens — and a ten-word list scored **3 flagged / 3 true positives / 0 false alarms** on the
+unfixed tree. **One of those three was not in the brief**, and is §3.141.
+
+**And the gate is nevertheless declined, on coverage rather than on noise.** It reaches **2 of this
+session's 6 corrected spots**. Three of them — §5 clause 9, §7.6 clause 8, §8 clause 14 — cite the
+ledger with no item number at all ("ledgered open work (plan §18)"), and the era row states its false
+claim in prose naming no item. **A citation-keyed gate is structurally blind to the sites that cite
+nothing, which is the population that grows.** Making it see them means first *banning the bare
+`plan §18` citation in normative prose* — a document-wide edit plus a standing constraint on every
+future clause, to catch a class an alignment pass already catches for free. Declined on item 96's
+grounds and re-openable on a second recurrence, with the three-true-positive yield recorded so a future
+filing starts from a number instead of an argument. Post-fix the same list flags 2, of which 1 is a true
+positive and 1 a false alarm on this pass's own new era-row prose ("unobtainable rather than **owed**").
+*Fail-first is not claimed for the declined gate;* those are its measured yields, not a proof.
+
+### 3.140 A repair that widened a claim's scope, in the one clause whose subject is the Linux/Darwin split
+
+**The first repair of §3.139 introduced a false kernel claim, of exactly the class it was cleaning up,
+and it landed in the one clause whose whole subject is the Linux/Darwin split.** Repairing §7.2 clause
+12 rested the pty last-close drain's justification on two legs — the collapsed-session write-lock leak
+and P6's `handler_reset_readable_bytes: 1` — and wrote the second as *"identical on both kernels"*.
+
+**Measured against the committed artifacts, which is what AGENTS §7 makes authoritative:** `1` in
+**72 of 72** Linux observations and `0` in **32 of 32** macOS ones, counted over every committed
+`docs/doctor/*.json` carrying the field. Current-era witnesses
+`docs/doctor/linux-7.0-2026-08-21-25d8ecd-tier3.json` (`25d8ecd39aed`, `probe_set`
+`4317ea5ac187f506`, 2026-08-21) and `docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3.json`
+(`b3461886e27a`, the same `probe_set`, 2026-08-13); the Linux 6.18 field report at `3e23c52` reads `1`
+too.
+
+**How the widening happened, and why no reading caught it.** Notes §3.96 and
+`itest/tests/p9_pty_collapse.rs` both say the reading is identical *"on 6.18"* / *"byte-identical on 7.0
+and 6.18"* — **a claim about two Linux kernels**. In this project "both kernels" means Linux and Darwin.
+The repair carried that sentence across the boundary **without changing a figure**, so there was nothing
+numerically wrong to notice; and it was verified against the in-tree comment rather than against the
+artifacts, so the check confirmed the error's own source. **Two rules, and they are the entry:**
+
+* **A repair that widens a claim's scope is a new claim and owes the evidence of one.** Editing prose
+  is not a lesser operation than writing it. The widening was invisible precisely because nothing in the
+  edit *looked* like a new assertion.
+* **An in-tree comment is not a citation.** It is a claim of the same kind as the sentence being
+  checked, and this tree has now found that particular one stale.
+
+**The tell was inside the clause.** Six lines below the new sentence it still read "P6 agreeing across
+Linux kernels remains measurement of the friendly platform". A clause that contradicts itself within one
+paragraph is the cheapest signal available, and it costs one read of the paragraph *as a whole* rather
+than as a sequence of sentences.
+
+**The corrected fact was load-bearing, not cosmetic.** With item 12's spin prediction already recorded
+as refuted (§3.139 (b)), the drain stood on exactly **two** legs and this was the second — and on Darwin
+it reads `0`. The mechanism is the probe's own: `handler_reset_extproc_retained` is `true` in **64 of
+64** Linux observations and `false` in **27 of 27** macOS ones; `set_baseline` returning `Ok` says the
+syscall was accepted, not that the pair carries `EXTPROC`, and `EXTPROC` gates `TIOCPKT_IOCTL` entirely
+— a kernel that drops it emits no control packet at all, which is why `handler_reset_applied: true`
+sits beside `handler_reset_readable_bytes: 0` on Darwin in every committed artifact, exactly as
+`doctor/src/probes.rs` says it does. **Darwin's `0` is not an inconvenience to scope around; it is the
+thing P6 exists to separate.** The clause now states the justification **per kernel**: on Linux
+load-bearing by measurement, on Darwin resting on the collapsed-session write-lock leak alone, with §7.2
+clause 4's `0x20`/`0x40` poll-only reading agreeing about that kernel from the other direction. Neither
+reading licenses deleting the drain (AGENTS §7's no-one-way-decision rule).
+
+**Two further scope defects came out of the same second pass**, both instances of the Status table's
+rule that a figure is quotable only with its scope. The 1.7–1.9 %-of-a-core CPU band was attributed to
+both kernels when plan §18 item 12 scopes it to **Darwin** in as many words, as does notes §3.96 —
+against a Linux cost recorded at the guard's own `MAX_CPU_NANOS` of **~10 ms in the same 2 s window,
+≈0.5 %**, three to four times lower; so the shared 10 % ceiling is ~20× the observed cost on the
+platform of record and ~5× it on Darwin, a wall rather than a tight bound on either. And §13 clause 8's
+`brk`/`frame`/`parity` counts were quoted with no scope at all, which §3.139 (d) now carries. A dangling
+citation went with them: the new annotation on §15.50 cited a plan item that did not exist.
+
+*Owed, and deliberately not fixed here:* `itest/tests/p9_pty_collapse.rs`'s comment still says
+"identical on both kernels" at the same two legs — the source the bad repair was verified against, and
+a file this pass did not own.
+
+### 3.141 Superseded prose left inline is live prose
+
+**The fifth site of §3.139's class, found by an instrument rather than by reading.** §7.1 clause 7
+carries a superseded per-mode status block. It says *"`xon-xoff` has no pre-check and no probe"* and
+*"that mode is **unmeasured rather than known-good**, named here and carried as open work (plan §18
+item 14)"*. **Both claims are false, and had been for eight days.**
+
+*There is a pre-check.* `flow_precheck_target` maps `FlowControl::XonXoff` to
+`serial_nexus_sys::FlowMode::XonXoff`, and the daemon's load path runs the result through
+`flow_precheck_refuses(honours_flow_control(&path, mode).ok())` — the same call `rts-cts` takes, with
+`.ok()` as clause 5's sanctioned *unmeasured* collapse. `honours_flow_control`'s `XonXoff` arm sets
+`IXON|IXOFF`, clears `CRTSCTS`, and requires **both** input flags on read-back because `serial2`
+compares the whole `c_iflag` word. *There is a probe.* P15 carries a `software_flow_control`
+observation block, landed at **item 14, which is EXECUTED** (2026-08-13; notes §3.89) — `c_iflag`
+`0x5` → `0x1405` on `ftdi_sio`, both ports
+(`docs/doctor/linux-7.0-2026-08-21-25d8ecd-tier3.json`, `25d8ecd39aed`, `probe_set`
+`4317ea5ac187f506`, 2026-08-21), against `0x0` → `0x0` with `tcsetattr_ok: true` on Darwin's
+`IOSerialFamily` (`docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3.json`, `b3461886e27a`, same
+`probe_set`, 2026-08-13). And **the mode is refused** where the driver drops it, per §15.61.
+
+**The repair is annotation, not rewriting** (AGENTS §5): the superseded block is set off as a
+quotation, verbatim, and the falsity is annotated beneath it with the code sites and the committed
+artifacts.
+
+***It is filed separately from §3.139 because the mechanism that found it is different, and that is the
+interesting fact about it.*** Those four sites were found by reading the clauses a ledger execution had
+falsified. This one survived **two close readings of §7.1** and was turned up by the gate-costing scan
+of §3.139 — an instrument with no idea which sentence was meant to be live, which is precisely why it
+read the stale half that careful reading had learned to skip.
+
+**The clause disagreed with itself twice over**: its own live text immediately above the quotation, and
+clause 6's parenthetical some twenty lines up, each already said all three things, and §15.61 states the
+refusal a third time. **The half a reader reaches last is the half that was wrong**, and a supersession
+marker that sits mid-paragraph is not a marker.
+
+***The rule this leaves: superseded prose left inline is live prose*** — set it off, or delete it. And a
+*partly* superseded block is the worst case of all: this one's `rts-cts` half is still accurate and
+carries citations the live text does not restate, which is exactly what kept earning the whole block a
+reader's trust.
+
+**And the repair's own first draft reproduced the defect from the other side**, within the same day: the
+new preamble said "nothing inside the quoted block below is current" and then contradicted itself in the
+next sentence. **A blanket disclaimer over a block whose halves differ makes them indistinguishable
+again**, which is the failure it was written to fix. That is recorded at the clause.
+
+*Owed, and named because it is the same sentence one entry over:* §15.53 — a **LIVE** entry — still
+reads "`xon-xoff` has no pre-check and no probe — **unmeasured, not known-good**, named here and filed
+(plan §18)". It is false in both halves for the reasons above, and it cites the ledger with **no item
+number**, which is exactly the population §3.139's declined gate is structurally blind to. Not repaired
+here; the design was another owner's file this session.
+
+### 3.142 A claim about an environment this project has never entered, replaced by the command that answers it there
+
+`packaging/serial-nexus-daemon.service` carried, beside `SupplementaryGroups=dialout`, the sentence
+*"If your distro uses `uucp` instead, change it here."* **Nothing in this project has ever booted a
+distro that does.** The `dialout` value is measured and its scope is recorded — `/dev/ttyUSB*` and
+`/dev/ttyACM*` are `root:dialout` mode 0660 on one box, one distro (Ubuntu, udev 259), across two
+drivers and two majors, `ftdi_sio` (188) and `cdc_acm` (166), both resolving through the same shipped
+udev rule (plan §18 item 78(a), 2026-08-16). The `uucp` half was a claim about somebody else's box, and
+it is the half an operator on somebody else's box would act on. That is why item 78 split it out as
+(b) rather than letting it ride on (a)'s evidence.
+
+**The remedy is the transferable part, and it is not "delete the sentence".** A claim about an
+environment this project has never entered can usually be replaced by **the command that answers it
+there**:
+
+```
+    stat -c '%G %a %n' /dev/ttyUSB* /dev/ttyACM*
+```
+
+On this box today that prints `dialout 660 /dev/ttyUSB0` and `dialout 660 /dev/ttyUSB1` (and an error
+for the `ttyACM*` glob, because the CDC-ACM pair of §3.112 is not attached — the command answers for
+whatever the reader actually has, which is the point). The measured scope of the `dialout` value moved
+into the comment beside the setting, `packaging/README.md`'s `SupplementaryGroups=` row keeps the
+evidence and its scope, and the unit no longer guesses at which name another distribution will have
+chosen. **An operator who needs the answer has it in one command; a guess at the name is worth less
+than that and is not checkable by anyone here.** `systemd-analyze verify
+packaging/serial-nexus-daemon.service` still exits 0.
+
+### 3.143 A retired gate's configuration, still asserting in the present tense
+
+`.shellcheckrc` sat in the repository root. **All four of its claims were false**, and it had been
+inert for a month:
+
+* It asserted, in the present tense, that *"shellcheck runs green across `scripts/` on every push"*.
+  **No lane runs shellcheck** — measured, zero hits across `.github/workflows/` and the whole tree
+  outside this file's own historical notes.
+* It explained `SC1091` by "every script sources `scripts/lib/*.sh` by a runtime-computed path". There
+  is no `scripts/lib/`; `scripts/` holds exactly one file, `bless`.
+* It explained `SC2164` by "the 41 call sites would only gain ceremony". There is one `cd` in the one
+  surviving script.
+* It cited "design §16.5" as its authority. §16.5's status line now reads *"the doctrine survives at
+  plan §3; the bash-specific gates retired with §16.11"* — a section that means something else than it
+  did when the file was written.
+
+**The dates make the shape plain.** The file was created at `7f097e0`, 2026-07-21, in the commit
+titled "Post-1.0 §9.4+§9.5: harness and CI hardening (design §16.5)" — the commit that *built* the gate
+it configures — and never touched again. The suite it configures was deleted at `563fb9c`, 2026-07-24
+(§16.11's own execution). **It was accurate for three days and false for the following twenty-eight.**
+
+***And it was invisible to the gate written to enforce exactly that retirement.***
+`meta_gates::no_shell_script_has_come_back` asserts two things: no `.sh` anywhere in the tree, and
+`scripts/` holding exactly what §16.11 says it holds. A root dotfile that is a shell linter's
+configuration is neither. **A gate that enforces "the suite is gone" by looking for the suite's *files*
+does not see the suite's *furniture*** — and furniture is what a later reader reconstructs the world
+from.
+
+**Disposition: deleted, not reinstated.** Adding a shellcheck lane to make the file's first sentence
+true would silently reverse §16.11's recorded retirement, which AGENTS §5 forbids: a declined or
+retired decision is overturned at its entry, with a reason, not by quietly satisfying its
+configuration.
+
+**Separately, `scripts/bless:89` carried a dead `blessed=` assignment** — SC2034, assigned and never
+expanded, present since `adec786` (2026-08-05) and dead since the script stopped inspecting
+`.snx-bin/` and started asking the tool. Removed, with a comment saying **why no path is spelled
+there**: `install --verify` owns that comparison and spells the installed path from the capability set
+it already knows, so a second spelling here would be the two-copies-that-must-agree shape one file over.
+A deletion with no note invites the next reader to add the line back.
+
+**Measured after**, on this box, 2026-08-21, shellcheck 0.10.0: `shellcheck scripts/bless` exits **0**
+with **no configuration file and no blanket disables at all** — a stronger statement than
+`.shellcheckrc` ever made, since its three suppressions were the reason it existed. One inline
+`# shellcheck disable=SC2034`-class suppression remains and is deliberate: `# shellcheck
+disable=SC2086` at the line that word-splits `$setcap_cmd` on purpose, with the reason written above
+it. That is a documented exception at its site rather than a policy file over a directory.
+
+***The residual is stated rather than taken silently.*** Whether `scripts/bless` should be linted in CI
+is **not decided here**. It is the one privileged-path script in the tree, which is an argument for
+linting it; adding a lane is a new gate *and* a reversal question against §16.11, which is an argument
+for deciding it deliberately. Left as an open question with the measurement attached — the script
+passes today — rather than as a lane nobody agreed to.
+
+### 3.144 What this session left in the tree, and what it left open
+
+**The suite: the closing figure is owed, and the plan's Status table is the authority for it.** What
+exists is an **intermediate** reading — **1120 passing · 0 failed · 7 ignored**, exit 0, at default CI
+scope, taken by the orchestrator against a tree that is not the one this session closes on — against a
+baseline of **1089 · 0 · 7** measured in the same session on the same box at `800915b`. Neither this
+entry nor any other prose in this document is the place that figure is quoted from; the Status table
+is, with its scope column, and whatever row stands there when the session lands supersedes the number
+written here.
+
+***The 1120 reading and the numbering gap below cannot both describe one tree, which is how the
+intermediate is dated.*** `parse_ledger`'s contiguity refusal is not new — `git show
+800915b:itest/tests/meta_ledger.rs` carries it byte-identical, so it predates this session — and on
+any tree whose §18 spells a head `113` while 109, 111 and 112 are unfiled, twelve of `meta_ledger`'s
+twenty-seven tests fail on that one refusal. Measured on the gapped document, 2026-08-21, before the
+repair below closed it: `cargo test --test meta_ledger` → **15 passed · 12 failed · 0 ignored**. A
+green, exit-0 workspace run therefore belongs to a §18 that was still contiguous when it was taken,
+which given this session's filings means one that ended at **108**, before 110 and 113 were appended
+over the gap. That is a deduction from the gate's own behaviour rather than a reading of a log, and
+it is offered as one.
+
+**So the +31 is not quotable yet either.** It is the distance between a baseline and an intermediate,
+and plan §3 rule 19 wants both ends of a delta measured in one session on the tree the delta is claimed
+for. What the delta *is not* is settled independently of its size, and the difference from §3.120's +37
+matters: product behaviour moved in four places this session — the pattern wait gained a stated
+occupancy maximum (§3.135), the browser console stopped repainting the graph page on every snapshot
+(§3.136), the privileged helper stopped execing anything (§3.127), and the stdin-EOF leash became one
+implementation with a strictly stronger unarmed arm (§3.137). **It was not decomposed per target**,
+which §3.120's session did do; a later session that wants a per-binary delta has to re-measure rather
+than subtract, and after this session it has to re-measure the total too.
+
+**Ledger numbering: an instruction to leave 109, 111, 112 and 114 unused, and the gate that refused
+it.** **The instruction was wrong, and this record's first draft wrote it up as benign** — *"nothing
+was lost and nothing was renumbered"* — which is true, and beside the point. plan §18's
+**Numbering** rule is append-only. `itest/tests/meta_ledger.rs`'s `parse_ledger` reads append-only
+as **contiguity**: the heads must run `1..=highest`, where `highest` is taken from the document with
+a looser matcher than the walker's own, precisely so that a lost tail cannot hide as a short parse
+that is contiguous over everything it did read. **A deliberate gap is bit-identical to a parser that
+dropped a head**, and the gate says so in the sentence it prints:
+
+```
+plan §18's item heads are not 1..=113 contiguous. The highest head number in the section is 113;
+the walker reached 110 head(s), missing [109, 111, 112]. The ledger is append-only (§18's
+**Numbering**), so a gap means the parser stopped or lost a head, never that an item was removed.
+```
+
+**That last clause is a premise the instruction falsified**, and the refusal is worth more than the
+premise: the gate does not have to be able to tell the two apart, because the rule it enforces makes
+only one of them possible. Twelve of twenty-seven tests took it — measured 2026-08-21, `cargo test
+--test meta_ledger` → 15 passed · 12 failed · 0 ignored, every failure the same panic.
+
+***The route out was three real items, not a widened parser.*** All three numbers had genuine
+unfiled loose ends behind them — found by this session's own inventory sweep and left unnumbered —
+and they are filed at **109** (executed: the operating manual's own stale headline claims), **111**
+and **112** (both open). **Their entries in plan §18 are their whole record**, deliberately: that
+repair lands after this entry's account of the session was written, and duplicating it here would
+create the second copy this session has spent two entries on. Measured across the repair on this
+box, 2026-08-21: **15 passed · 12 failed** of 27 with the gap, **24 passed · 3 failed** without it —
+so **nine of the twelve were never findings at all**, they were one refusal reaching the document
+through `parse_ledger` nine more times. The three that remain report subjects of their own, and plan
+§18's *Items 102–113* section header states them.
+
+**The cheap repair was available and is named here as declined.** Relaxing the check to *no head is
+repeated* — or to *contiguous over what was parsed* — would have gone green in a minute and would have
+deleted the one property that makes the gate worth having, which is that it cannot be argued with by
+whoever it is currently inconveniencing. That is the general form: **a gate that can be re-scoped by
+the party it blocks is a comment.** It happened to block this project's own orchestrator, which is the
+only reason the case is interesting; the correct response to being blocked by your own gate is the same
+as anyone else's.
+
+***Renumbering was never the alternative, and neither was the gap.*** A renumber invalidates every
+citation in the tree at once — §3.120's item 95 spent a session on that failure — which is exactly why
+the numbering rule is append-only in the first place. But append-only forbids **reuse**; it does not
+license **omission**, and reading the first as permission for the second is the whole of the error. The
+two are not on a scale with a gap in the middle: an appended number costs nothing, and this session had
+three things to append.
+
+**The fourth number in the instruction, 114, was never a gap at all.** Contiguity is measured against
+the highest head the document spells, so a number nobody has used yet is simply the next one and is
+invisible to the check. It is left for the concurrent lane filing against it, and this entry does not
+assume it exists.
+
+***Two failures in the final tree were plant residue from this session's own agents, and they are
+process facts rather than product defects.*** `itest/tests/p8_web_ui.rs` shipped `--grep "@devise"` — a
+fail-first plant of its own `@device` non-vacuity assertion (§3.131), left in place when that lane hit a
+usage limit mid-proof. `itest/tests/meta_gates.rs` carried an unformatted, clippy-failing
+`collapsible_if` from a half-finished edit. Both were repaired by hand and both are recorded plainly,
+because **a session that leaves plant residue in a committed tree is the hazard**, and it is the reason
+the whole suite was re-run rather than trusted. A plant is a deliberate defect; the only thing that
+separates it from a defect is that somebody removes it, and "somebody removes it" is not a property any
+gate in this tree asserts.
+
+**Still open, derived from plan §18's own entries** (which item 95 made the authority): **4-residual, 8,
+13(b), 15, 28, 31, 71, 73, 85, 111, 112** — eleven, against a ledger of 113 items. Everything else in
+1–113 is executed or closed as a recorded decline.
+
+***That list was derived by hand first, and then checked against the machine, and the two agree.***
+`meta_ledger.rs` derives it and holds AGENTS §2 to it — that gate is item 95's whole product — and
+it could not run while §18 had a hole in it, so the one summary this tree normally checks was
+re-read entry by entry against every declaration in §18, on this box, 2026-08-21, yielding the first
+nine of the eleven. Once items 109, 111 and 112 landed the gate ran again and printed its own
+derivation: `LEDGER 113 items, 11 open`, and *"the list AGENTS §2 should carry, in ledger order: 4,
+8, 13(b), 15, 28, 31, 71, 73, 85, 111, 112"* — the same nine plus the two the filings added. **The
+agreement is the only reason the hand-derived version is quotable at all**, and it is stated here
+rather than assumed, because a hand-kept copy of this list is exactly what item 95 was filed about.
+
+**Item 73 stays open**: no lane returned work on it, and its entry still reads `open` (S/M).
+*Recorded because it is this document's own subject:* while this record was being written, a
+concurrent lane began editing the four files item 73 names — `doctor/src/probes.rs`,
+`expectations/linux.jq`, `expectations/macos.jq` and `itest/tests/expectation_gates.rs` — so the
+working tree at the moment of writing is **not** the tree the 1120 figure describes. `cargo fmt
+--all --check` on it was red at that moment, inside that lane's own half-finished edit; re-measured
+after the edit settled, 2026-08-21, it exits **0**. That is §3.126's moving-tree hazard arriving in
+the record rather than in a measurement, and it cuts both ways: **a red reading of a moving tree
+expires exactly as fast as a green one**, and the first is the one a reader is tempted to leave
+standing because it sounds cautious. The honest handling is the same for both — name the tree each
+figure belongs to, and do not let a later state quietly re-scope an earlier reading, or an earlier
+one condemn a later.
+
+**Citations this session left dangling, none of which any gate catches.** The design entries for the
+armed-wait cap, the no-`exec` bound and the design-behind-tree class are §15.70, §15.71 and §15.72, and
+the code cites them correctly in `daemon/src/tap.rs`, `daemon/src/daemon.rs`,
+`itest/tests/p12_pattern_wait.rs` and most of `itest/tests/meta_gates.rs`. **Five** citations do not
+agree with that assignment. *The count is itself a correction:* this passage said **four** and then
+enumerated five, in a session whose subject is inventories that do not survive being counted. Measured
+2026-08-21 by grepping every `§15.7N` in `.rs`, `.js` and `.mjs` — 15 citations in code, 5 of them
+misassigned — with line numbers as of that reading:
+
+* `web/src/assets/app.js` (lines 97 and 304) and `web/src/assets/graph.test.mjs` (line 105) cite
+  **§15.70** for item 91's repaint skip — three sites. §15.70 is the armed-wait cap. Item 91 has **no
+  §15 entry at all** yet, and neither does item 79's leash hoist. Grepping the design for `item 91`
+  finds §15.70's own citation note, which points back at the plan, and one mention inside §15.72's
+  argument about a citation gate — no entry. `item 79` returns nothing at all.
+* `itest/tests/meta_gates.rs` cites **§15.70** twice, at lines 2544 and 2825, for item 104, where the
+  assignment is §15.71 — two sites. The same file cites §15.71 correctly at **nine** other lines in the
+  same reading, which is why reading the file does not catch these two: the wrong number is
+  outnumbered nine to two by the right one, in the same vocabulary, a few hundred lines apart.
+
+None of these is a product defect and none is reachable by a gate — the citation gate covers `§3.NN`
+only. They are exactly the class §3.139 declined to build a gate for, arriving in `.rs` and `.mjs`
+instead of in prose, which is worth knowing before that decline is re-litigated.
+
+**Three other things are owed and are named at their entries rather than here:** item 91's two browser
+guards, written and fail-first proven but **never applied** to the file that would hold them, so the
+Playwright suite does not carry that property and the item's record must not be read as saying it does
+(§3.136); the pattern wait's two remaining uncapped factors, measured for the first time in §3.135 and
+carrying no ledger number; and §15.53's `xon-xoff` sentence, false in both halves and citing the ledger
+with no item number (§3.141). None of the three is a defect this session created; all three are defects
+this session **measured** and did not close, which is a different thing from an oversight and is
+written down here so it does not become one.
+
+### 3.145 An exit status answers "did it pass", never "under what policy"
+
+***The fourth round in this session where a repair introduced a false claim while fixing a true one,
+and this one is the orchestrator's own.*** Four is the orchestrator's count and is recorded on its
+authority; §3.140 is this record's fullest write-up of the shape, and what is measured below is the
+fourth instance. It is here for the reason the other three are: the discipline is not a property of
+which agent happens to be holding the pen.
+
+**The claim.** Item 110 deleted `.shellcheckrc` — a retired gate's configuration, still asserting in
+the present tense (§3.143) — and recorded beside the deletion: *"`shellcheck scripts/bless` exits **0
+with zero disables** — a stronger statement than the configuration ever made, and one that needed the
+dead assignment gone to be true."* It stands at plan §18 item 110's *Measured after* clause.
+
+**Measured on this box, 2026-08-21, ShellCheck 0.10.0, with no `.shellcheckrc` in the repository root
+and none in `$HOME`:**
+
+* `shellcheck scripts/bless` → exit **0**, and no output at all. **True, and still true.**
+* `grep -n 'shellcheck disable' scripts/bless` → **one** hit. `scripts/bless:179`, `# shellcheck
+  disable=SC2086`, sitting above `set -- $setcap_cmd` with a two-line comment saying why the word
+  splitting is deliberate.
+* The same script with that one directive deleted, on a copy outside the tree → shellcheck exits **1**,
+  `SC2086 (info)` at that line.
+
+**So the exit status was bought by the disable**, and *zero disables* is false by the one directive
+that decides the reading. Nothing about the deletion is wrong; the sentence written about it is.
+
+***The disable is not residue of the file that was deleted, which is what makes the error survivable
+by inspection.*** `.shellcheckrc` disabled exactly `SC1091,SC2164,SC2329` — none of them SC2086 —
+and the inline directive has been in the script since `84d7e82`, 2026-08-12, nine days before the
+configuration went. **The deletion removed a blanket policy over three codes; the claim written
+about it was about a fourth code the policy never mentioned.** A reader checking the sentence against
+what the deletion actually did would have confirmed it, and still been wrong.
+
+**How the check passed.** The claim was verified the way this project verifies claims: by running the
+command and reading its exit status. That half was true and is the half that was checked. **An exit
+status is a verdict *under* a policy, and it cannot report the policy.** Every linter, compiler and
+test runner in this tree honours in-file suppressions, and a green run is silent about every one of
+them by design — the suppression's whole job is to make the tool say nothing. The rule:
+
+> **An exit status answers "did it pass", never "under what policy" — and the second is the half a
+> disable lives in.**
+
+**The command that answers the second half** is a grep for the tool's own suppression vocabulary,
+plus its configuration files: `# shellcheck disable=`, `#[allow(…)]` and `#![allow(…)]`,
+`#[ignore]`, a `#[cfg(…)]` wrapped around a test, `// eslint-disable`. Its cousin is AGENTS §3's
+tell for a gate that asserts nothing — `jq` without `-e` exits 0 whatever it read — and the two meet
+here: **both are an exit status that is silent about the terms it was earned on**, one because a
+directive removed a finding, the other because the invocation never asked for one. The strongest
+form is to **delete each suppression and watch the tool go red** — fail-first proof aimed at the
+*policy* rather than at the code, and the thing that separates a deliberate exception from an
+inherited one. It cost one `grep` and one `sed` here, against a one-file directory.
+
+***The same measurement was written down twice in one session and the two copies disagree.***
+§3.143, two entries earlier, has it right — *"exits 0 with no configuration file and no blanket
+disables at all"* — and then names the exception at its line: the inline SC2086 at the statement
+that word-splits `$setcap_cmd` on purpose, with the reason written above it. **`blanket` is the
+whole difference between the two sentences.** Plan §18 item 110 has it as *zero disables*. Two
+records of one reading, one document apart, differing by the clause that makes one of them false,
+and nothing in this tree compares them: it is the two-copies-that-must-agree shape §7.1 clause 2
+forbids in the product, arriving in the record instead. **The narrower record is the correct one,
+and it is correct because it named its exception rather than rounding it off** — which is the
+cheapest available tell for this class, since a claim that has no exceptions at all is rarer than a
+claim written by someone who did not look for them.
+
+*Not repaired here.* The clause lives in `docs/44-implementation-plan-claude-fable-v17.md`, which this
+pass does not own. It is **owed**, and it is one clause: *zero disables* → *one inline `# shellcheck
+disable=SC2086` at `scripts/bless:179`, with its reason written above it, and no configuration file*.
+Whether `scripts/bless` should be linted in CI at all stays exactly where §3.143 left it — a stated
+open question, not decided by this correction either, and not reopened by it.
+
+### 3.146 Item 73: the cross-check had to compare the fate-deciding readings, not the predicate's rule
+
+Executed 2026-08-21 on the §3.118/§3.120 FT232R fixture — `BH00L4KU` ↔ `BH00LW9U`, P5 reading
+verbatim `5-wire crossover: RTS/CTS both ways, DTR moves nothing`, all six DTR crossings `false`.
+Same bench, same cabling, re-read: **not** a new cabling, so item 28 stays blocked on the fifth and
+this session adds no sixth.
+
+`SoftFlowReadback` gained `shipped_predicate_agrees`, computed from
+`serial_nexus_sys::honours_flow_control(path, FlowMode::XonXoff)` — the predicate `load` has
+consulted since §15.61 — against the arm `FlowOutcome::classify` gives the read-back P15 takes by
+hand. It rides in the `software_flow_control` object beside the hardware mode's own cross-check —
+the one item 56 is the precedent for — and both expectation files gained the clause in the same
+edit.
+
+***The one decision worth the entry is which by-hand reading the comparison is made against, and
+the obvious answer would have made the field agree by construction.*** `honours_flow_control`'s
+`XonXoff` arm answers on `contains(IXON | IXOFF)`, a **subset** test. Classify the probe's side from
+its own `ixon`/`ixoff` cells and the two implementations are reading the same bits by the same rule:
+the field reports `true` forever, passes every test written for it, and is item 56 one mode over —
+a cross-check that found agreement because it compared the halves that could not differ. The shipped
+version classifies from `iflag_matches_request`, the **whole `c_iflag` word**, which is `serial2`'s
+own comparison and the cell the probe already called the one that decides the node's fate. A driver
+honouring both flags while perturbing a third `c_iflag` bit then gets `Honoured` from the predicate
+and `serial2_readback_would_fault: true` from the probe, which is the divergence the item predicted.
+
+**A bound, stated because a cross-check that overclaims is the defect it exists to prevent.** The
+field cannot see a drift in the **request**. The probe compares its read-back against its *own*
+`want`, so two implementations that came to ask for different flag sets would both answer `Honoured`
+and agree. What it sees is a drift in the *answer*. This was checked rather than assumed: a plant
+that changed the probe's request produced no disagreement on this bench, which is why the hardware
+plant had to simulate a driver instead.
+
+**The hardware plant plants the driver, not the conclusion.** No box in this record perturbs a third
+`c_iflag` bit, so the item's ready-made divergence cannot be produced by any cabling here, and
+planting `shipped_predicate_agrees: false` directly would have proven nothing about whether the
+cells that produce it can co-exist. So `IGNCR` was inserted into the word fed to
+`iflag_matches_request`, `ixon`/`ixoff` were left coming from the real read-back and
+`honours_flow_control` was left answering honestly from the real port. Both ports then read
+`ixon_on_readback`/`ixoff_on_readback` `true`, `serial2_readback_would_fault: true`,
+`software_flow_control.shipped_predicate_agrees: false` — and top-level `shipped_predicate_agrees:`
+**`true`**, the hardware cross-check seeing nothing. *That last cell is the item's whole thesis,
+printed by an instrument on real hardware.* `baseline_restored: true` throughout, so the extra
+predicate open strands no adapter.
+
+**The best fail-first proof in the set needed no plant.** The pre-change capture — same bench, the
+binary as it stood before the change, an hour earlier — fails the finished jq clause (`jq -e` exit 1)
+while the post-change capture passes (exit 0). A real report of the unfixed tree reddening a new gate
+beats any mutation.
+
+**Two worries the item carried, both answered by measurement rather than by drafting around them.**
+(i) *Do the committed captures, which predate the key, force the clause to be tolerant?* No — the
+expectation files are executed in exactly three places, and they were enumerated rather than
+recalled: the `doctor` job's `Capability report` step, the `macos` job's `Capability report +
+macos.jq gate`, and `itest/tests/expectation_gates.rs`, which always runs the doctor fresh. **No
+committed artifact is ever gated by them.** (ii) *The era.* `field_set` moves
+`64eb252e565113b2` → `f18630922c4eecc7`; `probe_set` is unchanged at `4317ea5ac187f506`, so **no era
+closes** (§13's era law clause 4). Both ends were taken on this tree, on this bench, in this session,
+and the delta decomposes with nothing left over: 571 → 573 leaf paths by the digest's own field-path
+extraction, the two added being `P15.<port>.software_flow_control.shipped_predicate_agrees` for each
+named port, none removed.
+
+***No delta is derivable against the committed `25d8ecd` row*** (`29e4071d23e8b474`), and the first
+reason written down for that was fabricated. The record said that row "also carries a
+`recheck.refill_reproduced_total` this run did not produce"; parsed, **both** artifacts carry it, at
+the same two leaf paths under P10. The true reasons are that the two runs are at different commits
+and that they **named their ports differently** — `/dev/ttyUSB0`/`ttyUSB1` against the
+`/dev/serial/by-id/…` symlinks for the same two adapters — and the digest keys every P5/P11/P15 leaf
+path by the string it was handed, so the raw path-set difference is dominated by renamings. Rewrite
+each port string to a common name and the residue is exactly the two new cells. The commit
+difference alone would have sufficed; the fabrication is recorded here rather than deleted, because
+it is this session's standing shape once more — a repair introducing a false claim while fixing a
+true one (§3.140, §3.145).
+
+**A second correction from the same pass: the verdict cleared and refused the same port.**
+`p15_soft_note` counted `honoured` as `rows − dropped − refused − unmeasured`, which includes a port
+whose software cross-check disagreed — so the sentence that *clears* a port printed in the same
+paragraph as "Neither reading can be trusted until they are reconciled". The count is now split into
+cleared and disputed, the clearing sentence prints only for the cleared, and a disputed port gets a
+sentence saying its read-back is **not** a clearance. The guard for it pins the committed capture's
+own P15 sentence, so the split cannot silently invalidate the artifact item 73 was executed against.
+
+**And the decision itself is now guarded rather than inlined.** The comparison was extracted into
+`p15_fill_soft_cross_check`, taking the shipped predicate as a closure so the **production body** is
+drivable from a unit test with no serial port.
+`p15s_software_cross_check_compares_the_fate_deciding_readings` drives it with a row where the two
+rules genuinely disagree and pins that they do — replacing `iflag_matches_request` with the mirroring
+reading compiles and leaves every doctor test green, which is why the fixture asserts the separation
+rather than assuming it.
+
+***A finding this work turned up and did not fix, because fixing it is a policy move.***
+`honours_flow_control`'s doc says the question it answers is whether the node's own open would fault
+and that `serial2` compares the whole `c_iflag` word by read-back — and its `XonXoff` arm implements
+a subset test. That is AGENTS §3's weaker-than-its-comment register **in the shipped predicate rather
+than in a gate**. Item 73 makes an instance *detectable*; making it impossible means widening the
+predicate, which changes which configs `load` refuses and belongs to §15.53/§15.61. Filed, not
+smuggled in.
+
+**A process note, recorded because it nearly cost another lane its work.** Three agents were editing
+this tree and one of them was editing `doctor/src/probes.rs`. Restoring a plant by whole-file `cp` —
+this record's own documented technique (AGENTS §8) — is a **clobber** in that situation: the pristine
+copy predates the other party's write and the restore deletes it. It was caught by `md5sum -c`
+failing against that copy while the foreign symbols were present in the live file. The narrow rule:
+**with a concurrent writer, revert a plant by a targeted edit that removes exactly what was added,
+and verify by grep that both the plant is gone and the other party's work is still there.**
+
+### 3.147 Item 85: the state a read-back cannot see, and an instrument that did not generalise
+
+Executed 2026-08-21 on the same FT232R fixture as §3.146, Linux 7.0, `ftdi_sio`. **The decision was
+the maintainer's and no product behaviour moved:** §7.1 clause 2's pre-check decides whether the
+driver **accepts** a setting, never whether the wire **honours** it; a port reporting `Honoured` may
+still be inert; `load`/`add-node` are unchanged and no refusal was added. The item's banned answer —
+widening the refusal to a driver by name — was not taken, and no driver name appears in the change.
+What moved is the doctor, because it is the only instrument in this tree that holds both ends of a
+certified cable.
+
+P15's per-port observation gained a `wire_flow_control` sibling of `software_flow_control`. On a pair
+P5 has certified as carrying RTS/CTS both ways, it transmits with `CRTSCTS` on while the peer holds
+RTS low and counts **what the peer receives**; raises the peer's RTS and counts again; then runs two
+controls on the same wire — the flag off with the peer still not ready, and the flag on with the peer
+ready. Six words come out (`gated` / `partly-gated` / `inert` / `gated-then-lost` / `no-cts-path` /
+`unmeasurable`), with `honoured_on_the_wire` `true`/`false`/**`null`**, the two null arms reserved
+for readings that are about the bench rather than the driver.
+
+***The transferable finding is not the reading. It is what happened to the instrument the item was
+filed with.*** Item 85's evidence was a 2×2 that counted bytes the **writer** got rid of — peer RTS
+low/high × `CRTSCTS` on/off — reading 44672 in all four cells on the §15.62 CDC-ACM bench. Run at
+1024 bytes on a bench where flow control demonstrably works, *that same instrument reads 1024 in
+every cell*: `ftdi_sio` accepts the whole payload whether or not the transmitter will ever send it.
+The separation is real but appears only above a buffer depth that differs per driver and is published
+nowhere — on this bench at 65536 bytes it reads 4608 accepted under backpressure against 27648 with
+the flag off, 2 of 2, and (27648 − 4608)/2 s = 11520 B/s, exactly 115200 8N1's line rate, so the
+arithmetic closes. **§15.62's conclusion survives** — 44672 is above that bench's depth — **but its
+instrument does not**, and had this session copied it at a smaller payload it would have certified an
+inert bench as functional. The lesson is one register of AGENTS §9's proxy rule this record had not
+spelled: *acceptance is a proxy for transmission, and a proxy's discrimination can be payload-
+dependent even when the property is not.* The shipped cell counts what the peer **receives**, which
+has no such threshold, and carries the acceptance count beside it so the two can be read against each
+other.
+
+**The second finding is where the honest answer lives on a bench that cannot be asked.** The
+instrument's own stimulus control — does the transmitter's CTS follow the peer's RTS at both levels?
+— is ordered *first*, before any comparison. Proven on the bench: with the stimulus withheld, the
+gated cell delivers **1024 bytes, byte-for-byte the number that reads `inert` when the stimulus
+arrived**, and the reading is `no-cts-path` with `honoured_on_the_wire: null`. A 3-wire rig is §5's
+own stated assumption and a CDC stack manufactures the bit (§15.62, §15.68, §15.69 clause 1); on
+both, a transmitter that does not stall is what an **honest** driver does. Calling that `inert` is
+§15.69 clause 1's harm — blaming a driver for a cable — reappearing one instrument over, in the same
+session that repaired it in P5's own sentence (§3.121). Same mistake, nouns swapped, which is why the
+guard is a check and not a comment.
+
+***A `gated` reading now means zero bytes crossed, not few — and the threshold that stood was the
+weaker-than-its-comment register again.*** `WireReading::PartlyGated`'s doc said *"Some of the
+payload crossed anyway"* while the fold admitted up to a quarter of it. Measured on the unfixed tree
+across the ladder 0/1/8/64/128/200/255 of 1024 with both controls at 1024: **every rung read `gated`
+with `honoured_on_the_wire: true`, and 256 was the first to flip**; 768 was the first `inert`. The
+rule is now one byte, in the code, the enum doc and the reported sentence alike: the peer lowers RTS
+*before* the write begins, so nothing is in flight and every byte that arrives is traffic the peer
+has just said it has no room for. After: 0 reads `gated`; 1 through 767 read `partly-gated`; 768 and
+1024 read `inert`. The hardware of record needs no tolerance to pass it, and since §7.1 clause 2
+refuses nothing on this cell, **a stricter word can change a report sentence and never a lane**.
+
+**The release is now read for content, not for length.** A release of the right size carrying the
+wrong bytes was indistinguishable from a clean one, because the check was a count. `released_intact`
+compares the released bytes against the payload's own continuation from the offset the gated cell
+stopped at, a `gated-then-lost` arm covers the failure, and both expectation files require it. The
+old sentence — "the release proves the bytes were deferred rather than dropped" — was a claim about
+bytes resting on a `Vec::len()`.
+
+**Era.** `probe_set` is unchanged at `4317ea5ac187f506` throughout; P15's `question` string was
+deliberately **not** widened, because widening it is a `probe_set` move and would close an era for a
+wording change (§15.59's first step, repeated on purpose). The verdict *status* therefore does not
+move on the wire reading either; the finding rides in the observations, where a gate reads it, and in
+the consequence prose, where an operator does. `field_set` moves twice in this session's item-85
+work: `f18630922c4eecc7` → `9a75a9f83a83a617` as the wire cell lands (24 new `wire_flow_control.*`
+leaf paths, nothing removed), and → `b73dba8f32301a84` as `released_intact` joins it. **No era
+closes** (§13's era law clause 4), and a *passive* run's digest does not move at all, since P15 skips
+with no observations.
+
+***Four different trees in this session stamp the identical commit string, and only the digest tells
+them apart.*** `800915bf4078-dirty` is the `build.commit` of all four of this session's rig captures
+— the pre-change one, item 73's, item 85's wire one, and the one carrying `released_intact` — because
+the `-dirty` suffix `doctor/build.rs` writes for an uncommitted tree says nothing about *which*
+uncommitted tree. `field_set` — `64eb252e565113b2`, `f18630922c4eecc7`, `9a75a9f83a83a617`,
+`b73dba8f32301a84`, verified by reading `.build` out of each artifact — is the only field that
+separates them. **Citing a `-dirty` artifact by its commit alone names four different trees.**
+
+***The bound on the reading, stated plainly because the first draft overstated it and the
+overstatement was a citation to a file that does not exist.*** **Exactly one arm has been read off
+hardware: the FT232R's `gated`.** `inert`, `partly-gated`, `gated-then-lost`, `no-cts-path` and
+`unmeasurable` have executed under fixtures and on no bench. A doc comment cited "the CDC-ACM
+capture's `inert`" as the other half of the discrimination pair; `grep -l wire_flow_control
+docs/doctor/*.json` returns exactly three files, all FT232R, all reading `gated`, and **no CDC-ACM
+artifact carries a `wire_flow_control` block at all** — those captures are 2026-08-16/17, before the
+cell existed. §15.62's inert finding is real and was taken with that session's bespoke 2×2; it is not
+a capture of this instrument. A second fabricated citation in the same file named a date,
+`2026-08-22`, that had not happened. **Both were caught by an adversarial pass running `ls`, not by
+reading** — the standing shape of this session, and §3.140's and §3.145's class arriving in a doc
+comment rather than in a document.
+
+**A gate that tolerates absence needs a second gate that does not, and the first candidate was not
+one.** `expectations/*.jq` admits a P15 row with no `wire_flow_control`, because `docs/doctor/` holds
+frozen artifacts that predate the key. That tolerance is a hole unless the **emitter** is pinned, and
+the test named as the pin — `every_p15_row_carries_a_wire_cell_whatever_it_could_measure` — builds a
+reading by hand and asserts what the serialiser does with it. Planting `return;` at the top of
+`p15_attach_wire_readings` left it, and the whole doctor binary, green at 112 of 112.
+`p15_attaches_every_wire_cell_by_running_the_measurement` is the pin: it calls the function for all
+four dispositions reachable without a peer and requires the emitted JSON to **differ** from the
+not-running JSON it constructs, with the certified-crossing arm driven through unopenable paths so it
+comes back carrying that open's error — the one thing an early `return` cannot produce.
+
+***What is owed, and it is a live trap for whoever commits this session.*** The three artifacts
+`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json` carry the six `gated`
+readings quoted above (0 of 1024 delivered under backpressure, 1024 on release, both directions,
+three captures) and **fail the current `expectations/linux.jq`** — `jq -e` exits 1 on all three,
+measured, because they predate `released_intact`. That is the ordinary state of a frozen artifact and
+breaks no lane, but **no sentence anywhere may say those three pass the current expectation file**,
+and they are untracked as this entry is written: AGENTS §7 wants a *committed* report behind a kernel
+claim, so they must land in the same commit as the prose that cites them. Replacement captures taken
+with the repaired binary, passing `jq -e` with exit 0, exist and were measured; adopting them instead
+means updating the three citation sites in `doctor/src/probes.rs` that name the originals.
+
+### 3.148 Item 31: the recipes executed, two sandboxes that proved nothing, and a class nobody flipped
+
+Item 31's remainder was the four rows of `packaging/README.md` that describe recipes nothing in this
+tree had run. The maintainer's routing was to extend the existing CI root arm — item 68's arm, whose
+shape took five successive probe defects to get right — so `itest/tests/p8_packaging.rs` gained
+**six** checks. It stands at thirteen: `800915b` carries six, §3.132's evidence-row gate is the
+seventh, and item 31 added the rest — two that need no privilege (a parser that reads the
+socket-group recipe out of the shipped unit and holds its halves to each other and to the unit
+around them, and a
+`systemd-analyze verify` of the unit an operator following that block would end up with) and **four
+root-gated probes** that run the block's own `groupadd`/`useradd`, measure the `SupplementaryGroups=`
+arrangement against the static one as a *pair*, start the real daemon inside the packaged sandbox,
+and walk the upgrade section's root `cp` step by step. `.github/workflows/ci.yml` gained the build
+step they need — the probes exec the plain artifacts, which `cargo test` never builds — and a pair of
+conditions applying §3.77's recorded lesson to the one job that had never had it: the root arm keys
+on the **build's** outcome, so a red unprivileged gate can no longer hide it.
+
+***The four root probes have executed nowhere, and this entry is not going to imply otherwise.***
+This box has no passwordless sudo — measured, `sudo -n true` → `sudo: interactive authentication is
+required`, exit 1 — and the rootless fallback is closed too (`unshare --mount --map-root-user` →
+`write failed /proc/self/uid_map: Operation not permitted`). Their first run is CI's `packaging` job.
+**Item 31 therefore stays open, and its remainder is one green root-arm run plus four one-line class
+edits.** The README rows read `measured (…)` for the halves that are measured and `unverified (…)`
+for what those probes will show, each naming its guard and saying the arm has not yet run it. Citing
+a run that has not happened is the same defect as a measurement nobody took, and item 31's own
+sequencing — land self-skipping, flip after a green run — is the precedent.
+
+***The first trap nearly became a false `measured`, and it is a sandbox wearing AGENTS §3's tell.***
+The daemon-under-the-sandbox claim looks answerable without root, through a user manager. Run that
+way with sixteen of the unit's nineteen hardening directives, `systemd-run --user` reported
+`Finished with result: success`: the daemon bound its socket, allocated a pty, answered `state`, and
+exited 0. **It proved nothing.** A control read `wc -l < /proc/self/mountinfo` = **53 inside the unit
+and 53 on the host**, `/tmp` was the host's, `/home` was visible — the manager had built no mount
+namespace, so `ProtectHome=`, `PrivateTmp=` and `ProtectSystem=` were applied as **silent no-ops**.
+Three directives *do* fail loudly there — `ProtectKernelModules=`, `ProtectKernelLogs=` and
+`ProtectClock=`, each `218/CAPABILITIES`, re-measured one at a time rather than inherited — and that
+is exactly what made the silence of the other sixteen easy to miss. **No cause is claimed**:
+`unshare -U true` succeeds on the host and was refused inside the unit, and the user journal carried
+no diagnostic. The reading is recorded, the mechanism is not. **A sandbox that did not apply and one
+that applied cleanly produce the same green**, which is §3's tell with the subject changed from a
+gate to a sandbox, and the readings are written into `packaging/README.md` as *refuted evidence*
+rather than dropped.
+
+**The anti-vacuity reading the probe first took was itself vacuous, and the repair is a positive
+control rather than a better inference.** `home_entries == 0` under `ProtectHome=yes` was to be the
+proof; `ls /home 2>/dev/null | wc -l` prints 0 for an empty `/home` **and for no `/home` at all**
+(both measured; this box's real `/home` reads 2). So `run_probe` now plants `/tmp/<tag>.sentinel` on
+the host immediately before starting the unit and the payload must report it **`hidden`**, with
+`home_entries` demoted to corroboration. The negative arm is measured here — the `--user` unit above
+reads `tmp_sentinel=visible`, and adding `PrivateUsers=yes` changes neither reading. The **passing**
+arm has been measured on no machine anywhere, and the first green root-arm run should be read as its
+real fail-first proof: if it comes back `visible`, that is a finding about the runner, not a probe
+defect.
+
+***The second trap is the same mistake in different clothes, and no amount of reading the code would
+have shown it.*** The generated probe payload was dumped from the real function and executed under
+`/bin/sh` with only its path prefixes redirected. It printed `nodes=` — empty — because
+`serial-nexus-ctl --json state` is pretty-printed and the payload's `grep -o '"name":"[^"]*"'`
+assumed it was not. All three daemon-bearing probes would have failed on CI for a reason that was
+never about packaging. Piping through `tr -d ' \n'` first fixed it and the same run read
+`nodes=probe,`. **Dry-run the generated text, not the generator.**
+
+***A guard whose plants pinned a value its own documentation promised was free.*** `check_recipe`'s
+doc said "None of them pins a value, so renaming the group stays a one-line edit", and the unit's own
+comment block said "Rename the group in one half and the gate will tell you the other half
+disagrees". Both were true of `check_recipe` and false of **the gate**: its eight fail-first plants
+named their target lines as string literals, group name included, and each asserted its own landing.
+Measured on the unfixed tree — a *correct, fully consistent* rename of all eight occurrences failed
+`the_socket_group_recipe_agrees_with_itself` with "the plant … found no `#   Group=console-operators`
+to rewrite". **The anti-vacuity assertion added to catch a plant that changes nothing is what refused
+the correct edit.** Repaired by deriving every plant from the recipe the parser just read, anchored
+to a source line *inside* the block — a bare needle also matches the prose above it, and a plant that
+lands in prose reddens nothing, which reads exactly like a gate that does not bite. Ten plants now,
+both arms measured: consistent rename green with each plant still reddening, half-rename red from
+either side.
+
+**A sibling in the same sweep: the recipe's verification `stat` was checked only for shape** — a
+directory and something inside it, which two invented paths satisfy as well as the real ones. It is
+now held to the unit around it, `stat_paths[0]` to `/run/<RuntimeDirectory=>` and `stat_paths[1]` to
+`ExecStart=`'s own `--socket` argument. Proving that turned up a third: `daemon_payload` hard-coded
+the socket **basename**, so the root probe was comparing the recipe's prediction against a socket the
+payload had named for itself. Today the two strings are identical, so the arm's behaviour is
+byte-for-byte unchanged and the repair buys only the day they diverge.
+
+***Three line-number citations into `ci.yml` were checked, and the first sentence written about them
+was false in the other direction.*** The claim recorded was that `docs/vmcell-requirements.md`'s
+`.github/workflows/ci.yml:399`–`:410` "was already stale before this session". Measured: at
+`800915b`, line 399 **is** `- name: Packaging gate (root arm — item 31's owed measurement)` and the
+span runs to its last `sudo -n env SNX_PACKAGING_ROOT=required` line. The citation was exactly right
+and **this session broke it** — the root-arm step stands at 603 in the working tree as this entry is
+written. Its second citation, `:419`–`:428` for the `external-codec` job, was right at HEAD too and
+now points 205 lines short. The
+repair is to cite the step and the job **by name**, which is the durable form; the workflow carries a
+comment saying so and states no current line number, because that comment would have moved one.
+
+**One citation *was* already stale, and it is in this file.** §3.74's *"CI always had `-e`"* cited
+`.github/workflows/ci.yml:195` and `:251`. At `800915b` the two `jq -e -f expectations/` lines are at
+**279** and **481**, and line 195 there is a comment about `SNX_TLS`; in the working tree as this
+entry is written they have moved again, to 420 and 686. The substantive claim is true and survives;
+only the coordinates were wrong, and they are replaced in place by the two steps' names —
+`Capability report` and `Capability report + macos.jq gate` — with the correction dated. **Three
+citations into one file, all wrong at once: two of them broken by this session and one stale before
+it.** That is the argument for the guard nobody has written: nothing in this tree checks that a
+citation into `ci.yml` still resolves. A
+cheap meta-gate would assert that every `- name:` string cited from `docs/` appears verbatim in the
+workflow and refuse `ci.yml:<number>` outright. It belongs in `itest/tests/meta_*.rs`, which neither
+this pass nor the implementing one owned.
+
+***The maintainer's recorded direction, filed as scheduled-for-later and not as done.*** A future
+design should use the **`vmcell` peer project** to implement **local** versions of all the CI checks,
+so a root arm can be exercised on a maintainer's box rather than only on a runner.
+`docs/vmcell-requirements.md` is in this repository and vmcell is a sibling project of this one,
+nearly done implementing this project's requests. Nothing in this session runs a root arm off a
+runner, and this paragraph records the direction rather than any work toward it. The cost it is
+meant to remove is legible from this session alone: item 68's arm took five successive probe defects
+to get right, every one of them found on a runner, and item 31's four new probes have had no run at
+all.
+
+**Bounds a reviewer should have, because the code now reads like coverage.** The root probes hand
+the packaged `[Service]` directives to `systemd-run` as transient properties; nothing installs a unit
+into `/etc/systemd/system` or starts it by name, so `[Install]`, `Type=exec`, `Restart=` and the
+`/usr/local/bin/` path in `ExecStart=` are outside every one of these measurements — deliberately,
+since a probe that installed a unit would overwrite a real deployment's. Two probes create a real
+system identity and delete it in `Drop`; they refuse to run if either name already exists and refuse
+to delete one they did not make, and a `static Mutex` serialises them, so the root step's
+`--test-threads=1` buys a readable `--nocapture` stream (§3.78's class) and not safety.
+
+### 3.149 A guard that asserts anti-vacuity against a live document is asserting two things
+
+Executing items **64(a)** and **78(b)** on 2026-08-21 took plan §18's **only** `PARTLY` declaration
+and **one of its two mixture shapes** with them, and two of `itest/tests/meta_ledger.rs`'s assertions
+went red — correctly, loudly, and naming exactly what had changed. **Neither assertion was broken.
+Their subject had been finished.**
+
+Both were written as *liveness* claims against the live ledger: every row of the status vocabulary
+must decide or co-occur in some entry's declaration, and the mixture battery must reach both of the
+joint shapes §18 writes. Both are the strongest kind of guard that file has — *a mechanism reached by
+nothing cannot be shown to work*, which is AGENTS §3's tell applied to a gate's own vocabulary — and
+both are also, fused into one `assert!`, a claim the gate has no standing to make.
+
+***The two claims, and only one of them is the guard's.*** A row's ability to work is a property of
+the **parser**. Its presence in a declaration is a property of **today's document**, and that one
+moves every time an item is executed. Fused, the guard reports *completed work* as a defect. Worse —
+and this is the half that costs something — **it prints an instruction a reader will follow, and the
+instruction is wrong.** "Delete the row, since a row that matches nowhere cannot be shown to work"
+deletes a disposition §18 has used three times (items 31, 64, 78), which `classify` still implements,
+and which §18's own **Discipline** rule keeps producing: every clause of every item dispositioned
+explicitly at every rewrite is the rule that manufactures a part-executed item. The second guard's
+message named nothing a reader could do short of reopening an item. **A guard whose green depends on
+work being unfinished pays for its teeth with a false instruction, and the instruction is the half
+people act on.**
+
+***The repair is a split, not a weakening, and the split is the doctrine.***
+
+* The **parser** claim is asserted for every row and every shape, against the real document, **by
+  construction rather than by luck**: each vocabulary row is planted into a real entry — its own
+  title, size marker, line wraps, siblings and superseded filing all in place — and required to move
+  the whole gate; a subject of each joint shape is *built* over a real open entry on every run. The
+  three plant loops' coverage of the vocabulary tables is itself asserted, so a sixth table cannot be
+  added without a plant.
+* The **document** claim is **reported**, not failed: which item still spells a quiet status word and
+  in which region of its entry, and how many mixtures the ledger writes itself.
+
+**A report is a no-op unless something holds it up**, so each side keeps one assertion that cannot go
+empty when work closes. A quiet spelling must be **founded** — written somewhere in §18 under its own
+match kind — which kills a speculative row somebody adds because they believe the document uses a
+word it has never used, while surviving every execution, *because executing an item does not unwrite
+its record*. (`PARTLY` is founded on item 64's preserved `*Original head declaration:*`.) And a
+constructed subject must answer **arm for arm** as the live mixture it shares a joint token with,
+which is the only honest licence for a fixture to stand in for a document: a stimulus gentler than
+the product's is precisely what a hand-written stand-in becomes, and the arm-for-arm comparison is
+the measurement that says it has not.
+
+Three alternatives were rejected and are recorded because each is the obvious move. Deleting the
+quiet row — it drops a parser branch and a disposition the ledger may write again, and *the failure
+message itself offered it*. Scoping the live requirement to "spellings the ledger currently uses" —
+computed rather than hand-listed, and circular, since that set is defined by the thing being checked.
+Building the missing mixture from a synthetic entry — a hand-written entry drops the title that is a
+sentence, the size marker outside it, the 100-column wraps and the superseded filing underneath,
+which is everything that makes a real declaration hard to parse.
+
+***The sweep for that repair found the plants underneath were weaker than their own comment*** —
+AGENTS §3's fifth register, and `meta_ledger.rs`'s third instance of it; the file already carried
+two. The plants — one for each row of the status vocabulary, planted into a real entry — asserted
+`!matches!(outcome, Outcome::Green)` under a comment promising the plant "must take that entry off
+the derived list". Those are not the same claim: `Outcome::Refused` satisfies the first and denies
+the second, so **a plant that left the declaration unreadable passed exactly as one the classifier
+read.** For a spelling the ledger still
+uses the gap is covered by accident, because making the classifier blind to it also breaks the
+unplanted parse. For a **quiet** spelling nothing covers it at all — and quiet spellings are the case
+this block now exists to carry, since the liveness assertion above it was split precisely so a row
+could go quiet without the gate going red.
+
+**Measured, by making the classifier blind to one row at a time: ten of the eleven rows reddened the
+gate anyway, and `PARTLY` — the one row §18 no longer spells — stayed green.** The coupling stated
+exactly: *the plants only appeared to prove the matcher because every row was live, so the day a row
+went quiet the plants and the liveness assertion failed together, in opposite directions.* Three
+assertions replace the one — the parse must **succeed**, because a refusal means the spelling was
+never reached; the spelling must appear in the entry's own `matched` set, which is the classifier
+saying in its own words that it read this text; and the entry must land on the side the spelling
+means. *One arithmetic loose end is left at the site and is worth naming rather than rounding off:*
+the note decomposes those ten into seven that reddened through "declares no status this gate
+recognises" and two through the straddle tripwire, which accounts for **nine**. The tenth row's route
+is unattributed there. It is a comment's arithmetic rather than a gate's, so it is owed as one
+sentence and not filed as an item — but a decomposition that does not close is the shape this record
+refuses everywhere else, and it is refused here in the one place a reader would be least likely to
+recheck: a doc comment above a passing test.
+
+***A third instance of the same landmine was found one item from firing.*** The clause-completeness
+rule read its bite off the document's content — `items.iter().any(|i| i.status == Status::Partly)` —
+with a message telling the next reader to "say so here" if the ledger had closed every mixture. That
+assertion would have gone red **the day item 13 closes**, reporting completed work as a defect and
+offering an edit to itself rather than a repair. It is replaced by a plant: a mixture constructed
+over a real entry of this tree, its open clause reworded into prose with its letter left standing,
+and the parse required to refuse naming the item and the clause. Which entries the ledger *itself*
+spells as mixtures is printed rather than asserted, because that is a fact about how much work is
+finished.
+
+**The rule this leaves, and it generalises past this file.**
+
+> **A guard that asserts anti-vacuity against a live document is asserting two things, and only one
+> of them is the guard's. Prove the mechanism by construction; report what the document contains.**
+
+The tell is cheap to look for once you have the shape: *would this assertion go red if the project
+finished the work it describes?* If yes, it is holding the document still, and the message it prints
+on that day will tell the next person to undo the work rather than to fix the gate.
+
+**State of the gate as this entry is written, and the reading moves because its subject is being
+edited.** `cargo test -p serial-nexus-itest --test meta_ledger` read **26 passed · 1 failed · 0
+ignored** on the tree the repair above landed on, the one failure being
+`agents_2s_still_open_list_matches_plan_18s_item_states`; a few minutes later, with AGENTS §2's
+`Still open:` sentence and plan §18's own entries both being rewritten under it by other passes, the
+same command read **24 · 3 · 0** — the two extra failures being the plant batteries refusing to run
+at all, each naming the *same* cause before planting anything ("the reconciled control is not green,
+so no plant below proves anything").
+**Neither figure is a defect in the repair and neither is a suite number**: `meta_ledger.rs` does not
+read this document, its subject is AGENTS §2 and plan §18, and both were being written while it ran.
+The control-first design is why three failures name one cause instead of three — which is the
+opposite of the shape §3.144 had to reason its way out of, and worth noticing as the payoff for
+asserting the control before the plant.
+
+
+### 3.150 A floor that counted the schedule, in a function whose only business was a sentence
+
+`parse_agents_open_list` in `itest/tests/meta_ledger.rs` ended its checks with `if spans.len() < 10`,
+refusing AGENTS §2's `Still open:` list with *"parsed only N numbers, which is below the floor a real
+list clears — the sentence's shape has changed under the parser."* **Ten is not a property of a
+sentence. It is a count of how much work happens to be open**, and executing items 73 and 85 took the
+derived set from eleven numbers to nine.
+
+The suite went to **24 passed · 3 failed** — and only one of the three was the gate. The other two are
+the plant batteries, which build a **reconciled** AGENTS copy *from the derived list* and require it
+green as their control: both panicked before a single plant or rewrite ran, so the whole plant battery
+and the whole joint battery were silent behind a message about a sentence nobody had touched. Not one
+of the three failures had found a defect; between them they had found the completion of two items. The
+first response was to put the count back to ten by filing a real ledger entry, with the honest sentence
+written into it at the time: *that is an arithmetic coincidence, not a repair, and the next two items
+this ledger closes re-trip it.* That entry became item 115, and its subject turned out to be real — the
+floor itself — so the number stayed and the work changed.
+
+***The hazard was real and is kept; the constant was never it.*** If the lead literal matched a
+different sentence, or the terminator search stopped inside the list, the parser would read a number
+set that is not §2's list — and a derived set that happened to match would pass for the wrong reason.
+So the question was re-asked structurally: **did the parser consume the sentence it claims to have
+consumed?** Three claims answer it, none of which counts anything. The lead is spelled **once** in the
+file — the "a different segment" half of the hazard, which no count could ever see. The segment **reads
+as a list**: every depth-0 word from a closed five-word connective vocabulary read off the record,
+opening on an entry, not ending on a dangling separator or connective, and no number hyphen-joined to
+what stands in front of it, which is what stops a date being read as three items and an ASCII-hyphen
+range as two unrelated ones. And the list **does not carry on past the terminator**: the run beyond it
+is read with the same two scans, so a stray full stop where a comma belongs — the likeliest
+single-character edit there is — is refused with the continuation quoted rather than handing back a
+prefix.
+
+**The asymmetry is the repair in one line: a segment with no numbers and no words is an empty list and
+parses to the empty set; the same segment with *words* in it is prose and is refused. Small is not a
+defect, unread is.**
+
+***Two rejections are worth more than the fix.*** "Assert every depth-0 digit run is accounted for" was
+**measured vacuous before it was rejected** — the parser's own loop consumes every span as a range's
+end or a single entry, so it is true by construction and would pass with the parser gutted. "Derive the
+floor from the plan's own parse" re-introduces exactly the coupling being removed and adds nothing the
+comparison does not already do, since a segment shorter than the derived set is drift and the drift
+report already names every missing item and quotes the segment verbatim.
+
+***Fail-first had to run in both directions, because the defect has two.*** Against the unfixed tree,
+the real plan with its open entries closed one at a time and the real AGENTS.md reconciled after each
+closure: **GREEN at 10 open, then REFUSED at 9, 8, 7, 6 and 5**, every refusal naming the floor and the
+count — a correct document refused for finishing work. And a truncated sentence carrying **ten**
+numbers, the list split by a stray full stop with four more items on the far side, parsed clean: the
+false green the floor was aiming at, which the floor could not reach. Every fixture in the refusal
+battery carries ten or more numbers deliberately, so a short one cannot smuggle in a proof of the old
+constant. After the repair the sweep is green at every step down to five open, and all six reshaped or
+truncated fixtures are refused by the rule that should refuse them.
+
+One test was **renamed rather than deleted**, and its first case now reads *the same three numbers two
+ways*: a genuine three-entry list parses, and those three numbers left behind by a stray full stop are
+refused. Nothing that counts can tell those two sentences apart, and that pair is the whole argument.
+
+**And the landing pass is where it paid off.** Marking item 115 EXECUTED took the derived set to
+**nine** — the exact size that was refused an hour earlier — and the gate parsed it without complaint.
+The repair's proof is that closing the item did not break the gate that the item was about.
+
+***The rule, and it is the third instance of one class inside a single file.*** The `PARTLY` liveness
+row and the mixture-shape battery (§3.149) were each a claim about the parser fused to a claim about
+which items happen to be open. This was the same fusion **with no assertion around it at all** — a bare
+`10` inside a function whose only business is a sentence's shape, carrying no comment saying which of
+the two claims it meant. **A gate that hard-codes how much work is open is asserting a property of the
+project's schedule, not of its code — and completing work is what exposes it.** The tell is that its
+failure arrives on a green change, and the instruction it prints cannot be followed.

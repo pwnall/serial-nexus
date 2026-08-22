@@ -40,6 +40,12 @@ pub const DAEMON_NAME: &str = "serial-nexus-daemon";
 pub mod socket;
 pub use socket::{SocketOrigin, default_socket_path, resolve_client_socket};
 
+// The §15.43 stdin-EOF orphan leash, one implementation for the three binaries that
+// carry one (plan §18 item 79). Not re-exported: `leash::` at the call site is what
+// says which mechanism is being armed. `std` only — nothing that links this crate for
+// its wire types pays for a leash it does not arm.
+pub mod leash;
+
 /// The pre-§15.40 spelling of [`DAEMON_NAME`], **accepted on read for one release**
 /// (plan §17.3) and then deleted.
 ///

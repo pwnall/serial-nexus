@@ -47,6 +47,11 @@ use sha2::{Digest, Sha256};
 // is a thin alias to keep the call sites unchanged.
 use serial_nexus_sys::ptsname;
 
+// The stdin-EOF leash is `serial_nexus_rpc`'s (§15.43, plan §18 item 79) — the same
+// implementation the daemon and the web console arm, so a defect in the read loop
+// cannot be fixed in one binary and left standing in this one.
+use serial_nexus_rpc::leash::StdinEof;
+
 #[derive(Parser)]
 #[command(name = "serial-nexus-sim", about = "serial_nexus test double (§3)")]
 struct Cli {
@@ -68,62 +73,24 @@ struct Cli {
 
 // --- the stdin-EOF leash (§15.43) ------------------------------------------
 
-/// The one stdin-EOF watch this process has.
+/// The process's one stdin-EOF watch (§15.43), from the workspace's single
+/// implementation of it in `serial_nexus_rpc::leash` (plan §18 item 79).
 ///
-/// One, not one per waiter: two threads reading the same pipe would race for the
-/// bytes and neither would see the close reliably. The leash (`--exit-on-stdin-eof`)
-/// and the caller-owned hold (`client --hold-stdin-eof`) are both waiters on this,
-/// and either may be armed without the other.
-struct StdinEof {
-    seen: std::sync::Mutex<bool>,
-    woken: std::sync::Condvar,
-}
-
-impl StdinEof {
-    /// Block until stdin reaches EOF. Returns immediately if it already has.
-    fn wait(&self) {
-        let mut seen = self.seen.lock().expect("stdin-eof mutex");
-        while !*seen {
-            seen = self.woken.wait(seen).expect("stdin-eof condvar");
-        }
-    }
-}
-
-/// Start (once) the reader thread and return the watch.
+/// **One watch, not one per waiter**, and this double is the binary that shows why:
+/// two threads reading the same stdin would race for the bytes. The leash
+/// (`--exit-on-stdin-eof`) and the caller-owned hold (`client --hold-stdin-eof`) are
+/// both waiters on this, either may be armed without the other, and the shared watch
+/// fans one close out to both.
 ///
-/// A blocked `read` costs nothing and ends exactly when the writer closes, so this is
-/// not a poll loop (§15.31's no-busy-waiting rule for the doubles). Anything actually
-/// written is noise, not a protocol: the only event reported is the close. A stdin
-/// that cannot be read is as good as gone — failing closed there would leave precisely
-/// the orphan this exists to prevent.
-fn stdin_eof_watch() -> &'static Arc<StdinEof> {
-    static WATCH: std::sync::OnceLock<Arc<StdinEof>> = std::sync::OnceLock::new();
-    WATCH.get_or_init(|| {
-        let watch = Arc::new(StdinEof {
-            seen: std::sync::Mutex::new(false),
-            woken: std::sync::Condvar::new(),
-        });
-        let signal = watch.clone();
-        thread::Builder::new()
-            .name("stdin-eof-watch".to_owned())
-            .spawn(move || {
-                let stdin = std::io::stdin();
-                let mut handle = stdin.lock();
-                let mut byte = [0u8; 1];
-                loop {
-                    match handle.read(&mut byte) {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
-                *signal.seen.lock().expect("stdin-eof mutex") = true;
-                signal.woken.notify_all();
-            })
-            .expect("spawn the stdin EOF watch thread");
-        watch
-    })
+/// The shared watch keeps §15.31's no-busy-waiting rule for the doubles: a blocked
+/// `read` costs nothing and ends exactly when the writer closes, so this is not a poll
+/// loop. `p12_sim_idle_cpu` is what asserts it.
+///
+/// The double `expect`s where the daemon and the console return an error: a test
+/// double that cannot arm its own leash has nothing useful to do next, and the
+/// verdict line it exists to print would be a lie either way.
+fn stdin_eof_watch() -> &'static StdinEof {
+    serial_nexus_rpc::leash::stdin_eof_watch().expect("spawn the stdin EOF watch thread")
 }
 
 /// Device symlinks this process published, removed before a leashed exit.
@@ -144,7 +111,7 @@ fn publish_link(path: &Path) {
 
 /// Arm the leash: on stdin EOF, unpublish and stop.
 fn arm_stdin_eof_leash() {
-    let watch = stdin_eof_watch().clone();
+    let watch = stdin_eof_watch();
     thread::Builder::new()
         .name("stdin-eof-leash".to_owned())
         .spawn(move || {

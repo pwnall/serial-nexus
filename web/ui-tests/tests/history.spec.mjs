@@ -90,7 +90,7 @@ test("the storage badge reports what the browser actually granted", async ({
   await expect(page.locator("#pane-storage")).toContainText("OPFS");
 });
 
-test("a reload splices stored history against the replay ring exactly once", async ({
+test("a reload splices stored history against the replay ring exactly once", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
@@ -125,7 +125,7 @@ test("a reload splices stored history against the replay ring exactly once", asy
   expect(await countInTerminal(page, second)).toBe(1);
 });
 
-test("clear drops the stored scrollback without breaking the live stream", async ({
+test("clear drops the stored scrollback without breaking the live stream", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
@@ -158,7 +158,7 @@ test("clear drops the stored scrollback without breaking the live stream", async
 // Looking away is a plain console switch: `selectConsole` flushes to OPFS and closes the
 // tap, and a hub with a ring keeps ingesting with no tap open (`refresh_active`), which
 // is exactly the state that rotates the ring out from under the stored history.
-test("a ring that rotated past the stored history is announced, not spliced over", async ({
+test("a ring that rotated past the stored history is announced, not spliced over", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
@@ -220,7 +220,7 @@ test("a ring that rotated past the stored history is announced, not spliced over
 // re-creating the record the operator just destroyed (review HISTC-2). The scenario is a
 // shared lab machine and a console that carried credentials, so the assertion has to be
 // about storage, not about `#term`.
-test("a slow-confirmed clear leaves no stored record behind", async ({ page }) => {
+test("a slow-confirmed clear leaves no stored record behind", { tag: "@device" }, async ({ page }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
   await open(page);
   await selectConsole(page, ECHO);
@@ -261,7 +261,7 @@ test("a slow-confirmed clear leaves no stored record behind", async ({ page }) =
     .toBe(0);
 });
 
-test("export hands the scrollback to the browser as a download", async ({ page }) => {
+test("export hands the scrollback to the browser as a download", { tag: "@device" }, async ({ page }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
   await open(page);
   await selectConsole(page, ECHO);

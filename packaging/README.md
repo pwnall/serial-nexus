@@ -299,9 +299,19 @@ are what plan §18 item 31 exists for.
 **Boxes these measurements were taken on.** `linux-2026-08-12` is Ubuntu with systemd
 259 (259.5-0ubuntu3.4), kernel 7.0.0-29, 20 cores, systemd as PID 1, unprivileged (no
 root, no polkit, and `unshare -Ur` refused: `write failed /proc/self/uid_map:
-Operation not permitted`). Suite citations name the guard, which is the durable form:
-a test that is renamed away takes its citation with it, and `itest/tests/meta_derive.rs`
-already holds the tree to that discipline elsewhere.
+Operation not permitted`). `linux-2026-08-21` is the same box on kernel 7.0.0-30, still
+unprivileged. **`CI root arm` is a third kind of box and the difference is the whole
+point of it:** GitHub's `ubuntu-latest`, systemd as PID 1 with passwordless root, which
+is the only place in this project's reach where a recipe that needs `groupadd` or
+`systemd-run` can actually be run. Suite citations name the guard, which is the durable
+form: a test that is renamed away takes its citation with it, and
+`itest/tests/meta_derive.rs` already holds the tree to that discipline elsewhere.
+
+**A guard that has not yet had a green run says so.** Several rows below cite a guard
+in `p8_packaging.rs` that self-skips everywhere but the root arm, and name the first
+run that will execute it. Until that run exists the row's class is what the claim is
+warranted by *today*, not by what the guard will show — a citation to a run that has
+not happened is the same defect as a measurement nobody took.
 
 ### The unit's directives
 
@@ -318,13 +328,13 @@ rather than from any list a human keeps.
 | ↳ | the daemon opens its own socket and exits cleanly on `SIGTERM`/`SIGINT`, releasing PTY symlinks and ports | measured | `p7_clean_exit.rs::sigterm_exits_cleanly_and_releases_the_node_environment` and the `sigint`/`shutdown` siblings |
 | `DynamicUser=` | A transient, unprivileged identity | man-page | `systemd.exec(5)`, `DynamicUser=` |
 | ↳ | under `DynamicUser=`, `StateDirectory=` really lives under `/var/lib/private/`, which is inaccessible to unprivileged users, so the pre-rename snapshot needs a root `cp` | **measured** (CI root arm, run 31695823765, 2026-08-13; `state_real=/var/lib/private/…`, `private_stat=root:755`, probe running as a transient `uid=65180`) | `systemd.exec(5)`: "the directories are created below `/var/cache/private`, `/var/log/private` and `/var/lib/private`, respectively, which are host directories made inaccessible to unprivileged users". Plan §18 item 31's root-box half; `p8_packaging.rs::dynamic_user_state_directory_is_private_and_read_write_paths_do_not_chown` measures it where root exists |
-| `SupplementaryGroups=` | The service needs `dialout` because USB serial nodes are `root:dialout` mode 0660 | measured | linux-2026-08-12: `crw-rw---- 1 root dialout 188, 0 /dev/ttyUSB0` (`ftdi_sio`). linux-2026-08-16: `crw-rw---- 1 root dialout 166, 0 /dev/ttyACM0` on a CDC-ACM pair (`1a86:55d3`, driver `cdc_acm`) — plan §18 item 78(a). Both resolve through the shipped rule at `/usr/lib/udev/rules.d/50-udev-default.rules:47`, whose kernel-name glob `tty[A-Z]*[0-9]` matches both families and which assigns the group but no mode of its own; 0660 is therefore the driver default, and **two different drivers were needed to say so rather than one plus an inference** (item 78 declined that inference). **Scope: one box, one distro (Ubuntu, udev 259), two drivers, two majors (188, 166).** The `uucp` remark is a separate claim and stays unverified — item 78(b) |
+| `SupplementaryGroups=` | The service needs `dialout` because USB serial nodes are `root:dialout` mode 0660 | measured | linux-2026-08-12: `crw-rw---- 1 root dialout 188, 0 /dev/ttyUSB0` (`ftdi_sio`). linux-2026-08-16: `crw-rw---- 1 root dialout 166, 0 /dev/ttyACM0` on a CDC-ACM pair (`1a86:55d3`, driver `cdc_acm`) — plan §18 item 78(a). Both resolve through the shipped rule at `/usr/lib/udev/rules.d/50-udev-default.rules:47`, whose kernel-name glob `tty[A-Z]*[0-9]` matches both families and which assigns the group but no mode of its own; 0660 is therefore the driver default, and **two different drivers were needed to say so rather than one plus an inference** (item 78 declined that inference). **Scope: one box, one distro (Ubuntu, udev 259), two drivers, two majors (188, 166).** The unit's `uucp` remark — a claim about distros this project has never booted — was replaced 2026-08-21 by the command that answers it on the reader's own box, `stat -c '%G %a %n' /dev/ttyUSB* /dev/ttyACM*`, with this row's scope moved into the comment beside the setting — item 78(b), notes §3.142 |
 | `RuntimeDirectory=`, `StateDirectory=`, `LogsDirectory=` | systemd creates each and chowns it to the service identity on every start | man-page | `systemd.exec(5)`: "the innermost specified directories will be owned by the user and group specified in `User=` and `Group=`" |
 | `RuntimeDirectoryMode=`, `StateDirectoryMode=`, `LogsDirectoryMode=` | 0700 on the socket directory bounds the post-bind window; 0750 on logs exposes them to the identity's group | man-page | `systemd.exec(5)`, the `*DirectoryMode=` family |
 | ↳ | that the daemon then narrows its own socket to 0600, and that `--socket-group` widens it to 0660 with the group's gid | measured | `p9_permissions.rs::a_running_daemon_writes_its_socket_state_and_logs_owner_only` and `::socket_group_chgrps_the_control_socket_and_widens_it_to_0660` |
-| ↳ | the socket-group recipe in the unit's comment block (`groupadd`/`useradd`, `DynamicUser=no`, `User=`, `Group=`, and the `stat` output it predicts) | **unverified** | Nothing in this tree has run it. Its premise (systemd chowns to `User=`/`Group=` and `SupplementaryGroups=` cannot reach a directory) is the man-page row above; the recipe built on that premise has never been executed |
+| ↳ | the socket-group recipe in the unit's comment block (`groupadd`/`useradd`, `DynamicUser=no`, `User=`, `Group=`, and the `stat` output it predicts) | **measured** (the block's acceptance and its internal agreement); **unverified** (the two `stat` lines it predicts) | Two halves, and they are not the same kind of thing. **Acceptance and agreement, measured on every push:** `p8_packaging.rs::the_socket_group_recipe_agrees_with_itself` parses the block out of the shipped unit and holds its halves to each other — the directives against the `groupadd`/`useradd` that create the identity they name, the predicted modes against `RuntimeDirectoryMode=`, the widening flag against `Group=` — and holds its two `stat` paths to the unit *around* it, the directory to `RuntimeDirectory=` and the socket to `ExecStart=`'s own `--socket`, because a verification step that agrees only with itself verifies nothing; ten plants, each derived from the parsed recipe rather than typed as a literal, are each proven to redden it; and `::the_socket_group_recipe_verifies_clean_under_systemd_analyze` applies the recipe to the unit and verifies the result, which is the same **acceptance** the hardening row claims. **What the recipe produces is not measured yet:** `::the_socket_group_recipe_hands_the_runtime_directory_to_the_operators_group` and `::the_socket_group_recipe_widens_the_control_socket_to_the_operators_group` run the block's own commands and check both predicted `stat` lines, but they need root and a live systemd, so they self-skip everywhere but the CI root arm and **have not yet had a run there**. This row moves to plain **measured**, citing that run, once one is green |
 | `KillSignal=`, `TimeoutStopSec=`, `Restart=`, `RestartSec=` | Stop signalling and restart policy | man-page | `systemd.kill(5)`, `systemd.service(5)` |
-| `NoNewPrivileges=`, `ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ProtectProc=`, `ProtectKernelTunables=`, `ProtectKernelModules=`, `ProtectKernelLogs=`, `ProtectControlGroups=`, `ProtectClock=`, `ProtectHostname=`, `LockPersonality=`, `MemoryDenyWriteExecute=`, `RestrictRealtime=`, `RestrictSUIDSGID=`, `RestrictNamespaces=`, `SystemCallArchitectures=`, `SystemCallFilter=`, `SystemCallErrorNumber=` | The hardening block: each buys what `systemd.exec(5)` says it buys, and the daemon still starts under all of them | man-page for the effect; **measured for acceptance** | `systemd.exec(5)`. Acceptance — that systemd parses every one of these on this systemd version rather than warning past a typo — is measured by `p8_packaging.rs::the_packaged_unit_verifies_clean_under_systemd_analyze`. That the *daemon* runs under the resulting sandbox is **unverified**: no lane starts it as a service |
+| `NoNewPrivileges=`, `ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ProtectProc=`, `ProtectKernelTunables=`, `ProtectKernelModules=`, `ProtectKernelLogs=`, `ProtectControlGroups=`, `ProtectClock=`, `ProtectHostname=`, `LockPersonality=`, `MemoryDenyWriteExecute=`, `RestrictRealtime=`, `RestrictSUIDSGID=`, `RestrictNamespaces=`, `SystemCallArchitectures=`, `SystemCallFilter=`, `SystemCallErrorNumber=` | The hardening block: each buys what `systemd.exec(5)` says it buys, and the daemon still starts under all of them | man-page for the effect; **measured for acceptance** | `systemd.exec(5)`. Acceptance — that systemd parses every one of these on this systemd version rather than warning past a typo — is measured by `p8_packaging.rs::the_packaged_unit_verifies_clean_under_systemd_analyze`. That the *daemon* runs under the resulting sandbox is **unverified until the CI root arm has a green run**, which is a narrower statement than the one that stood here (`no lane starts it as a service`): `p8_packaging.rs::the_packaged_sandbox_starts_the_daemon_and_it_serves` now starts the real daemon under exactly these directives and asks it for `state` over its own control socket, and it self-skips everywhere but that arm. **A rehearsal of that measurement was taken and is recorded as refuted evidence rather than quietly dropped** (linux-2026-08-21): run through a *user* manager, `systemd-run --user` reported `Finished with result: success` with the daemon serving and a pty allocated, and it proved nothing — `/proc/self/mountinfo` read **53 lines inside the unit and 53 outside**, `/tmp` was the host's and `/home` was visible, so `ProtectHome=`, `PrivateTmp=` and `ProtectSystem=` had been applied as silent no-ops (three of the nineteen do fail loudly there, with `218/CAPABILITIES`, which is what made the silence of the rest easy to miss). A sandbox that did not apply and one that applied cleanly produce the same green, so the guard asserts a reading only a real namespace can produce |
 | `RestrictAddressFamilies=` | `AF_INET`/`AF_INET6` are needed only for leg nodes, which bind loopback-only by default | measured (the loopback default) | `p6_insecure_bind.rs::loopback_bind_loads_without_flag`, `::non_loopback_bind_without_flag_is_structural_refusal`, `::insecure_bind_true_loads_and_marks_state`. The address-family restriction itself is `systemd.exec(5)` |
 | `PrivateDevices=`, `DevicePolicy=`, `DeviceAllow=` | `PrivateDevices=yes` would hide `/dev/ttyUSB*`, so it stays off and `/dev` is scoped by device class instead | man-page | `systemd.exec(5)`, `PrivateDevices=` ("a private `/dev/` mount … with API pseudo devices only"). Which majors a given adapter enumerates under is the operator's to check |
 
@@ -336,12 +346,12 @@ rather than from any list a human keeps.
 | Every command in "Operating it" is a live verb | measured | `serial-nexus-ctl --help` on linux-2026-08-12: `load`, `add-node`, `remove-node`, `connect`, `disconnect`, `dump`, `state`, `info`, `ports`, `subscribe`, `tap`, `tap-wait`, `rotate`, `send-break`, `set-modem`, `pulse-dtr`, `lock`, `unlock`, `send`, `teardown`, `shutdown` — and no `reload`, which is why the restart note is there |
 | `ports` opens nothing, so listing never toggles DTR | measured | `p10_ports.rs::ports_enumerates_every_candidate_in_its_identity_form` and the binding-status guards beside it |
 | The control socket is mode 0600, and whoever can open it owns every console | measured (the mode) | `p9_permissions.rs::a_running_daemon_writes_its_socket_state_and_logs_owner_only`; the consequence is `../docs/security.md`'s threat model |
-| The operators-group paragraph: `SupplementaryGroups=` cannot reach the runtime directory, so a static identity is the working recipe | man-page for the premise, **unverified** for the recipe | Same pair as the unit's socket-group row |
+| The operators-group paragraph: `SupplementaryGroups=` cannot reach the runtime directory, so a static identity is the working recipe | man-page for the premise; **measured** (the recipe's acceptance and its internal agreement); **unverified** (the runtime effect of either arrangement) | Same pair as the unit's socket-group row, and the same two guards. The paragraph's two halves are now measured *against each other* rather than separately: `p8_packaging.rs::the_socket_group_recipe_hands_the_runtime_directory_to_the_operators_group` runs the shipped unit with the operators' group added to `SupplementaryGroups=` **as a control** — asserting the group reaches the service's group list and still not the directory — beside the static identity that must produce the block's predicted `%U %G %a`. Either reading alone is consistent with the wrong story, which is why the guard takes both in one run. It needs root and self-skips everywhere but the CI root arm, which **has not yet run it** |
 | Extra log directories need `ReadWritePaths=` **and** a pre-`chown`, because `ReadWritePaths=` flips the mount without chowning | **measured** (CI root arm, run 31695823765, 2026-08-13 — the `EACCES`-versus-`EROFS` split, both halves of Claim 4 holding) | `systemd.exec(5)`: "Paths listed in `ReadWritePaths=` are accessible from within the namespace with the same access modes as from outside of it." Plan §18 item 31's root-box half measures the `EACCES`-versus-`EROFS` split that makes this concrete |
 | The udev step is a silent failure in both half-done directions | measured (the faulted arm) | A serial node that cannot open its device comes up `faulted` with the error named — `p9_permissions.rs`'s refusal guards; that a group without rules grants nothing is definitional |
 | The `99-serial-nexus.rules` file is syntactically valid udev | measured | `p8_packaging.rs::the_packaged_udev_rules_verify_clean_under_udevadm` on any box with `udevadm verify` |
 | The upgrade section's adoption behaviours (pre-rename state file adopted; client socket fallback; a live daemon never passed over) | measured | `p13_legacy_defaults.rs`, all five guards |
-| The upgrade section's root `cp` procedure, step by step | **unverified** | Never executed. Its necessity is the `/var/lib/private` man-page row |
+| The upgrade section's root `cp` procedure, step by step | **measured** (the copy and the adoption, off systemd); **unverified** (the `systemctl` steps and the `/var/lib/private` path) | linux-2026-08-21, by hand and recorded here with its box: a daemon started on a step-2 seed writes its snapshot at the `--state-file` path **mode 0600**; `cp` of a foreign snapshot onto that existing file leaves owner and mode unchanged — the invoking user and `600` both before and after, which is exactly what step 2's parenthetical promises; and the next start comes up reporting the copied graph's node and not the seed's. What that run did **not** do is any of the part that needs privilege — `systemctl start`/`stop`, and a copy into the root-only `/var/lib/private/` indirection this procedure exists for. `p8_packaging.rs::the_upgrade_procedures_root_copy_carries_the_snapshot_across` runs all three steps under the packaged unit's own `[Service]` properties and self-skips everywhere but the CI root arm, which **has not yet run it**. The adoption behaviour itself is separately guarded by `p13_legacy_defaults.rs` (the row above) |
 | Every "configurations that used to load and now do not" bullet, and the behaviour-change bullets | measured | `p9_config_validation.rs`, `p12_config_rules.rs`, `p8_map.rs` (the `spchex` change), `p9_permissions.rs` (the 0600/0640 file modes), `p3_log.rs` (rotate ordered against the write queue) |
 | Legs are loopback-only by default and `insecure_bind` is the deliberate footgun | measured | `p6_insecure_bind.rs`, all three guards |
 
@@ -370,8 +380,42 @@ not by the kernel — `unshare -U` succeeds and `kernel.unprivileged_userns_clon
 `1`, but the namespace is transitioned into the `unprivileged_userns` profile with an
 empty `CapEff`, so the `/proc/self/uid_map` write returns `EPERM`.
 
-What remains unverified here is listed row by row above and is **not** all one class:
-the socket-group and operators-group recipes and the upgrade `cp` procedure want a
-live systemd to start a unit on, while the `/dev/ttyACM*` half of the dialout claim
-wants a **CDC-ACM device** and no amount of privilege supplies one — it is carried
-separately as plan §18 item 78.
+What remains unverified here is listed row by row above and is **not** all one class.
+The `/dev/ttyACM*` half of the dialout claim wants a **CDC-ACM device**, and no amount
+of privilege supplies one — it is carried separately as plan §18 item 78. The other
+three want a **live systemd with root**, and as of 2026-08-21 the difference is that
+something now goes and gets it.
+
+**The recipes are executed rather than described** (plan §18 item 31's remaining four
+rows). `p8_packaging.rs` gained four root-gated probes that run what these pages tell
+an operator to run: the unit's own `groupadd`/`useradd` lines, its static-identity
+block measured against the `SupplementaryGroups=` arrangement it replaces, the real
+daemon started inside the packaged sandbox and asked for `state` over its own socket,
+and the upgrade section's `cp` procedure step by step. They derive every property from
+the shipped unit — the same discipline the existing root probe follows — and they
+self-skip on a box without root, naming the precondition that failed.
+
+**None of them has executed anywhere yet, and the rows above say so.** They land
+self-skipping, exactly as item 31 sequenced the first root probe: their first run is
+CI's `packaging` job, and each row that cites them moves to plain **measured** with a
+run number once that run is green. What *is* measured today is narrower and is written
+as such — that the recipe agrees with itself in all four of its halves, and that
+systemd accepts the unit an operator following it produces.
+
+**Two things this session learned the hard way, recorded because both are the same
+mistake in different clothes.** A rehearsal of the sandbox measurement through a
+*user* manager reported success while applying no mount namespace at all, so the guard
+now reads something only a real namespace can produce (the hardening row carries the
+figures). And a dry run of the probe's own payload under `dash` found its node check
+matching nothing, because `--json state` is pretty-printed and the pattern assumed it
+was not — a guard that would have failed on CI for a reason that was never about
+packaging.
+
+**Where this should go next, and it is not more CI.** Every check in this file that
+needs root can only be exercised by pushing to a runner, which is a slow, blind loop —
+the first root probe here took five CI runs to get right, none of them for the
+packaged unit's reasons. The `vmcell` peer project (see `../docs/vmcell-requirements.md`)
+is close to being able to run this project's checks in a local VM, and a future design
+should use it to give every CI job a **local** twin, the root arm first. The
+measurements would not change; the number of attempts it takes to get one right
+would.

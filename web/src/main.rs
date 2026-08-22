@@ -197,12 +197,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         socket,
         hosts,
     };
-    // The lifetime leash (§15.43), the console's arm of it (plan §18 item 65(d)).
-    // When the watch is off the sender is simply held here for the life of the
-    // `select!`, so its receiver never resolves and that arm never fires — one code
-    // path rather than a conditional arm, the shape `serial-nexus-daemon` uses.
-    let (_idle_tx, idle_rx) = tokio::sync::oneshot::channel::<()>();
-    let mut orphaned = if leashed { watch_stdin_eof()? } else { idle_rx };
+    // The lifetime leash (§15.43), the console's arm of it (plan §18 item 65(d)),
+    // from the workspace's one implementation of it (`serial_nexus_rpc::leash`, plan
+    // §18 item 79 — this file used to carry a byte-for-byte copy of the daemon's).
+    // When the leash is off the signal is a future that never resolves, so the arm
+    // below never fires — one code path rather than a conditional arm.
+    let mut orphaned = serial_nexus_rpc::leash::stdin_eof_signal(leashed)
+        .map_err(|e| anyhow::anyhow!("spawning the stdin EOF watch thread: {e}"))?;
 
     // `serve` prints the bootstrap URL after binding, so an ephemeral `:0`
     // request reports the port the OS actually chose.
@@ -215,46 +216,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             // its control connection closes (§10). There is no less residue to leave
             // — SIGTERM here runs no handler at all — so §15.43's "no more residue
             // than a SIGTERM" holds a fortiori.
-            tracing::info!(
-                "stdin reached EOF under --exit-on-stdin-eof: the supervisor holding \
-                 the other end of the pipe is gone; stopping"
-            );
+            tracing::info!("{}", serial_nexus_rpc::leash::STOPPING_ON_STDIN_EOF);
             Ok(())
         }
     }
-}
-
-/// Watch stdin for EOF on a detached thread, resolving the returned receiver when it
-/// arrives — the console's half of §15.43.
-///
-/// A **detached `std` thread in `read(2)`**, not `tokio::io::stdin`, which is §15.43
-/// clause 3 and not a stylistic preference: the tokio reader parks an uncancellable
-/// blocking-pool task that runtime shutdown waits on, hanging every other exit path.
-/// Anything actually written to stdin is noise rather than a protocol — the only event
-/// reported is the close — and a stdin that cannot be *read* is as good as gone,
-/// because failing closed there would leave precisely the orphan this exists to
-/// prevent.
-fn watch_stdin_eof() -> anyhow::Result<tokio::sync::oneshot::Receiver<()>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("stdin-eof-watch".to_owned())
-        .spawn(move || {
-            use std::io::Read;
-            let stdin = std::io::stdin();
-            let mut handle = stdin.lock();
-            let mut byte = [0u8; 1];
-            loop {
-                match handle.read(&mut byte) {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            let _ = tx.send(());
-        })
-        .map_err(|e| anyhow::anyhow!("spawning the stdin EOF watch thread: {e}"))?;
-    Ok(rx)
 }
 
 /// A fresh 256-bit bearer token, hex-encoded (§15.29). `getrandom` reads the OS CSPRNG.

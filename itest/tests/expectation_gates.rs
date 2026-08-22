@@ -450,6 +450,291 @@ fn both_gates_refuse_an_unsupported_verdict_and_are_shown_able_to() {
     }
 }
 
+/// **P15's wire clause has teeth, proven against planted violations** (plan §18
+/// item 85, design §15.73).
+///
+/// The clause hides in exactly the place its two siblings do: CI runs the doctor
+/// **passively**, so P15 reports `skipped`, the antecedent is false, and nothing on
+/// either automated lane ever evaluates it. The antecedent is therefore built
+/// synthetically here, and the shape it is built into is a *rig* reading — one port
+/// row carrying a complete wire block — on a box with no adapters.
+///
+/// **The positive control comes first and does double duty**: it proves the honest
+/// shape is admitted (or every rejection below would be proving some other clause),
+/// and it proves the tolerance arm — a row with **no** `wire_flow_control` at all —
+/// is admitted too, which is the disposition committed artifacts captured before
+/// this key existed depend on (§16.13).
+#[test]
+fn the_p15_wire_clause_rejects_a_reading_that_cannot_say_what_it_measured() {
+    if !have_jq() {
+        eprintln!("skipping: jq is not on PATH (CI has it — it runs these files)");
+        return;
+    }
+    let expectation = platform_expectation();
+    let out = Command::new(serial_nexus_itest::bin("serial-nexus-doctor"))
+        .arg("--json")
+        .output()
+        .expect("the doctor runs");
+    let report = String::from_utf8(out.stdout).expect("the report is utf-8");
+
+    let p15 = |body: &str| {
+        jq_filter(
+            &format!(
+                r#"(.probes[] | select(.id=="P15")) |= (.status = "supported" | del(.reason) | .observations = {body})"#
+            ),
+            &report,
+        )
+    };
+    // The row the FT232R bench actually produced (design §15.73), reduced to the
+    // cells the clause names. The sibling clauses' cells ride along because a row
+    // missing those is refused by *them*, and every rejection below would then be
+    // proving one of those instead of this one.
+    const SIBLINGS: &str = r#""honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true,"software_flow_control":{"asks":"…","measured":true,"tcsetattr_ok":true,"honoured_on_readback":true,"silently_dropped":false,"serial2_readback_would_fault":false,"shipped_predicate_agrees":true}"#;
+    let wire = |cells: &str| {
+        format!(r#"[{{"key":"/dev/ttyUSB0","value":{{{SIBLINGS},"wire_flow_control":{cells}}}}}]"#)
+    };
+    const GATED: &str = r#"{"asks":"…","measured":true,"does_not_license":"…","peer_port":"/dev/ttyUSB1","baud":115200,"payload_bytes":1024,"receive_window_ms":300,"reading":"gated","honoured_on_the_wire":true,"released_after_peer_raised_rts":1024,"released_intact":true,"cts_after_release":true,"flag_on_peer_not_ready":{"cts_at_transmitter":false,"bytes_accepted_by_the_kernel":1024,"bytes_delivered_to_the_peer":0,"delivered_intact":true},"control_flag_off_peer_not_ready":{"cts_at_transmitter":false,"bytes_accepted_by_the_kernel":1024,"bytes_delivered_to_the_peer":1024,"delivered_intact":true},"control_flag_on_peer_ready":{"cts_at_transmitter":true,"bytes_accepted_by_the_kernel":1024,"bytes_delivered_to_the_peer":1024,"delivered_intact":true}}"#;
+
+    assert!(
+        gate_accepts(&expectation, &p15(&wire(GATED))),
+        "{} refused the wire reading this bench actually produced — every \
+         rejection below would be vacuous",
+        expectation.display()
+    );
+
+    // The tolerance arm: a row with no wire cell at all is admitted, because
+    // `docs/doctor/` holds frozen artifacts that predate the key.
+    assert!(
+        gate_accepts(
+            &expectation,
+            &p15(&format!(
+                r#"[{{"key":"/dev/ttyUSB0","value":{{{SIBLINGS}}}}}]"#
+            ))
+        ),
+        "{} refused a P15 row captured before the wire reading existed — that \
+         would make this clause an instrument-version detector, which is the \
+         disposition the field_set clause spells out at length",
+        expectation.display()
+    );
+
+    // **Every answer but one is free** (§7, §7.1 clause 2). `inert` is the finding
+    // plan §18 item 85 is about and it must not redden a lane: nothing in the
+    // daemon consults it, and a bench that reads it is reporting a driver, not
+    // failing a build. Same for the two arms that are about the bench.
+    for reading in ["inert", "partly-gated", "gated-then-lost"] {
+        let other = GATED
+            .replace(r#""reading":"gated""#, &format!(r#""reading":"{reading}""#))
+            .replace(
+                r#""honoured_on_the_wire":true"#,
+                r#""honoured_on_the_wire":false"#,
+            )
+            .replace(
+                r#""flag_on_peer_not_ready":{"cts_at_transmitter":false,"bytes_accepted_by_the_kernel":1024,"bytes_delivered_to_the_peer":0"#,
+                r#""flag_on_peer_not_ready":{"cts_at_transmitter":false,"bytes_accepted_by_the_kernel":1024,"bytes_delivered_to_the_peer":1024"#,
+            );
+        assert!(
+            gate_accepts(&expectation, &p15(&wire(&other))),
+            "{} reddened on a `{reading}` reading — that is a driver finding the \
+             report states and the daemon does not act on, never a gate failure",
+            expectation.display()
+        );
+    }
+    let unmeasurable = r#"{"asks":"…","measured":false,"unmeasurable_here":"no pair P5 verified contains this port","does_not_license":"…"}"#;
+    assert!(
+        gate_accepts(&expectation, &p15(&wire(unmeasurable))),
+        "{} reddened on a bench that cannot be asked the wire question — a 3-wire \
+         rig is §5's own stated assumption",
+        expectation.display()
+    );
+
+    // **The two control cells are the teeth.** A gated cell with nothing to compare
+    // it against is the vacuity this item exists to prevent: a link carrying nothing
+    // delivers the same zero a held transmitter does.
+    for key in [
+        "control_flag_off_peer_not_ready",
+        "control_flag_on_peer_ready",
+        "flag_on_peer_not_ready",
+    ] {
+        let holed = GATED.replace(&format!(r#""{key}":{{"#), r#""unrelated":{"#);
+        assert!(
+            !gate_accepts(&expectation, &p15(&wire(&holed))),
+            "{} admitted a wire reading with `{key}` absent — a reading with no \
+             control is not a reading",
+            expectation.display()
+        );
+    }
+    for key in [
+        "reading",
+        "peer_port",
+        "released_after_peer_raised_rts",
+        "released_intact",
+        "payload_bytes",
+    ] {
+        let holed = GATED.replace(&format!(r#""{key}":"#), r#""unrelated":"#);
+        assert!(
+            !gate_accepts(&expectation, &p15(&wire(&holed))),
+            "{} admitted a measured wire reading with `{key}` absent",
+            expectation.display()
+        );
+    }
+    // `honoured_on_the_wire` is spelled with `has`, not with `type`: `null` is a
+    // real answer here (the two arms that are about the bench rather than the
+    // driver), and an ABSENT key is what a half-written emitter produces. A missing
+    // path in jq evaluates to `null`, so `type` alone cannot tell them apart — the
+    // same disposition the software half's `shipped_predicate_agrees` carries.
+    let nulled = GATED.replace(
+        r#""honoured_on_the_wire":true"#,
+        r#""honoured_on_the_wire":null"#,
+    );
+    assert!(
+        gate_accepts(&expectation, &p15(&wire(&nulled))),
+        "{} refused a null `honoured_on_the_wire` — that is the reading a bench \
+         this instrument could not stimulate legitimately produces",
+        expectation.display()
+    );
+    let absent = GATED.replace(r#""honoured_on_the_wire":true"#, r#""unrelated":true"#);
+    assert!(
+        !gate_accepts(&expectation, &p15(&wire(&absent))),
+        "{} admitted a measured wire reading that never says whether the wire \
+         honoured the flag",
+        expectation.display()
+    );
+
+    // **A confident positive with no stimulus behind it is refused**, which is the
+    // one place this clause reads a value. `gated` is a claim about a driver, and
+    // the probe promises it only ever issues one with the transmitter's CTS
+    // measured low while the peer held RTS low. Without that, the same reading
+    // would be issuable on a bench where nothing was ever told to stop — which is
+    // this item's whole subject, one instrument over.
+    for planted in [
+        r#""cts_at_transmitter":true"#,
+        r#""cts_at_transmitter":null"#,
+    ] {
+        let unstimulated = GATED.replacen(r#""cts_at_transmitter":false"#, planted, 1);
+        assert!(
+            !gate_accepts(&expectation, &p15(&wire(&unstimulated))),
+            "{} admitted a `gated` verdict over a transmitter whose CTS was never \
+             lowered ({planted}) — a positive claim with no stimulus behind it",
+            expectation.display()
+        );
+    }
+    // …and the same missing stimulus under any *other* reading is admitted, because
+    // there the cell is reporting the bench rather than clearing a driver.
+    let bench = GATED
+        .replace(r#""reading":"gated""#, r#""reading":"no-cts-path""#)
+        .replace(
+            r#""honoured_on_the_wire":true"#,
+            r#""honoured_on_the_wire":null"#,
+        )
+        .replacen(
+            r#""cts_at_transmitter":false"#,
+            r#""cts_at_transmitter":true"#,
+            1,
+        );
+    assert!(
+        gate_accepts(&expectation, &p15(&wire(&bench))),
+        "{} reddened on the reading a bench that cannot be stimulated produces — \
+         that arm exists so a cable is never reported as a driver defect",
+        expectation.display()
+    );
+
+    // An unmeasured cell that cannot say why is refused: unmeasurable is data
+    // (§15.47), and a bare `measured: false` is the absence it exists to replace.
+    let silent = r#"{"asks":"…","measured":false,"does_not_license":"…"}"#;
+    assert!(
+        !gate_accepts(&expectation, &p15(&wire(silent))),
+        "{} admitted an unmeasured wire cell carrying no reason",
+        expectation.display()
+    );
+    // And the bound may never be dropped: it is the only place in the artifact that
+    // states §7.1 clause 2's decision — the pre-check decides acceptance, never wire
+    // behaviour — and `expectations/*.jq` is the only gate that can see it, because
+    // the digests read leaf paths and never values.
+    let unbounded = GATED.replace(r#""does_not_license":"…""#, r#""unrelated":"…""#);
+    assert!(
+        !gate_accepts(&expectation, &p15(&wire(&unbounded))),
+        "{} admitted a wire reading that states no bound on what it licenses",
+        expectation.display()
+    );
+}
+
+/// The clause-identity guard for P15's wire clause, for the reason the others give:
+/// the behavioural proof above runs against one platform's gate and reaches the
+/// other only through this identity. The defect the clause instruments — a driver
+/// that keeps `CRTSCTS` and ignores it — was found on a Linux CDC-ACM bench and the
+/// discrimination measured on a Linux FT232R one, and a clause that lived on the
+/// Linux lane alone would be blind on the platform where §15.53's founding
+/// measurement was taken.
+#[test]
+fn both_expectation_files_carry_the_same_p15_wire_clause() {
+    // **The whole clause, not landmarks in it.** Until 2026-08-21 this guard held
+    // three fragments — head, stimulus, controls — and every conjunct it did not
+    // name could be deleted from `expectations/macos.jq` from a Linux box with
+    // nothing noticing. Measured rather than reasoned: with
+    // `has("honoured_on_the_wire")` and the release conjunct deleted from the macOS
+    // file, the landmark version of this test ran **green** and the version below
+    // reddens on the same tree. The property being asserted is that the two files
+    // carry the *same* clause, and the only faithful spelling of that is string
+    // equality over the clause itself — proven here against a third conjunct again
+    // (`payload_bytes`), so the guard is not shaped around the two that found it.
+    let clause = |name: &str| -> String {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("the expectation file is readable");
+        let lines: Vec<&str> = text.lines().collect();
+        // The clause is one top-level `and (…)` block: it opens at column 0 and
+        // every line of its body is indented, so the block is bounded by the next
+        // line that starts at column 0 (the following comment).
+        let first = lines
+            .iter()
+            .position(|l| l.contains("wire_flow_control"))
+            .unwrap_or_else(|| panic!("{name} carries no P15 wire clause at all"));
+        let start = lines[..=first]
+            .iter()
+            .rposition(|l| l.starts_with("and ("))
+            .unwrap_or_else(|| {
+                panic!("{name}'s wire clause is not inside a top-level `and (…)` block, so this walker cannot bound it")
+            });
+        let mut end = first;
+        while end + 1 < lines.len() && lines[end + 1].starts_with(' ') {
+            end += 1;
+        }
+        let clause = lines[start..=end].join("\n");
+        // **The walker proves itself, because a walker that returns the same two
+        // empty strings compares equal** — AGENTS §3's tell, in the register where
+        // the gate's own extractor is the thing that went quiet. Both landmarks are
+        // about *this* block rather than about any conjunct in it, so tightening or
+        // loosening the clause does not touch them.
+        assert!(
+            clause.starts_with(r#"and (all(.probes[]; . as $p | ($p.id != "P15")"#),
+            "{name}: the walker bounded something that is not the P15 clause: {clause}"
+        );
+        assert!(
+            clause.trim_end().ends_with("))"),
+            "{name}: the walker stopped inside the clause rather than at its end: {clause}"
+        );
+        let mentions = clause.matches("wire_flow_control").count();
+        assert!(
+            mentions >= 19,
+            "{name}: the walker returned a clause naming `wire_flow_control` only \
+             {mentions} times — it carried 21 when this floor was written (measured, \
+             not counted by eye), and the floor is here because two silently \
+             truncated extractions compare equal to each other and prove nothing. \
+             If the clause genuinely lost three conjuncts, lower this with the new \
+             count in hand."
+        );
+        clause
+    };
+    let linux = clause("expectations/linux.jq");
+    let macos = clause("expectations/macos.jq");
+    assert_eq!(
+        linux, macos,
+        "expectations/linux.jq and expectations/macos.jq no longer carry the same \
+         P15 wire clause — the behavioural proof in this file runs against one \
+         platform's gate and reaches the other only through this identity, so a \
+         conjunct that lives on one lane alone is untested on the other"
+    );
+}
+
 /// The clause-identity guard for the summary clause and for the P6/P7 words, for the
 /// reason the three above give — and with one difference worth stating: this pair
 /// had *drifted*, so the identity assert is what stops it drifting again.
@@ -531,7 +816,9 @@ fn both_expectation_files_carry_the_same_new_flow_and_close_shape_clauses() {
                   or ((.value.software_flow_control.tcsetattr_ok | type == "boolean")
                       and (.value.software_flow_control.honoured_on_readback | type == "boolean")
                       and (.value.software_flow_control.silently_dropped | type == "boolean")
-                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean"))))))))"#;
+                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean")
+                      and (.value.software_flow_control | has("shipped_predicate_agrees"))
+                      and (.value.software_flow_control.shipped_predicate_agrees | type | . == "boolean" or . == "null"))))))))"#;
     let arrival = r#"and (all(.probes[]; . as $p | ($p.id != "P13") or
       ($p.observations | any(.key == "e_reader_arrives_during_close_wait"
          and (.value | type == "object")
@@ -805,7 +1092,8 @@ fn the_p15_software_clause_rejects_a_reading_that_was_never_taken() {
              "iflag_before_hex":"0x5","iflag_after_hex":"0x1405",
              "ixon_on_readback":true,"ixoff_on_readback":true,
              "honoured_on_readback":true,"silently_dropped":false,
-             "serial2_readback_would_fault":false,"does_not_license":"…"}}}])"#;
+             "serial2_readback_would_fault":false,"shipped_predicate_agrees":true,
+             "does_not_license":"…"}}}])"#;
     let honest = jq_filter(HONEST, &report);
     assert!(
         gate_accepts(&expectation, &honest),
@@ -849,6 +1137,69 @@ fn the_p15_software_clause_rejects_a_reading_that_was_never_taken() {
     assert!(
         !gate_accepts(&expectation, &planted),
         "{} admitted a `measured` software reading with no read-back verdict",
+        expectation.display()
+    );
+
+    // Plant 4 — `measured: true` with the software half's **cross-check** gone (plan
+    // §18 item 73). This is the shape a revert of that item takes, and it is the one
+    // spelling `type` alone cannot see: a missing path evaluates to `null` in jq, and
+    // `null` is a legitimate value for this key, so the clause must ask `has` as well.
+    // Without both questions the gate would accept a report that dropped the field
+    // entirely — a passing output identical to its not-running output (AGENTS §3).
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= del(.shipped_predicate_agrees)"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a `measured` software reading carrying no cross-check against the \
+         predicate `load` consults — the state plan §18 item 73 was filed about",
+        expectation.display()
+    );
+
+    // Plant 5 — the key present but carrying a type that is neither an answer nor an
+    // honest absence. `has` alone would admit this, which is why the clause asks both.
+    let planted = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= (.shipped_predicate_agrees = "yes")"#,
+        &honest,
+    );
+    assert!(
+        !gate_accepts(&expectation, &planted),
+        "{} admitted a software cross-check whose value is a string",
+        expectation.display()
+    );
+
+    // Control C — the cross-check reporting a **disagreement**. The answer is free here
+    // exactly as it is for the reading cells: a `false` is a finding P15 degrades on and
+    // narrates, and a clause that reddened on it would fail the lane for the defect
+    // instead of reporting it.
+    let disagreeing = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= (.shipped_predicate_agrees = false | .serial2_readback_would_fault = true)"#,
+        &honest,
+    );
+    assert!(
+        gate_accepts(&expectation, &disagreeing),
+        "{} reddened on a report and a daemon that disagree about a port — that is the \
+         finding item 73 added the cell to surface, not a lane to fail",
+        expectation.display()
+    );
+
+    // Control D — present and `null`: the predicate could not open the port. §7.1 makes
+    // that *unmeasured*, never a refusal, so it must pass. This is the disposition that
+    // is the **opposite** of every other cell in this block, where present-but-null is
+    // rejected, and it is asserted here so the asymmetry is a decision on the record.
+    let unreachable = jq_filter(
+        r#"(.probes[] | select(.id=="P15") | .observations[].value.software_flow_control)
+           |= (.shipped_predicate_agrees = null)"#,
+        &honest,
+    );
+    assert!(
+        gate_accepts(&expectation, &unreachable),
+        "{} rejected a cross-check the shipped predicate could not take — unmeasured is \
+         data (§15.47), and refusing it pushes the probe toward inventing an answer",
         expectation.display()
     );
 
@@ -1581,7 +1932,7 @@ fn the_flow_control_clause_rejects_a_reading_that_cannot_say_what_it_measured() 
     // the hardware cells would be refused by the sibling clause and every rejection
     // below would then be proving that one instead of this one. Its own plants live
     // in `the_p15_software_clause_rejects_a_reading_that_was_never_taken`.
-    const FULL: &str = r#"[{"key":"/dev/ttyUSB0","value":{"honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true,"software_flow_control":{"asks":"…","measured":true,"tcsetattr_ok":true,"honoured_on_readback":true,"silently_dropped":false,"serial2_readback_would_fault":false}}}]"#;
+    const FULL: &str = r#"[{"key":"/dev/ttyUSB0","value":{"honoured_on_readback":true,"tcsetattr_ok":true,"baseline_restored":true,"software_flow_control":{"asks":"…","measured":true,"tcsetattr_ok":true,"honoured_on_readback":true,"silently_dropped":false,"serial2_readback_would_fault":false,"shipped_predicate_agrees":true}}}]"#;
 
     // The honest shape must be ACCEPTED, or every rejection below proves nothing
     // about this clause and everything about some other one.

@@ -4,12 +4,16 @@
 Tier-3 hardware rig (the tier ladder is §13's) on both kernels, a Linux replug lane driven by the
 repository-carried privileged helper (§15.45, amended by §15.55), and the cross-kernel doctor
 campaigns whose committed artifacts under `docs/doctor/` back every kernel claim below. §1–§14 and
-§17 are normative for the system as built, with **exactly one design-ahead-of-tree surface**: the
-`actual_baud` read-back in a serial node's state (§7.1, decided at §15.58), written here before
-the tree moves — the amend-first order AGENTS §5 requires — and carried as plan §18 item 41. Its
-predecessor is settled: the pattern wait (§10, §15.56) was specified the same way one generation
-back and plan §18 item 47 built it the same day, so §10's pattern-wait subsection is system like
-the rest. §15–§16 are the decision record.
+§17 are normative for the system as built and carry **no design-ahead-of-tree surface at all**.
+The last one was the `actual_baud` read-back in a serial node's state (§7.1 clause 7, decided at
+§15.58), written here before the tree moved — the amend-first order AGENTS §5 requires — and
+**built 2026-08-15 as plan §18 item 41**, whose entry records in as many words that "the two now
+agree completely". §7.1 clause 7 says the same at its own site. Its predecessor went the same way:
+the pattern wait (§10, §15.56) was specified one generation back and plan §18 item 47 built it the
+same day, so §10's pattern-wait subsection is system like the rest. **This paragraph claimed the
+`actual_baud` surface was still ahead of the tree for six days after item 41 closed it**, while the
+clause it named said the opposite — the class §15.72 collects, filed as plan §18 item 108.
+§15–§16 are the decision record.
 Measured figures — suite
 counts, gate scopes, wall-clock costs — live in exactly one place, the plan's Status table, and are
 quotable only with the scope recorded there; this document deliberately carries none. What remains
@@ -615,12 +619,31 @@ was exactly where a node ceases to exist and `state` can no longer report it.
    attributable and one number for eight channels says what was lost without saying where.
    **Deliberate:** a `faces = "target"` leg's per-channel hostward relay is excluded —
    charging it here would report a hostward loss under a targetward name (notes §3.55).
-   **Limit, named and open:** `exec`'s figure is a floor, not a total — its internal merge
-   stage is beyond the handle's reach, so a torn-down `exec` can destroy more than it reports,
-   never less — ledgered open work (plan §18); the pty's held `pending` payload is not fixable
-   the same way and is recorded, not re-filed, in the ledger's closing register. Both are
-   stated here rather than left to be discovered by someone diffing the counter against the
-   conservation sum.
+   **Every kind that has a targetward queue of this shape reports a total, `exec`'s included**
+   (plan §18 item 21, executed 2026-08-12; notes §3.86). `exec` was the one floor, and the shape is worth keeping because
+   it is what the item closed: the ledger watched only the host-facing per-channel queues, so a
+   chunk that had moved into the node's *internal* merged queue was beyond the handle's reach
+   and a torn-down `exec` could destroy more than it reported, never less. That merge stage is
+   watched now, through the same `TargetwardInbox` the `serial`/`leg` adoption built — the
+   invariant holding one stage further in than the fix that named it reached (notes §3.31,
+   §3.55). Only its targetward half is charged: the merged queue carries both directions at
+   once, and an item riding the reserved multiplexed channel identity is the raw hostward
+   device stream on its way into the child, so charging it here would report a hostward loss
+   under a targetward name — the same exclusion the leg's per-channel relay is held to, one
+   node kind over (§7.6 clause 8, §8 clause 14).
+   **What remains is a boundary, not a floor:** what has left the daemon is delivery — bytes
+   already inside a child's stdin pipe, exactly like bytes written to a device fd, are outside
+   every kind's figure — and the pty's held `pending` payload is not fixable the same way and
+   is recorded, not re-filed, in the ledger's closing register. Both are stated here rather
+   than left to be discovered by someone diffing the counter against the conservation sum.
+   **The headline's qualifier is load-bearing, because the code carries it too:** `pty` and `log`
+   answer a structural `0` — the log is target-facing and the pty's undelivered payload is a held
+   `pending` slot inside its reader's own stack frame, reachable from nowhere this counter can
+   go — so those two zeros are *the absence of a queue*, never a measured total of one. Reading
+   the headline over all seven kinds is the over-read this sentence exists to stop; it said
+   "Every kind's figure is a total" flat until 2026-08-21, which is stronger than
+   `Node::discarded_at_teardown`, whose `pty`/`log` arm returns `0` with the reason written
+   beside it (plan §18 item 108, §15.72).
 
 ### The hybrid architecture
 
@@ -1066,6 +1089,32 @@ would be degraded here is not an observation but the transport's *contract*.
    accept-then-drop and was refused at load, while P15 — which does record the set status — called
    the same port `supported`. The tree moved to clause 7, which is the contract; this clause moved
    to match the tree it now describes.)*
+   *(Annotated 2026-08-21 (plan §18 item 73, notes §3.146): **the cross-check this clause
+   requires covered `rts-cts` alone until this date.** P15's software cell was a second
+   hand-rolled read-back with nothing between it and the shipped predicate — the
+   two-callers-that-can-disagree shape this clause's own first sentence forbids — tolerable
+   only while plan §18 item 14's decline stood and
+   no `load` consulted the software answer, and a defect from §15.61 onward, which made an
+   accept-then-drop software reading refuse an operator's config. The
+   `software_flow_control.shipped_predicate_agrees` cell now carries the comparison for the
+   second mode, on both kernels' expectation files.
+   **Which arm it compares is the whole value of the field:** the by-hand side is classified from
+   the probe's *whole*-`c_iflag` comparison — `serial2`'s own, and the one that decides whether the
+   node's open faults — never from the `ixon`/`ixoff` reading that mirrors `honours_flow_control`'s
+   `contains(IXON | IXOFF)` subset test. A field built from the mirroring reading would agree **by
+   construction**, and would report `true` on precisely the port where the two implementations
+   part: item 56 one mode over, and worse than no field at all, because it reads as evidence.
+   Measured on the FT232R pair, both ports `shipped_predicate_agrees: true` against `c_iflag`
+   `0x5` → `0x1405` (`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-tier3.json`, `probe_set`
+   `4317ea5ac187f506`, `field_set` `f18630922c4eecc7`); and separated on the same bench by a plant
+   that simulates the driver rather than the conclusion — a third `c_iflag` bit inserted into the
+   word fed to `iflag_matches_request`, leaving the flag cells and the predicate answering honestly
+   — under which both ports read `software_flow_control.shipped_predicate_agrees: false` while the
+   top-level hardware cross-check read **`true`** and saw nothing. **A bound the field cannot
+   exceed:** it sees a drift in the *answer*, never in the *request*, since the probe compares its
+   read-back against its own `want` (notes §3.146). A probe change and not a contract change: no
+   verdict, no refusal and no predicate moved, P15's `question` is unchanged, and §13's era law
+   clause 4 covers the `field_set` move it costs — **no era closes**.)*
 3. The pre-check asks its question through `Resolver::resolve_current_path` — the same call the
    node's open makes — so check and open cannot disagree about *which device* is asked either;
    the naive `Path::exists` form was 100% dead on `add-node`, on every `load` of a `dump`ed
@@ -1107,18 +1156,78 @@ would be degraded here is not an observation but the transport's *contract*.
    `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so the node would
    fail its own open with the bare `failed to apply some or all settings`. The discrimination is
    proven rather than assumed — a Darwin **pts** honours the same request (`0x2b02` → `0x2f02`)
-   and is not refused. The superseded per-mode status follows.
-   `rts-cts` is measured on both kernels — Linux honours the flag
-   (`cflag` delta exactly `CRTSCTS`; the `7cf0338` Linux triple — a committed doctor artifact,
-   the citation convention is §13's — 2026-08-05, and the Linux 6.18
-   field report at `3e23c52` agree) and Darwin's `IOSerialFamily` accepts-then-drops it on the
-   FT232R rig (`silently_dropped: true` on both ports; the `acb5162` macOS triple, 2026-08-05)
-   — so the refusal arm and the honour arm have each executed on real hardware. A driver that
-   *refuses* the flag outright is honest and is not refused here; only accept-then-drop is the
-   defect (§15.53). `xon-xoff` has no pre-check and no probe, and `serial2` verifies `c_iflag`
-   by read-back too, so a driver silently dropping `IXON`/`IXOFF` would fault the same late way:
-   that mode is **unmeasured rather than known-good**, named here and carried as open work
-   (plan §18 item 14).
+   and is not refused. **The superseded per-mode status follows, quoted rather than corrected —
+   and exactly one of its two halves is superseded.** The block's **`xon-xoff` sentence** is the
+   stale half; the annotation printed under the block shows it was false in *both* of its claims.
+   The block's **`rts-cts` sentence is still accurate**, and both of its citations still read as
+   quoted: the `7cf0338` Linux triple reads `cflag` `0x10021cb2` → `0x90021cb2`, a delta of
+   exactly `0x80000000` (`CRTSCTS`), on both ports of all three captures, and the `acb5162`
+   macOS triple reads `0x4b00` → `0x4b00` with `silently_dropped: true` on both. That split is
+   why the whole block kept being read as live — an accurate half carrying citations the live
+   text above does not restate. **This preamble said "nothing inside the quoted block below is
+   current" and then contradicted itself in the next sentence**, from 2026-08-21 until it was
+   repaired the same day: a blanket disclaimer over a block whose halves differ makes them
+   indistinguishable again from the other direction, which is the failure it was written to fix
+   (plan §18 item 108, §15.72).
+
+   > `rts-cts` is measured on both kernels — Linux honours the flag
+   > (`cflag` delta exactly `CRTSCTS`; the `7cf0338` Linux triple — a committed doctor artifact,
+   > the citation convention is §13's — 2026-08-05, and the Linux 6.18
+   > field report at `3e23c52` agree) and Darwin's `IOSerialFamily` accepts-then-drops it on the
+   > FT232R rig (`silently_dropped: true` on both ports; the `acb5162` macOS triple, 2026-08-05)
+   > — so the refusal arm and the honour arm have each executed on real hardware. A driver that
+   > *refuses* the flag outright is honest and is not refused here; only accept-then-drop is the
+   > defect (§15.53). `xon-xoff` has no pre-check and no probe, and `serial2` verifies `c_iflag`
+   > by read-back too, so a driver silently dropping `IXON`/`IXOFF` would fault the same late way:
+   > that mode is **unmeasured rather than known-good**, named here and carried as open work
+   > (plan §18 item 14).
+
+   **Annotated 2026-08-21 (plan §18 item 113): the quoted `xon-xoff` sentence is false in
+   both of its claims, and had been for eight days.** *There is a pre-check*:
+   `flow_precheck_target` maps `FlowControl::XonXoff` to `serial_nexus_sys::FlowMode::XonXoff`,
+   and the daemon's load path runs the result through
+   `flow_precheck_refuses(honours_flow_control(&path, mode).ok())` — the same call the
+   `rts-cts` mode takes, with `.ok()` as clause 5's sanctioned *unmeasured* collapse.
+   `honours_flow_control`'s `XonXoff` arm sets `IXON|IXOFF` and clears `CRTSCTS`, and its
+   read-back requires **both** input flags, because `serial2` compares the whole `c_iflag`
+   word. *There is a probe*: P15 carries a `software_flow_control` observation block, landed at
+   plan §18 item 14 — **executed** 2026-08-13 (notes §3.89), not open — reading `c_iflag`
+   `0x5` → `0x1405` on `ftdi_sio`, both ports
+   (`docs/doctor/linux-7.0-2026-08-21-25d8ecd-tier3.json`, `25d8ecd39aed`, `probe_set`
+   `4317ea5ac187f506`, 2026-08-21), against `0x0` → `0x0` with `tcsetattr_ok: true` on Darwin's
+   `IOSerialFamily` (`docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3.json`, `b3461886e27a`,
+   the same `probe_set`, 2026-08-13). And the mode *is* refused where the driver drops it, per
+   §15.61. **The clause therefore disagreed with itself, twice over** — this clause's own live
+   text above and clause 6's parenthetical some twenty lines up each said all three, and §15.61
+   says it a third time — and the half a reader reaches last is the half that was wrong. **How it was
+   found is the transferable part:** not by reading §7.1, which two passes had read closely,
+   but by a scan costing an unrelated gate, which had no idea which sentence was meant to be
+   live and so read them all.
+8. **The pre-check decides whether the driver *accepts* the setting; it never decides whether the
+   wire *honours* it.** A port that reads `Honoured` may still be inert, and that is measured
+   rather than feared: on §15.62's CDC-ACM bench `CRTSCTS` was accepted **and persisted in the
+   `termios` read-back** — `c_cflag` gaining exactly `0x80000000` on both ports of all four
+   captures, which is the invariant; the words themselves differ per port and per run
+   (`0x10021cb2` → `0x90021cb2` on `ttyACM0`, `0x100218b2` → `0x900218b2` on `ttyACM1` in
+   `docs/doctor/linux-7.0-2026-08-17-a7e6070-tier3.json`) — while a 2×2 control (peer RTS low/high
+   × `CRTSCTS` on/off, peer never reading) wrote 44672 bytes in every one of the four cells,
+   spread 0. The predicate of clause 2 answers about
+   acceptance, so `Honoured` licenses the `load` and nothing further; the operator can hold a port
+   that reports flow control and does not perform it. **`load` and `add-node` are unchanged and no
+   new refusal is added** (decided 2026-08-21 — §15.73, plan §18 item 85), and the reason is
+   structural rather than a tolerance: separating *honoured* from *inert* needs a peer, a transfer
+   and a stall, while a pre-check has one port and one `tcsetattr` at a position §11 puts *before
+   anything is created*. It is the wrong instrument for the question, not a lax one. **This clause
+   adds no bound to clause 2 and states the one clause 2 enumerated**: four read-back answers, of
+   which one refuses. It is here because the shipped code and the ledger both cite §7.1 for the
+   sentence, and a citation whose target has to be inferred is the shape §15.72 catalogues. **The
+   instrument that can ask it is the doctor**, because it holds both ends of a cable P5 has
+   certified: P15 carries a `wire_flow_control` reading per direction, emitted only where P5
+   measured an RTS/CTS crossing **both ways** on that pair, and it is **reported, never judged** —
+   no pre-check consults it, no verdict moves on it, and `flow_control = "rts-cts"` behaves exactly
+   as clauses 1–5 say whatever the cell reports. What such a reading licenses is one port, one
+   driver, one peer, at its stated rate and payload: an `inert` reading is that port's answer, and
+   a `gated` one clears that port rather than the driver family it belongs to.
 
 ### 7.2 PTY node
 
@@ -1260,15 +1369,96 @@ character size, parity, flags), and drop counters.
     inventing a Linux mechanism for a shape that costs nothing, downward means discarding an
     edge the kernel is already giving away (§15.39). Doctor P12 sits beside P7 so the two
     detach-release mechanisms are diffable across kernels.
-12. The last-close block also drains the master so the poll loop cannot spin on a hung-up pty —
-    a hazard that cannot occur on the kernel of record (P6 measures `pollin_passes: 0` with
-    `read_outcomes {EIO: 64}` on a hung-up master there, against Darwin's 64 of 64
-    `POLLIN|POLLHUP` passes), which makes its regression guard the tree's sharpest known
-    proxy-in-space: it self-skips off Linux, the one platform family where the hazard exists, so
-    a widened last-close predicate or a deleted latch drain would burn a core — and release
-    operator-held write locks — on macOS with the suite green. That gap is named open work, not
-    accepted silently (plan §18 item 12); P6 agreeing across Linux kernels is measurement of the
-    friendly platform, never permission to widen the predicate or delete the drain.
+12. The last-close block also drains the master. **Its headline reason read "so the poll loop
+    cannot spin on a hung-up pty" until 2026-08-21, and that reason did not survive the
+    measurement thirty lines below** (plan §18 item 108, §15.72): the spin is a property
+    *neither* kernel exhibits, so the drain's two live legs are the collapsed-session write-lock
+    leak, which both kernels share, and P6's re-arm, which is Linux's alone — and those are the
+    reasons this clause now leads with. The spin was never observable on the kernel of record in
+    the first place: P6 measures `pollin_passes: 0` with `read_outcomes {EIO: 64}` on a hung-up
+    master there, against Darwin's 64 of 64 `POLLIN|POLLHUP` passes. That is exactly what made
+    the old regression guard the tree's sharpest known **proxy-in-space** — it ran on Linux and
+    self-skipped everywhere else, so it asserted the property only on the kernel where P6 says
+    the property cannot fail, and stayed silent on the platform family the hazard was believed to
+    live on. *(This sentence read "it self-skipped off Linux, the one platform family where the
+    hazard exists" until 2026-08-21. Read left to right the appositive attaches to **Linux**,
+    which inverts both halves at once and contradicts the refutation three lines down; §15.72.)*
+    **That gate is gone** (plan §18 item 12, executed 2026-08-13; notes §3.96):
+    `serial_nexus_sys::process_cpu_nanos` is the portable CPU source the tree had said did not
+    exist, Darwin answering with `proc_pid_rusage` where Linux reads `/proc/<pid>/stat`, so
+    `a_bare_hangup_leaves_the_daemon_cpu_bounded` is a bare `#[test]` that runs on both kernels
+    against the same 10 % ceiling, converted rather than re-chosen. **The two kernels do not
+    read alike under it, and the ceiling is neither one's figure.** Darwin spends
+    **1.7–1.9 %** of a core over the 2 s window — the band plan §18 item 12 scopes to Darwin
+    in as many words, and notes §3.96 with it — while the Linux cost recorded at the guard's
+    own `MAX_CPU_NANOS` is **~10 ms in the same window, ≈0.5 %**, three to four times lower.
+    The shared 10 % ceiling is therefore ~20× the observed cost on the platform of record and
+    ~5× it on Darwin: a wall against a handler re-running `tcsetattr` on every poll, never a
+    tight bound on either kernel's idle cost, and quoting one kernel's band as both is the
+    scope error §13's citation rule exists to stop.
+    **The causal claim this clause made was then measured on the platform it named, and it did
+    not hold.** The claim was that a widened last-close predicate or a deleted latch drain
+    "would burn a core — and release operator-held write locks — on macOS with the suite green".
+    Planted on Darwin against a rebuilt binary, the ungated `|| closed` arm reads
+    **1.81/1.88/1.81 %** against an unplanted **1.87/1.88/1.81 %** — identical bands, the plant
+    moving nothing, and the same null Linux had already given. So the spin is a property neither
+    kernel exhibits rather than a Darwin hazard the guard was blind to: the reader's backoff is
+    not defeated by the handler re-firing, the extra work per pass being small and the cadence
+    still relaxing to `IDLE_POLL`. **Recorded as refuted rather than quietly dropped**
+    (AGENTS §9), and the refutation moves the drain's justification to where measurement puts
+    it — what bars the ungated arm is the collapsed-session **write-lock leak**, a correctness
+    property no probe measures and the two collapse guards beside it assert directly. With the
+    spin refuted the drain stands on exactly two legs, and that is the one both kernels share;
+    the second — P6's re-arm — has to be stated per kernel, because P6 does not read alike
+    across them.
+    **P6's re-arm reading is a Linux fact, and Darwin's value is the mechanism rather than a
+    gap.** `handler_reset_readable_bytes` is `1` in every committed Linux observation — 72 of
+    72 — and `0` in every committed macOS one — 32 of 32; the current-era witnesses are
+    `docs/doctor/linux-7.0-2026-08-21-25d8ecd-tier3.json` (`25d8ecd39aed`, `probe_set`
+    `4317ea5ac187f506`, 2026-08-21) and
+    `docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3.json` (`b3461886e27a`, the same
+    `probe_set`, 2026-08-13), with the Linux 6.18 field report at `3e23c52` reading `1` too.
+    **Darwin's `0` is not missing evidence; it is the thing P6 exists to separate.**
+    `handler_reset_extproc_retained` reads `true` in 64 of 64 Linux observations and `false` in
+    27 of 27 macOS ones: Darwin *accepts* the last-close baseline re-assert —
+    `handler_reset_applied: true` on both kernels, which says only that the syscall returned —
+    and then does not retain `EXTPROC`; and `EXTPROC` gates `TIOCPKT_IOCTL` entirely, so a
+    kernel that drops the flag emits no control packet at all, nothing becomes readable, and
+    the drain has nothing to consume. Reading the `0` as "the drain is idle here" inverts it.
+    **So the drain is justified on both kernels and the justifications are different.** On
+    **Linux** it is load-bearing by measurement: the node's own re-assert re-arms readability
+    and leaves exactly one byte on the master, which without the drain the handler would re-arm
+    for itself — the runaway returning by that route rather than through a stuck `POLLIN`. On
+    **Darwin** that packet never exists, so the drain rests there on the write-lock leak alone,
+    and **clause 4 of the baseline contract** above — this section carries two independently
+    numbered clause lists, and clause 4 of *this* one is the read-the-slave-dry clause — already
+    puts Darwin on the poll-only observation story for the same reason: P1 reports the fast-path
+    signals **absent** and degrades with the reconciliation poll named as the carrying mechanism.
+    So the two probes agree about one kernel, from two directions.
+    **P1 reads no byte, and this clause said it did between 2026-08-15 and 2026-08-21** (plan §18
+    item 108, §15.72). P1 carries exactly three booleans — `ioctl_packet_on_tcsetattr`,
+    `clear_extproc_produces_packet`, `reassert_extproc_via_master` — `false` in **32 of 32**
+    committed macOS artifacts, the current-era witness being
+    `docs/doctor/macos-24.6.0-2026-08-13-b346188-tier3.json` (`b3461886e27a`, `probe_set`
+    `4317ea5ac187f506`, 2026-08-13). `doctor/src/probes.rs`'s `p1_inner` tests
+    `b & TIOCPKT_IOCTL` and **discards** the bytes, so no leading byte can reach a report, and
+    `0x20` appears in no committed artifact on either kernel. The `0x20` (`TIOCPKT_DOSTOP`)
+    reading is real but is a **rig-session** measurement from 2026-07-28 recorded in
+    `docs/macos.md`, cited as such at the baseline contract's clause 4 — where its provenance is
+    stated instead of an artifact's — and it must not be re-cited as a probe observation, which
+    is AGENTS §7's rule and the reason the mis-attribution is worth a sentence rather than a
+    quiet deletion. **The identical false attribution was found and repaired once before**, by
+    the blind verifiers at the v15 landing, whose record names *"a §7.2 sentence claiming doctor
+    P1's artifact names the `0x20` byte it does not carry"*; it was reintroduced here in prose
+    that had every other citation right, which is the tell §15.72 is about — a claim verified
+    against a neighbouring sentence rather than against the artifact.
+    Neither reading licenses deleting the drain: AGENTS §7 forbids a one-way decision on
+    single-kernel evidence, and Darwin's `0` is the second leg being *explained*, not the
+    property being absent. What the
+    port bought is therefore not the hazard the clause predicted but the removal of a guard
+    that asserted nothing off Linux. P6 agreeing across **Linux** kernels — 7.0 and 6.18 —
+    remains measurement of the friendly platform, never permission to widen the predicate or
+    delete the drain.
 
 **Symlink rules.** The configured path is configuration; the pts target is state. A pre-existing
 path faults the node (environmental) — except a symlink dangling into devpts, presumed to be the
@@ -1412,9 +1602,19 @@ Contract:
 7. **Copyleft tools run unmodified.** Because the child is a separate process speaking a
    documented protocol, protocol tools under any license, including copyleft, can be used
    without linking (§13).
-8. **Its teardown-ledger figure is a floor**: the node's internal merge stage is not reached by
-   the §5 ledger, and §5 names that limit at the counter (notes §3.31); the remainder is held
-   in the work ledger (plan §18).
+8. **Its teardown-ledger figure is a total** (plan §18 item 21, executed 2026-08-12; notes
+   §3.86). It was a floor until then — the node's internal merge stage was not reached by the
+   §5 ledger, notes §3.31's original defect surviving one stage further in than the fix reached
+   — and that queue is watched now, through the same `TargetwardInbox` `serial` and `leg` made
+   possible. **Only its targetward half is charged**, and that discrimination lives on the
+   queue item's own type rather than in a blanket impl: the merged queue is the one queue here
+   carrying both directions at once, so an item tagged with the reserved multiplexed channel
+   identity is the raw hostward stream on its way into the child and charging it would report a
+   hostward loss under a targetward name (§5's exclusion, notes §3.55). The `deaf.py` fixture
+   of §8's register — a child that has stopped reading stdin, so the merge stage is holding
+   bytes at teardown — is what makes the guard measure a real quantity instead of a zero. What
+   stays outside the figure is what has left the daemon: the child's stdin pipe is delivery,
+   exactly as a serial node's device fd is.
 
 ### 7.7 Existing-terminal node
 
@@ -1636,10 +1836,14 @@ enforced or measured where the clause says, and a dropped clause is a visible di
     channel identity `""` (§7.6); configuration validation independently forbids the empty string
     as a real channel identity, so the reservation can never collide.
 14. **Teardown is accounted.** A codec or exec node destroyed by teardown reports the targetward
-    bytes it destroyed as `discarded_at_teardown` under §5's teardown ledger. **Deliberate
-    limit:** `exec`'s figure is a floor, because its internal merge stage is not reached — an
-    open, recorded residual carried in the plan §18 ledger, named here where the counter is
-    documented.
+    bytes it destroyed as `discarded_at_teardown` under §5's teardown ledger. **`exec`'s figure
+    is a total** (plan §18 item 21, executed 2026-08-12): it was a floor until the node's
+    internal merge stage came under the same watch, and the reserved multiplexed channel
+    identity charges `0` there, that half of the merged queue being hostward. The `deaf.py`
+    entry in the fixture register below is the fixture that makes the guard for it measure a
+    real quantity instead of a zero. **What remains is a boundary, not a floor:** bytes already
+    inside the child's stdin pipe are delivery, exactly as bytes written to a device fd are,
+    and no kind's figure claims them — stated here where the counter is documented.
 
 The exec codec's child-stdio boundary — stdin and stdout pumped as concurrently-polled futures so
 a blocked write never starves the read, stderr as a third pumped diagnostic stream, and
@@ -1819,14 +2023,33 @@ build your own harness around the envelope, give it a positive control — a kno
 it must pass and a known-broken codec it must fail — before you let it judge your codec, because
 the tree's own battery once failed correct codecs until `lag.py` pinned the check.
 
-Further kit and battery capabilities stay filed as plan §18 ledger items, deliberately not promised
-here as existing: **golden transcripts of the daemon boundary** (item 36) and a
-**teardown-conservation suite on a codec node** (item 38), and a **resync-accounting suite**
-(item 53). The **six** this list carried alongside
-them shipped 2026-08-12 and are described above and in `docs/codec-authors.md`: the
-attribute-schema suite (item 32), the `Err`-then-`Ok` recovery suite (item 33), the exec battery's
-error paths (item 34), demux-shape exec conformance (item 35, retiring the identity-passthrough
-limitation), executable doc examples (item 37), and the second template codec (item 39).
+**Every kit and battery capability this paragraph has ever listed now exists in the tree.** Nine
+were filed; all nine shipped in one batch on 2026-08-12 (notes §3.86). Six were already recorded
+here as shipped and are described above and in `docs/codec-authors.md`: the attribute-schema suite
+(item 32), the `Err`-then-`Ok` recovery suite (item 33), the exec battery's error paths (item 34),
+demux-shape exec conformance (item 35, retiring the identity-passthrough limitation), executable
+doc examples (item 37), and the second template codec (item 39). The other three shipped in the
+**same batch** and are:
+
+- **Golden transcripts of the daemon boundary** (item 36, executed 2026-08-12) —
+  `itest/tests/p8_daemon_transcript.rs`, generated against the live daemon so they cannot drift,
+  with a `serial-nexus-sim transcript` mode playing both roles off one file (`--record`,
+  `--verdict`). A transcript is two *ordered* streams, `<` and `>`, never one interleaved log: the
+  exec boundary is two pipes polled concurrently (§15.22), so pinning an interleaving would pin a
+  scheduling artifact.
+- **A teardown-conservation suite on a codec node** (item 38, executed 2026-08-12) —
+  `itest/tests/p5_codec_teardown.rs`, asserting `discarded_at_teardown` and §5's conservation
+  equality on a codec node under teardown.
+- **A resync-accounting suite** (item 53, executed 2026-08-12) — `resync_is_counted` in the kit
+  (`codec-api/src/test_support.rs`), opt-in and parameterized by the author's own malformed unit,
+  with `SilentResyncer` as the kit-honesty negative that passes all eight other suites and fails
+  only this one.
+
+**This paragraph promised those three as deliberately-absent for nine days after the tree built
+them**, and its own fixture register some 160 lines above already described one of them — the class
+§15.72 collects, filed as plan §18 item 108. A future capability that really is filed-and-unbuilt
+belongs here with its ledger number *and* the answer's date beside it, never in a standing sentence
+that outlives the answer.
 
 ### The extension surface
 
@@ -2080,7 +2303,12 @@ amend-first order (AGENTS §5) ran its full course — §15.56 is the decision r
    the engine never assumes text. Every dimension carries a stated, structurally checked
    maximum under §16.12's rule — pattern count, pattern and name length, compiled-pattern
    size, the lookback window, the context width, and the deadline — checked before anything
-   is armed (§7.1's range-check-before-assert shape).
+   is armed (§7.1's range-check-before-assert shape). **One further maximum is the
+   endpoint's rather than the request's**: an endpoint holds at most a stated number of
+   waits armed at the same time, because the hub rescans every armed wait's whole lookback
+   window on every chunk that endpoint ingests. The request past that maximum is refused
+   before anything is armed *or scanned* — the replay ring included — exactly as an
+   out-of-range dimension is (§15.70).
 3. **The engine is linear-time by requirement.** Patterns compile and match on the runtime
    thread, so a backtracking engine is an operator-reachable denial of service and is refused
    by design: the engine is non-backtracking with a bounded compile size (§15.56 records the
@@ -2586,9 +2814,39 @@ diagnostic binary consolidating every kernel-behavior probe the design depends o
    **Misreading callout, kept adjacent:** the shipped certificate contains a deliberate
    **baud** mismatch and local break **assertion** — not a parity mismatch, break reception,
    or far-side modem signalling (review 37, 37-TOOL-3; §15.21). Those belong to the checklist
-   run the certificate is the precondition *for*. The parity-mismatch and break-reception
-   remainder is plan §18 item 17; the far-side handshake wiring is since measured by P5's pair
-   block (clause 9, §15.52), reported and never judged.
+   run the certificate is the precondition *for* — and both are since **executed** as suite
+   guards rather than grown into P5, the doctor gaining nothing (plan §18 item 17, executed
+   2026-08-15; notes §3.108; §15.21's own annotation): break reception raises the far node's
+   `driver_counters.brk` by 1 with `frame +0` — one per break *event*, a 250 ms and a 25 ms
+   break moving it alike — and the parity mismatch answers **counted, not lost**: an 8E1
+   transmitter into an 8O1 receiver reads `parity +2` while the 43-byte payload arrives
+   byte-exact, so the pre-registered prediction of payload damage is refuted and recorded.
+   **Both readings are scoped to `ftdi_sio` on Linux 7.0.0-29, on a cross-wired FT232R pair**
+   (plan §18 item 17 scopes them, and the
+   `IGNBRK | IGNPAR` reading that explains why an errored character still arrives is P15's, at
+   `docs/doctor/linux-7.0-2026-08-14-b58a1c4-tier3.json`, `b58a1c4b7fc8`, `probe_set`
+   `4317ea5ac187f506`, 2026-08-14).
+   **The break half has a second reading, and it disagrees.** This clause added *"and neither has
+   been taken anywhere else"* on 2026-08-15 and this document falsified it on its own page the next
+   day (plan §18 item 108, §15.72): §15.62 clause 3 records a 250 ms break on `cdc_acm` moving
+   **`frame` +1 with `brk` +0**, filed and executed as plan §18 item 81. Where `ftdi_sio` moves
+   `brk` +1 with `frame` +0, that driver moves the other counter for the same physical event.
+   **Two drivers disagreeing about which counter a break lands in is worth more than one driver
+   measured once, and it is what the clause is written around**: which counter rises is the
+   *driver's* choice and no part of anything serial_nexus promises, so §15.21's checklist clause
+   asks only whether a break was **received** — it was, on both — and the guard names the counter
+   it found rather than pinning one, re-running its idle-window control against *that* counter so
+   a driver whose framing count free-runs cannot have noise chosen for it. `ftdi_sio`'s
+   break-over-parity-over-framing precedence is therefore one driver's ordering and never a kernel
+   fact; a pre-registration that assumed it was already refuted once (plan §18 item 81's own
+   pre-written message called the `cdc_acm` reading a *refutation, not a product defect*).
+   The **parity** half is the one with no second reading anywhere, and saying so narrowly rather
+   than over both halves is the whole use of a scope sentence.
+   Both guards self-skip off Linux on
+   `serial_nexus_sys::ICOUNTS_SUPPORTED`, and that is a **real gap rather than a formality** —
+   Darwin has no equivalent input-error counter, so this clause is unanswerable there until an
+   observable exists, and no rig creates one. The far-side handshake wiring is since
+   measured by P5's pair block (clause 9, §15.52), reported and never judged.
 9. On a pair discovery has verified, **P14** measures the rig's ceiling — the maximum baud
    rate at which transmission is still reliable — a number plus its reason for stopping, never
    a grade (§15.51). **P5's pair block** reports handshake continuity in the six-crossing
@@ -2859,7 +3117,7 @@ record and carries the per-artifact rows, including eras predating both digests.
 | `a131e1f4b46d6c83` | P1–P13 | the 2026-08-05 cross-kernel campaign: the `71fc5a8`, `4b78fff`/`1a9a8fc` (same-binary pair), `7ead470`, and `f8315cc` triples | closed by P14's landing — the digest's first move, and deliberate (notes §3.57) |
 | `94d64d8bbacf1174` | + P14 | the `42eac2a` macOS triple against the `3d850cf` Linux triple — P14's first cross-kernel reading (§15.51) | opened by P14 (notes §3.57); closed by P15 (notes §3.65) |
 | `82a8e2198e54626a` | + P15 | the `7cf0338` Linux triple, the `acb5162` macOS triple, the 6.18 field report at `3e23c52` — holding the first lawful cross-kernel Linux comparison (6.18 ↔ 7.0, same-source basis) | opened by P15 (notes §3.65); closed by the P15 `question` correction (notes §3.73) |
-| `e79f5fcd86a2e5f0` | P1–P15, corrected citation | the current era; first artifacts committed at its opening | opened by notes §3.73; open |
+| `e79f5fcd86a2e5f0` | P1–P15, corrected citation | the six `2b44c17` rows of 2026-08-07 — Tier-3 and passive triples from one clean Linux build, `jq -e` executed against both halves — and the era-closing `8c00078-dirty` Tier-3 triple, an era-mate rather than an opener: same `probe_set`, moved `field_set` (plan §18 items 14 and 22), which closes nothing under clause 4. **Two halves of this era were never taken and are now unobtainable rather than owed**: no Darwin capture exists in it at all, and the closing triple has no passive counterpart — the cost of taking a rig capture and an instrument change in one session | opened by notes §3.73; closed 2026-08-13 by P16's arrival with P15's widened `question` folded into the same boundary — one boundary, two changes, deliberately (§15.59; notes §3.89/§3.90) |
 | `4317ea5ac187f506` | P1–P16 | the current era, opened 2026-08-13 by P16's arrival together with P15's widened `question` — **one boundary, two changes**, deliberately (§15.59). The `field_set` moves earlier the same day (P15's software reading, P13's fifth shape) are **not** boundaries — clause 4 — so the artifacts either side of *those* stay era-mates, while nothing diffs across *this* row | opened by notes §3.89/§3.90; open |
 
 Two reading rules close the section: a cross-kernel claim quotes the rung it stands on — "same
@@ -3892,6 +4150,17 @@ places at `.snx-bin/<profile>/` — project-local, gitignored, mode `0700`, bles
 - **the kernel confirms the filesystem** — `fstatfs` must report `SYSFS_MAGIC` before any write.
 - **non-hub serial adapters only** — `bDeviceClass 09` refused.
 
+*[**Annotated 2026-08-21 (plan §18 items 103 and 104, §15.71): the second bound was violated in the
+tree, and the guarantee cited for it answers the wrong half of the hazard.** `install` answered *what
+capabilities does this file carry* by spawning `getcap`, and the refusal that was supposed to contain
+that guarded the **verb** while the spawn lived in a **module** two verbs used — `preflight` reached
+it with no refusal in front of it, so a blessed copy execed a `PATH`-selected binary while holding
+both capabilities (measured: `CapPrm` = `CapEff` = `000000000000000a`). `PR_SET_NO_NEW_PRIVS` stops
+an `exec` from *gaining* privilege and says nothing about one that inherits the environment and the
+`PATH` of a process that already holds it. **The bound's wording above is unchanged**; what changed
+is that it is now enforced by a gate rather than by this paragraph, and the capability reader is one
+`getxattr(2)` in `serial_nexus_sys::caps`. §15.71 is the record.]*
+
 Crash safety is the helper's: no `deauthorize` verb — `cycle` does both writes in one process,
 re-authorizes on signals, caps any hold at 30 s; an idempotent `authorize` repair verb exists.
 Self-invalidation is the primary bound: any write clears `security.capability`; mode `0700`
@@ -4049,6 +4318,28 @@ ride its reply now, always present, `0` included, on a plain `load` as well (`0`
 named:** `exec`'s figure is a floor (its internal merge stage is beyond the handle's reach) —
 ledgered open work (plan §18); the pty's held `pending` payload is not fixable the same way and
 is recorded, not re-filed, in the ledger's closing register. (Notes §3.31, §3.55, §3.59.)
+**Closed 2026-08-12 (plan §18 item 21; notes §3.86): the `exec` floor above is a record of what
+that item closed, not a live limit.** Every kind's `discarded_at_teardown` is exact now. The
+internal merge stage is watched through the same `TargetwardInbox` this entry's `serial`/`leg`
+adoption built, so the two-sided invariant holds one stage further in than the fix it describes
+reached — notes §3.31's original defect, surviving that far and no further. **The item's own
+filing got one thing wrong, and the correction is the load-bearing half:** the merge queue is
+*bidirectional*, roughly half of it being the raw device stream on its way into the child under
+the reserved multiplexed channel identity, so notes §3.55's sketched "it needs only a watch"
+would have charged hostward bytes to a targetward ledger — the precise error the leg's
+per-channel relay is excluded to avoid, one node kind over. The charge is discriminated on the
+queue item's own type instead, which is why that item is a named struct (§7.6 clause 8, §8
+clause 14). *Guard:*
+`p13_teardown_accounting::exec_teardown_counts_a_merge_stage_a_deaf_child_is_holding`, against a
+`tests/ext-codec/deaf.py` child that has stopped reading stdin so the merge stage is holding
+bytes at the instant of destruction; *fail-first:* with the merge queue's watch removed the
+removal reports **708000** destroyed — the host-facing queue alone — against a fixed **1736000**,
+the remaining 64000 being the child's stdin pipe, which is delivery and not this counter's to
+claim. The pty's held `pending` payload is untouched by any of this and stays in the closing
+register. **Annotated 2026-08-21 (plan §18 item 108)**, when the three settled-system
+restatements of the floor — §5's teardown-ledger clause 9, §7.6 clause 8 and §8 clause 14 — were
+found still calling it open nine days after the tree closed it, while §8's own fixture register
+described the guard that closed it some 160 lines further down §8 itself.
 
 ### 15.51 The ceiling is measured, not assumed: P14, the maximum-rate search
 
@@ -4199,6 +4490,14 @@ because this entry did not exist; notes §3.68 filed and declined the string fix
 **overturned that decline**, deliberately moving `probe_set` `82a8e2198e54626a` →
 `e79f5fcd86a2e5f0` and closing that era — a correction only gets dearer as captures accumulate
 under a wrong citation.
+
+*[**Annotated 2026-08-21 (plan §18 item 85, §15.73), not rewritten:** every refusal above is
+decided on what the driver *accepted*, which is the only thing this entry's instrument — one port,
+one `tcsetattr`, one read-back — can see. A driver that keeps the flag on read-back and is inert on
+the wire satisfies this predicate and is not refused. That is a stated bound rather than a gap:
+§15.73 records the decision (no new refusal; the functional question goes to the doctor, where a
+peer exists), its one hardware arm, and why the bench that motivated it is one the new instrument
+cannot be run on — notes §3.147. Nothing here moves.]*
 
 ### 15.54 Park or drain is a property of the pump, not of the edge
 
@@ -4365,6 +4664,13 @@ DECLINED, recorded so they are not re-proposed (AGENTS §5):
   one-connection consequence any later admission must weigh, and the allowlist stays a
   deliberate act (§15.34).
 
+*[**Annotated 2026-08-21 (plan §18 item 64(a), §15.70):** the *Unbounded lookback* decline above
+names the right rule and reaches one factor of three. The hub's per-chunk work is
+`waits × lookback × the pattern's cost per byte`; the **list length** carried no maximum until
+§15.70 gave it one — `MAX_ARMED_WAITS = 64`, refused ahead of the replay scan — and the **pattern's
+cost per byte** still carries none, measured there at an 18× spread between a literal and a
+prefilter-less regex and recorded rather than fixed. Nothing decided here moves.]*
+
 ### 15.57 The doctor's Markdown is a view, not a format: the value grammar stays non-injective
 
 **Status:** DECIDED — the escape is DECLINED and the Markdown's non-contract is stated instead.
@@ -4416,6 +4722,12 @@ so the frozen corpus keeps one grammar for its whole life.
 
 **Status:** DECIDED — contract at §7.1; construction is plan §18 item 41. New design content, so
 it is written here before the tree moves (AGENTS §5).
+*[**Annotated 2026-08-21 (plan §18 item 108, §15.72) — the status line above is a dated record of
+this entry's filing, not a live state.** The tree moved on **2026-08-15**: plan §18 item 41 is
+**EXECUTED** (notes §3.107) and its entry states that this was "the design's only surface specified
+ahead of the tree" and that "the two now agree completely". §7.1 clause 7 is settled system and
+says so at its own site; §15.69 clause 2 later scoped what its ±2.5 % read-back can and cannot
+verify. Nothing in the decision recorded below moves — only the "before the tree" tense does.]*
 
 **The gap, measured rather than supposed.** P14's `adapter-refused` class is a driver accepting a
 rate and landing somewhere else: on the committed 6.18 triple a 4000000 ask returns success with
@@ -4472,6 +4784,12 @@ the tree moves (AGENTS §5), which is the order item 26 was blocked on: a new pr
 from *this* document by `meta_derive`'s roster gate, so landing P16 first would have made the tree
 ahead of the design — the same defect as the reverse, and the reason the item stopped rather than
 shipping a red gate.
+*[**Annotated 2026-08-21 (plan §18 item 108, §15.72):** the tree moved on **2026-08-13** — plan §18
+item 26 is **EXECUTED** (notes §3.90) and P16 ships with both arms serving as each other's control,
+so the "written before the tree moves" tense above is a dated record of the order this entry
+imposed rather than a live status. The ordering rule it states is the durable half and still binds:
+a probe id is derived from *this* document by `meta_derive`'s roster gate, so the design entry has
+to land first or the gate goes red.]*
 
 **The gap, and why it is a probe rather than a comment.** The harness's `SlaveWitness::prove_open`
 establishes that a pts slave is still open by comparing `(st_dev, st_ino, st_rdev)` against a fresh
@@ -4551,6 +4869,14 @@ a port that honours the mode is not refused — which is not a hope, because bot
 reachable on one box: a Darwin **pts** honours `IXON|IXOFF` (`c_iflag` `0x2b02` → `0x2f02`) while
 the FT232R beside it drops them. That pair is the discrimination proof, and it is what keeps this
 from being a rule that refuses everything and calls it safety.
+
+*[**Annotated 2026-08-21 (plan §18 item 85, §15.73), not rewritten:** "one predicate, parameterised"
+bounds *what* this entry widened as well as *how*. Both modes are still judged on acceptance and
+read-back, and neither is judged on the wire; §15.73 records why the wire question belongs to the
+doctor rather than to the pre-check, and how much of that reading has been taken off hardware.
+Clause 1's own widening obligation was then executed a second time, one mode over: the software
+cell gained the `shipped_predicate_agrees` cross-check that the hardware cell had carried since
+notes §3.67 (plan §18 item 73, notes §3.146, annotated at §7.1 clause 2). No clause above moves.]*
 
 ### 15.60 The Darwin pty buffer is a capacity, not a watermark — settled by a rung that already shipped
 
@@ -5236,7 +5562,11 @@ already localizable. **A battery of constant patterns would have been a step bac
 this axis: all-zero and all-ones are blind to the whole insert/delete/reorder class under
 `contains_sub`, and `0x55`/`0xAA` is blind to every even-length member, which is every displacement
 size measured on this bench. The stimulus half of that idea is real and is filed as plan §18 item 98,
-Linux-gated because its readout is `TIOCGICOUNT`.
+Linux-gated because its readout is `TIOCGICOUNT`. *[**Superseded 2026-08-21 by §15.69 clause 3**
+(plan §18 item 108, §15.72): item 98 ran on the FT232R bench and is **closed as a measured
+decline**. The inlay separates from the LCG on nothing that bench can read, and the null counts as
+evidence only because `frame`, `brk`, `overrun` and `parity` were each moved by a positive control
+in the same session. P14's payload does not move. Read "is filed" above as the filing it was.]*
 
 **Three properties are preserved deliberately, and each is asserted.** `RungOutcome`'s six words are
 untouched — the stall arms still fold to `TimedOut` and the displacement arms to `Corrupt` — so
@@ -5423,6 +5753,707 @@ declining rule is the one already on the books: nothing reads prose, and §16.13
 each generation's alignment pass is the practical guard. Re-opened on a second recurrence, not
 before. The three live stale sites are annotated where they stand (AGENTS §5) rather than rewritten.
 
+### 15.70 The armed-wait list is the pattern wait's sixth dimension, and it gets the maximum the other five had
+
+**Status:** DECIDED and EXECUTED — contract at §10 (*The pattern wait*, clause 2, which now bounds
+the endpoint's **occupancy** beside the request's dimensions); construction is plan §18 item 64(a),
+**executed 2026-08-21**, which was the last clause of that item still open and whose closing closed
+the item. Its own filed remedy had been recorded REFUTED first (notes §3.109: six runs of the filed
+throughput test read a wall ratio of 0.86–1.13 with `bytes_scanned` complete and `gaps: 0` in all
+six), which is why the guards below assert mechanism. Nothing else in §10 moves, and the verb's
+semantics are unchanged: this is a stated maximum where there was none.
+*[**Corrected 2026-08-21:** this line read "the one clause of that item still open" in the present
+tense, after item 64's own entry already recorded (a) EXECUTED 2026-08-21 and the item closed with
+it. A standing promise that outlives its answer is what rule 2 of §15.72 below forbids, and this is
+its instance (j)'s shape — a dated filing read as live status — in an entry that landed the same day
+as the sweep collecting them.]*
+
+**The gap, measured rather than supposed.** §10 clause 2 gives every dimension of a `tap.wait`
+*request* a stated, structurally checked maximum under §16.12's rule — pattern count, pattern and
+name length, compiled size, the lookback window, the context width, the deadline — and §15.56
+declined an unbounded lookback in exactly those terms: a match window without a stated maximum is
+an allocation and a scan cost an operator input controls. `TapHub::ingest` walks the endpoint's
+armed-wait list on **every** ingested chunk and each entry rescans its **whole** retained window on
+the single runtime thread, so the hub's per-chunk work is
+
+    waits × lookback × the pattern's cost per byte
+
+Two of those three factors carried a maximum. The third — how many waits — carried none, so the
+product carried none. §16.12's rule is that the maximum exists, not that every surface mints its
+own; this surface had none at all.
+
+**What was measured, before any number was chosen.** Release build, 4 KiB chunks fed straight into
+`TapHub::ingest`, windows warmed to `MAX_LOOKBACK`, one 20-core box under a load average of
+3.6–5.7 — so these are ceilings on a busy machine rather than best cases, and the ladder was read
+three times. Scope is plan §18 item 64(a); `daemon/src/tap.rs` carries the same table at the
+constant, which is where a reader of the code meets it.
+
+| reading | figure |
+|---|---|
+| per armed wait per chunk, literal `login:` | 6.1–6.2 µs — **0.089 ns per scanned byte** |
+| per armed wait per chunk, `(?-u)[a-zA-Z0-9]{200}` | 111.4–112.3 µs — **1.61 ns/B** |
+| per armed wait per chunk, `(?-u)[^\n]{4000}` | 111.2–111.7 µs — **1.60 ns/B** |
+| per **open tap** per chunk, same list, same run | **20–22 ns**, flat |
+| per-wait cost against list length | flat 2.7–4.0 µs from 8 waits through 128; 3.5–4.1 at 256; 4.8–5.1 at 512; 5.4–6.0 at 1024 |
+
+and end to end — `info` timed over the control socket while a `sim pty --source` firehose feeds one
+endpoint with no consumer and the ring off, three runs at load 9.9–19.0:
+
+| armed waits | `info` p50 | p90 | max |
+|---|---|---|---|
+| 0 | 0.11–0.22 ms | 0.20–0.27 ms | 0.31–0.97 ms |
+| 1 | 7.8–11.7 ms | 11.5–15.7 ms | 14.1–18.7 ms |
+| 8 | 60.0–71.6 ms | 74.0–87.4 ms | 83.6–101.5 ms |
+| 64 | 0.08–0.26 ms | 0.16–689 ms | 625 ms–1.06 s |
+
+The bytes actually ingested inside each window differ per rung — the producer→hub feed hop drops
+when the hub is slow — so these are not per-byte normalised and **no ratio is derived across
+rungs**; the n=64 median is bimodal for the same reason, and its tail is the reading rather than its
+middle. This is the worst case the tree can build — a software firehose, the maximum lookback, a
+prefilter-defeating pattern — and is **not** a console figure.
+
+Three things follow, and only the last is this entry.
+
+1. **A wait is not a tap, by 130× to 5300× per element.** That refutes the symmetry the surface had
+   been surviving on: `taps` rides the same per-chunk list uncapped because a tap is a pointer, a
+   clone and a `try_send`, and the reason does not extend to a full window rescan.
+2. **The pattern is a cost the caller chooses, on top of the window the caller chooses.** 0.089 ns/B
+   against 1.60 is an 18× spread between a literal the engine can prefilter and a regex with no
+   literal in it. `MAX_COMPILED_BYTES` bounds the *build*; nothing bounds the match throughput.
+3. **The list's length is the factor with no maximum at all**, and it is the one this entry closes.
+
+**Reachability, stated because a decline would have turned on it.** Every armed wait is one
+control-socket connection: §15.20 runs one waiting verb per connection, and §10 clause 8 keeps
+`tap.wait` off the web bridge's allowlist — **asserted rather than merely absent** (`web/src/bridge.rs`
+requires the refusal by name), since an absence proves nothing about intent. So the caller is
+already through the 0600/0660 socket and could call `shutdown` instead, which is strictly the
+stronger lever. **That argument is not available here, because §15.56 already rejected it for this
+exact surface**: a backtracking engine and an unbounded lookback are refused *by design* on the same
+socket, from the same caller. The settled posture is that the pattern wait's cost dimensions carry
+stated maxima regardless of who can reach them, and this is that posture applied to the dimension
+that was missed. The accidental case decides it as firmly as the adversarial one — a client that
+leaks connections reaches an unbounded list by accident, and today that degrades every console the
+daemon runs.
+
+**The decision: `MAX_ARMED_WAITS = 64` per host-facing endpoint, refused before anything is armed
+or scanned.**
+
+- **The number comes from the ladder, not from taste.** Per-wait cost is flat from 8 waits through
+  128 and climbs past it as the retained windows outgrow cache, so beyond that knee an operator's
+  input stops buying linear cost. 64 sits one binary step inside the measured flat region. It bounds
+  the retained windows to **4 MiB** per endpoint at the maximum lookback, and the hub's per-chunk
+  work to a *stated* 0.40 ms (literal) or 7.2 ms (no-prefilter regex), where it had no bound at all.
+  It is eight times `MAX_PATTERNS`, whose own doc names the escape hatch this cap must not close —
+  a caller that wants more opens a second connection — so 512 patterns can still be watched on one
+  endpoint at once.
+- **Checked as `arm_wait`'s first statement, ahead of the replay scan.** A hub at its cap that still
+  scanned the ring would hand a *refused* caller a bigger lever than an accepted one: 14.984 ms
+  (literal) and 91.997 ms (no-prefilter regex) per `tap.wait --replay` over a ring at its 16 MiB
+  maximum, repeatable per call with no wait ever registered to be capped.
+- **The refusal is `-32602` and names both numbers.** Same code, same breath, as every other §10
+  clause 2 maximum, and §16.12's rule about refusals applies: the message names the occupancy, the
+  maximum, and what makes the count a cost.
+- **It is occupancy, not a quota.** A wait that matches, expires, is cancelled, or whose connection
+  closes frees its slot at once, so the refusal's *retry* advice is true and the guards assert it.
+
+**What this does NOT do, stated so it is not quoted as more than it is.** *One* max-lookback
+no-prefilter wait already moves the control socket's `info` p50 by 40–110× on a firehose, and the
+cap cannot touch that: the lookback and the pattern's cost per byte are the dominant term and are
+already-stated maxima this design accepts. **This bounds a product that had no bound; it does not
+make the worst case comfortable.** Lowering 64 is now a one-constant change with a plant-proven
+guard behind it.
+
+**Two factors the measurement found and this entry does not fix**, recorded with their numbers so
+that whoever files them starts from a measurement rather than an argument:
+
+- **Match throughput is uncapped, and it is the dominant factor.** `MAX_COMPILED_BYTES` bounds how
+  large a compiled pattern may be; nothing bounds how many nanoseconds a byte of the window costs
+  at match time, and the spread between a literal and `(?-u)[a-zA-Z0-9]{200}` — both ordinary asks —
+  is 18×. `MAX_LOOKBACK`'s doc says the window "is a scan cost as well as an allocation", which is
+  half the sentence: the window is the byte count and the pattern is the price per byte. **Do not
+  close this by lowering `MAX_ARMED_WAITS`** — that is the other factor, and this entry already
+  bounded it.
+- **`tap.wait --replay` is a repeatable ring scan with no cap on the repetition.** The cap check
+  sits ahead of the scan precisely so a capped endpoint cannot be milked for it, but a caller
+  *under* the cap can arm, match-or-disarm and re-arm without limit, and each cycle is one full
+  scan at the figures above. It is one connection's serial cost (§15.20), so the amplification is
+  connections rather than requests — the same reachability recorded above.
+
+**DECLINED, recorded so they are not re-proposed (AGENTS §5):**
+
+- **A dedicated application error code for the refusal.** It is the more precise typing — a cap is a
+  transient state refusal, closer to `EdgeInboxFull`'s shape than to *your params are wrong*, and a
+  caller cannot today separate "shrink your regex" (never retry) from "wait for a slot" (retry) by
+  code alone. Declined **for now**, and the reason is not typing: a ninth `AppError` is a `docs/rpc`
+  table row plus a two-way registry gate, and a code with no documented row is exactly what that
+  gate exists to stop. Carried as this item's residual rather than pretended away; overturned by
+  anyone landing the row and the registry entry together.
+- **Capping per daemon rather than per endpoint.** The scan cost is per chunk *per endpoint*, so the
+  endpoint is the axis the cost actually has. Endpoints are operator configuration rather than
+  request input, which is the line §15.34's screening rule draws.
+- **Capping control-socket connections instead.** It would bound this and everything else, and it is
+  a far larger decision — every stream verb, every subscription, the web bridge's own leg — taken on
+  evidence about one verb. It is also the wrong shape: `tap.wait` is the cheapest lever on that
+  socket with a 5300× multiplier, and a connection cap generous enough for legitimate clients is far
+  too generous for this one.
+- **Choosing the number from a latency budget.** Measured, and it disqualifies itself: a budget
+  tight enough to hold the firehose figures above is met only at zero waits, because one accepted
+  wait already blows it. A cap chosen that way would be a refusal of the feature wearing a number.
+- **A throughput assertion as the guard.** Item 64(a)'s own filed remedy was exactly that, and it
+  was built, measured and removed: six runs read a wall ratio of 0.86–1.13 with `bytes_scanned`
+  whole and `gaps: 0` in all six. The guards here assert *mechanism* — the bound is reached, the
+  next is refused, the refusal arms nothing, a freed slot is reusable — which is deterministic and
+  needs no clock.
+
+**Three things the work found about its own guards, the first being the useful one.**
+
+*A plant that reddened nothing.* Moving the cap check below the ring scan but **above** the
+`AlreadyMatched` return still answers `Refused` — the scan runs, the cost is paid, and no assertion
+anywhere can see it, **because a cost leaves no outcome behind**. The guard's doc now says which
+mis-placements it catches and which it does not, and states that the ordering is held by
+construction — the check is the function's first statement — rather than by assertion. That is
+AGENTS §3's weaker-than-its-comment register met head-on: the remedy was not a cleverer assertion,
+it was writing down what the assertion actually holds.
+
+*An off-by-one only a "the bound is reached" assertion can see.* Spelling the arm `>` instead of
+`>=` lets 65 waits arm against a stated 64; a `<=` check would pass, and so would any assertion that
+merely counted refusals. Both guards assert that the count accepted **equals** the maximum the
+daemon's own refusal names, and the itest reads that maximum out of the refusal rather than
+hard-coding it — a copy of `MAX_ARMED_WAITS` in the test file would be a second implementation of
+the thing under test, which is the shape §7.1 clause 2 forbids one surface over.
+
+*A guard whose first version named the wrong defect.* Two properties — the 65th is refused, and a
+capped endpoint does not scan the ring anyway — were probed by one `replay: true` request, so
+deleting the cap reddened on the ring-ordering message. Split into two probes; each plant now
+reddens on its own defect's sentence. A guard that fails for a true reason that is not *the* reason
+costs the next reader the diagnosis.
+
+*[**Citation note, 2026-08-21, recorded because grep is how a §15 number is read.** Two code sites
+spell *this* number for decisions that are not this one, and neither is repaired here:
+`web/src/assets/app.js` and `web/src/assets/graph.test.mjs` cite §15.70 for the graph page's repaint
+skip (plan §18 item 91), and `itest/tests/meta_gates.rs` cites it twice for the privileged helper's
+no-`exec` gate, which is **§15.71**. The graph-page decision is a live instance of the class §15.72
+collects, in the other direction: as of this entry's landing the tree carries the construction and
+this document carries no entry for it, so its record is plan §18 item 91 and the session notes.]*
+
+### 15.71 The blessed helper's no-`exec` bound was true by argument and false in the tree
+
+**Status:** DECIDED and EXECUTED — §15.45's second bound, **unchanged in wording** and now enforced
+by construction and by a gate instead of by a paragraph. Construction is plan §18 items 103 (the
+`exec` itself) and 104 (the gate). §15.45 is annotated at the bound; no contract moves, and nothing
+here widens what the blessed binary may do.
+
+**The transferable fact belongs first.** An invariant this repository states absolutely — AGENTS §4,
+§15.45's bound list, and `devprep`'s own module documentation twice over — was **false in the tree**
+for as long as `install` shelled out to `getcap`, and **nothing could see it**. The documents that
+state it are otherwise scrupulous, which is the point rather than the excuse. Nor could the gate
+written to see it, in its first draft: an adversarial plant opened **three matcher holes**, each
+demonstrated rather than argued, and all three were one root cause — *a scanner that did not know what a Rust
+string literal is*. The sharpest of the three is that the gate reported **green** on the real defect
+restored into `read_caps`, because a URL earlier on the same line ended the scan at its `//`; the
+binary built from that tree execed `getcap` from `preflight`, confirmed with the same `PATH` shim
+that found the original. The other two are the mirror pair: an unbalanced `]` inside a literal drops
+the attribute pass's bracket depth so a four-line `#[arg(…, env = "…")]` scans clean, and a brace
+inside a literal moves where a `#[cfg(test)] mod` ends and therefore what counts as product code at
+all. Every scanner in that file now runs over **masked** source.
+
+**The breach.** `install::read_caps` answered *what capabilities does this file carry* with
+`Command::new("getcap")`. The safety argument, written twice in the tree, was that `install` is
+refused while any capability in `REQUIRED_CAPS` is held, so the spawn and the capability could never
+coexist. **True of the verb, false of the module**: `preflight` → `install::inspect` → `read_caps`,
+with no refusal in front of it. **Nothing had to be edited into a violation.** No line of the argued
+code changed; a second call site was added somewhere else, and the argument became false where it
+stood. That is the failure mode of an invariant held by prose rather than by a gate, and it is why
+this entry exists rather than a one-line patch.
+
+**Measured, on the rig box, with a `PATH` shim that reads its *parent's* `/proc/<pid>/status`** so
+the capability reading is the spawning process and not the shim: `CapPrm` = `CapEff` =
+`000000000000000a` — bits 1 and 3, `CAP_DAC_OVERRIDE|CAP_FOWNER`, exactly the pair the installed
+file carries. **Reproduced three times, by three agents, on this box — two of them before this
+session** (plan §18 item 103, notes §3.127).
+*[**Corrected 2026-08-21:** this read "Reproduced twice, independently". Plan §18 item 103 and
+notes §3.127 both record three, on three occasions by three agents, two of them predating the
+session that filed the item — so the undercount made a finding that had survived three independent
+sightings read as one session's pair.]*
+
+**The harm is not "a child process ran", and this is the measurement worth keeping.** A shim that
+answers *this file carries nothing* turns a **correctly blessed** copy's own report inside out, on
+the same inode, old reader against new: `ready (mode 0700, cap_dac_override,cap_fowner+ep)` and
+exit 0 becomes `Unblessed("(none)")` with a `sudo setcap …` line attached and exit 2. So the
+**environment chose the verdict** of a binary whose first stated bound is that it reads none — and
+the verdict it chose is plan §18 item 101's harm exactly: a tool naming a privileged repair for a
+file that needs none. Item 101 arrived through a hardlink that `cargo` re-pointed; this one arrives
+through `PATH`. Two mechanisms, one wrong sentence, one wrong conclusion available to the next
+session.
+
+**`PR_SET_NO_NEW_PRIVS` is what §15.45 cites as making this bound a kernel guarantee, and it does
+not cover this.** It stops an `exec` from *gaining* privilege. It says nothing about an `exec` that
+inherits the `PATH` and the whole environment of a process that already holds it. The bit was
+established and read back correctly — against the wrong half of the hazard, which is worth stating
+because a correct mechanism cited for the wrong property reads exactly like coverage.
+
+**The repair, and the hint that found it.** `install --verify` answers the same question on the same
+binary in the same session and execs nothing — two readers of one question, one spawning and one
+not. A file's capability set *is* its `security.capability` extended attribute, so the honest reader
+is one `getxattr(2)`. It lives in `serial_nexus_sys::caps` because §16.3 puts every syscall there
+and this is the only `unsafe` involved; `devprep` keeps the vocabulary, `REQUIRED_CAPS` remaining
+the one place a capability name is written. No new dependency, so `cargo deny` does not move.
+`docs/vmcell-requirements.md` had already recommended the same change for an unrelated reason — the
+pinned base image ships no `getcap` at all, so the old reader failed on `ErrorKind::NotFound` there.
+Two arguments, one line of code.
+
+**A guard was deleted on purpose, and the deletion is the point.** The old pipeline parsed `getcap`'s
+stdout and carried a careful regression test for a real defect: `getcap` prints `<path> <caps>`, so a
+whole-line test for `ep` is satisfied by the **path** — a `deps/` component supplies those letters,
+and so does any home directory whose name happens to contain them — and a `+p`-only binary read as
+blessed. There is no line and no path in a
+twenty-byte kernel record, so that class is now **unrepresentable** rather than guarded. Every
+*decision* the deleted tests protected is re-asserted on bits, and one case got stronger: `carries`
+sees an inheritable-only capability, which the text era could see only if libcap happened to print
+the name. The stock tool's rendering survives pinned to real output — `cap_dac_override,cap_fowner=ep`
+against that same file's actual twenty bytes — as the decoder's fixture one crate over.
+
+**The gate, and what it cost to make non-vacuous.**
+`the_privileged_helper_neither_spawns_a_process_nor_reads_the_environment` scans `devprep/src/**`
+structurally for both classes. Three things it needed that a first draft would not have had:
+`Command` matched as a **substring** rather than a whole word, because
+`use std::os::unix::process::CommandExt;` is the counter-example and is planted for that reason; a
+**separate attribute pass with bracket-depth tracking over masked source**, because clap's
+`#[arg(env = "…")]` reads an environment variable with none of the obvious tokens present and
+rustfmt may put the token on a continuation line — the four-line plant reddened naming the
+attribute's **third** line, where a first-line scanner would have passed it while claiming coverage;
+and the **token list proven load-bearing**, removing any single spelling from either list reddening
+the gate's own matcher proof, without which a gate can list five spellings and match two. Validation:
+**26 plants → 26 red** (the original `getcap` spawn restored in place, an aliased import, `CommandExt`,
+all four method spellings, eleven environment spellings, three clap-attribute spellings, a spawn in
+the macOS arm, a spawn in `main.rs`, the manifest feature, and the walker floor), **3 negative
+controls green** (a spawn inside `#[cfg(test)]`, `Command::new` in a comment, a local variable named
+`env`), and **6 token-removal probes red**. Every restore verified byte-identical.
+
+**What the gate does not cover, named at the gate rather than left to be discovered.** It scans this
+crate's sources, so a spawn or environment read performed *for* the helper by a dependency is
+invisible to it — which is why `devprep`'s manifest states that its dependency list is part of its
+security argument and why that list is three crates long. And `#[command(version)]` expands to an
+`env!("CARGO_PKG_VERSION")` **inside clap's macro**, so the binary does contain a build-time
+environment read that no scan of these sources can see: it is the accepted instance, named at the
+gate so the claim reads *no such spelling in these sources* rather than the larger claim it might be
+mistaken for. Attribute-borne reads are additionally closed at the manifest, clap's `env` feature
+having to stay off for `#[arg(env)]` to compile at all — which covers spellings rustfmt has not
+invented yet.
+
+**What could not be measured here, said plainly.** The repaired binary has never run **blessed**.
+There is no passwordless `sudo` on this box and no user-namespace route — `unshare -Ur` answers
+`Operation not permitted` writing `uid_map` — so no unprivileged process here can create or refresh
+a file capability. *Does not exec while blessed* therefore rests on two things that **were**
+measured: the code path execs nothing at all, proven on the identical route with the identical shim
+against a binary built from the unfixed tree in the same scratch harness, and the construct is now
+forbidden by a gate shown to redden on every spelling it claims. `sys/` changed, so §15.45's standing
+re-bless applies before the next rig lane — that is §15.45's design and not a defect.
+
+*[**Annotated 2026-08-21 — the paragraph above is now answered rather than softened.** The repaired
+binary has since run **blessed**. The maintainer refreshed the installed copy's capabilities out of
+band — nothing above changes about this session's own reach, no unprivileged route to `setcap` was
+found or used — and the repaired `preflight --json` was then driven on the rig box under a `PATH`
+poisoned with shims for `getcap`, `setcap`, `capsh`, `sh`, `bash`, `env` and `cat`, each shim
+logging its own invocation to one file. It answered `REPLUG-PREFLIGHT: READY` and **the shim log
+was empty**: the first measurement of the repaired path on a genuinely blessed helper, and the
+bound §15.45 states read directly rather than inferred from an unblessed route. **Re-run later the
+same day against the same blessed inode** — `getcap .snx-bin/debug/serial-nexus-devprep` reading
+`cap_dac_override,cap_fowner=ep` — with the same seven shims: **the log is still zero bytes**,
+while the verdict now reads `REPLUG-PREFLIGHT: BLOCKED-ON-BLESS` with `bless_problems: ["Stale"]`
+at exit 2, because a concurrent lane rebuilt `devprep` two minutes after the bless and
+`install::inspect` compares the two artifacts byte for byte. That is §15.45's standing re-bless
+again, not a defect — and the same run is a live sighting of the sentinel defect recorded unfixed
+just below, since `Stale` is what asks the maintainer for a `sudo setcap` it does not need.]*
+
+**Recorded and not fixed.** `preflight`'s verdict sentinel names `sudo setcap` for **every** bless
+problem, `Stale` included, which needs no privilege — measured on this tree: a `Stale` bless answers
+`REPLUG-PREFLIGHT: BLOCKED-ON-BLESS`, and the sentence beside it asks the maintainer for one
+`sudo setcap`. That is item 101's defect surviving one function over, in the sentence an operator
+actually acts on. `install --verify` was repaired and `preflight` was not, because the two print
+different strings and only one was under audit; left owed rather than fixed in the same commit,
+because the string is a harness-visible sentinel and its repair deserves its own fail-first proof.
+
+**The register entry.** AGENTS §3 collects gates whose passing output is identical to their
+not-running output. This is a **seventh register** in that family and its sharpest member: **a gate
+that does not exist, standing in for one because a comment argues the case.** Its passing output is
+identical to its not-running output for the simple reason that it is not running. The remedy is the
+one already on the books, aimed one level up — for each invariant stated as absolute, ask not *is
+this true* but **what would go red**, and if the answer is a paragraph, the answer is nothing.
+
+### 15.72 Design behind the tree: settled prose a ledger execution falsified
+
+**Status:** DECIDED and EXECUTED — the class named, every instance found repaired **where it stands**
+(AGENTS §5, with the §15/§16 entries annotated rather than rewritten), and the gate that would catch
+it **scoped, costed and DECLINED** on its sibling's grounds, re-openable on a second recurrence
+naming new evidence. Construction is plan §18 items 108 and 113. No contract moves: every repair
+below brought prose to the tree, never the tree to prose.
+*[**Corrected 2026-08-21:** this line read "left as open work rather than claimed", and the
+comparison paragraph below read "left **open** rather than declined". Plan §18 item 108 and notes
+§3.139 record the candidate **DECLINED** on item 96's grounds, and plan §18's item entries are the
+authority on an item's disposition (decided 2026-08-21 at item 95). A design entry and the ledger
+disagreeing about a disposition is one register off this entry's own class — the disagreement is
+with the ledger rather than with the tree — and a reader had no way to tell which of the two was
+wrong, which is the whole harm.]*
+
+**The class.** AGENTS §2 tracks **design-ahead-of-tree** surfaces by name, one at a time, and got
+the last of them to zero on 2026-08-15 when plan §18 item 41 built the `actual_baud` read-back. This
+is the mirror, and it had no name, no counter and no sweep: **settled-system prose describing a tree
+that a ledger item's execution moved past.** The asymmetry is the whole reason it survives.
+Ahead-of-tree is *deliberate* — the amend-first order creates it on purpose, dates it, and files an
+item whose closing is the thing everyone is watching for. Behind-tree is nobody's decision. It is
+created by a *success* somewhere else, it carries no date, nothing announces it, and the sentence
+that becomes false is usually in a section a reader treats as the system rather than as a record.
+
+**The instances, and each is annotated at its own site.** *Ten here against the ledger's five, and
+the gap is two things at once — a finer unit of counting, and three sites the ledger does not
+itemise.* Plan §18 item 108's entry itemises **four** — (a), (b), (e) and (f) below — and names a
+fifth, (i), filed separately as **item 113** because the mechanism that found it differs; those five
+are what its head sentence counts as *Five sites*. The finer unit accounts for two of the extra
+five: **(c)** and **(d)** are further false sentences inside (b)'s own clause, which the ledger
+counts once, as a site. The other three are additional locations, repaired in the same session and
+annotated where they stand but not itemised at item 108: **(g)** the front matter, **(h)** §8's
+deferred-capability list, and **(j)**, one bullet over five decision-record entries and the only
+instance whose sites all sit in §15/§16 rather than in settled-system prose. So a count of this
+class is quotable only with its unit and its scope — sites item 108 itemises, or false sentences
+this list corrects — and for *how much work item 108 was*, the ledger's is the one to quote.
+
+- **(a) An `exec` teardown floor, restated in three settled clauses nine days after it stopped being
+  one** — §5's teardown-ledger clause 9, §7.6 clause 8 and §8's codec-contract clause 14, against
+  plan §18 item 21 executed 2026-08-12. §15.50's *"Open, named"* sentence stands verbatim under a
+  dated closing annotation, because it is the shape that item closed. What survives is renamed a
+  **boundary**, not a floor: bytes already inside a child's stdin pipe are delivery, exactly as bytes
+  written to a device fd are. **The document was already contradicting itself and nobody read across
+  the gap** — §8's own fixture register, some 160 lines below clause 14 in the same section,
+  described `deaf.py` as what makes item 21's guard measure a real quantity instead of a zero.
+- **(b) §7.2 clause 12 asserted a gate the tree had removed and a causal claim measurement had
+  refuted.** It called the anti-spin guard the tree's sharpest known proxy-in-space *because it
+  self-skips off Linux*, and predicted that a widened last-close predicate would burn a core on
+  macOS with the suite green. Item 12 executed 2026-08-13 with that prediction **refuted** on the
+  platform it named, and the guard is a bare `#[test]`. A refuted causal claim standing as normative
+  prose is sharper than a stale citation: a reader reasoning from §7.2 would have reasoned from a
+  mechanism neither kernel exhibits.
+- **(c) The same clause's appositive inverted both halves at once** — *"it self-skipped off Linux,
+  the one platform family where the hazard exists"* reads, left to right, as an apposition to
+  **Linux**, and contradicted the refutation three lines below it.
+- **(d) A `0x20` reading attributed to a probe that discards the byte.** §7.2 cited doctor P1 for
+  `TIOCPKT_DOSTOP`; P1 carries three booleans and `p1_inner` tests the bit and **discards** the
+  bytes, so `0x20` appears in no committed artifact on either kernel. The reading is real and is a
+  2026-07-28 rig-session measurement in `docs/macos.md`, cited as such at the baseline contract's
+  clause 4. **The identical false attribution had been found and repaired once before**, by the blind
+  verifiers at the v15 landing — and was reintroduced in prose that had every other citation right,
+  which is the tell this entry is about: *a claim verified against a neighbouring sentence rather
+  than against the artifact.*
+- **(e) A remainder discharged in one copy of a sentence and not the other.** §13 clause 8 named item
+  17's parity-mismatch and break-reception work as remainder after it executed 2026-08-15; the
+  near-identical sentence at §15.21 was already annotated with the answer. The tell for the whole
+  class is in that pair: **a document with two copies of a sentence gets one of them fixed**, and the
+  unfixed one is the one in the section a reader treats as the system.
+- **(f) An era row reading "the current era" two eras on.** `e79f5fcd86a2e5f0` sat open beside
+  `4317ea5ac187f506` and named no bounding artifacts where every sibling row does — contradicted by
+  §13's own era law two paragraphs above it, by `docs/doctor/README.md`, and by AGENTS §2. Closed
+  from the committed artifacts rather than from memory, with two halves now stated as **unobtainable
+  rather than owed**: no Darwin capture exists in that era at all, and its closing triple has no
+  passive counterpart.
+- **(g) The front matter claimed one design-ahead-of-tree surface for six days after item 41 closed
+  it**, while §7.1 clause 7 — the clause it named — said the opposite at its own site. The register
+  that exists to count this class was itself an instance of the mirror class.
+- **(h) §8 promised three capabilities as deliberately absent for nine days after the tree built
+  them** (items 36, 38 and 53, all executed 2026-08-12), with its own fixture register 160 lines
+  above already describing one of them.
+- **(i) §7.1 clause 7's superseded per-mode block was being read as live, and its `xon-xoff` sentence
+  was false in both of its claims** — plan §18 item 113. It said the mode *has no pre-check and no
+  probe* and is *unmeasured rather than known-good, carried as open work*. There is a pre-check
+  (`flow_precheck_target` maps the mode and the load path runs it through the same
+  `honours_flow_control` call `rts-cts` takes), there is a probe (P15's `software_flow_control`
+  block, landed at item 14, executed 2026-08-13), and §15.61 refuses the mode where the driver drops
+  it. The clause disagreed with itself twice over — its own live text immediately above the block,
+  and clause 6's parenthetical twenty lines up. **The half a reader reaches last is the half that was
+  wrong**, and a supersession marker sitting mid-paragraph is not a marker.
+- **(j) Dated filings read as live status.** §15.58's and §15.59's *written before the tree moves*
+  status lines, §15.68's *is filed* for item 98, §16.1's pty/log rebase recipe and §16.11's owed
+  destination record all pointed at items since executed. Each now carries a dated annotation; the
+  ordering rules those entries state are the durable half and still bind.
+
+**Two rules the instances leave, both about repairs rather than about the original defects.**
+
+*A repair that widens a claim's scope is a new claim and owes the evidence of one* (AGENTS §7).
+Repairing (b) rested the pty last-close drain's justification on two legs and wrote the second —
+P6's `handler_reset_readable_bytes: 1` — as *identical on both kernels*. Checked against the
+committed corpus: **`1` in 72 of 72 Linux observations and `0` in 32 of 32 macOS ones**, and
+`handler_reset_extproc_retained` **`true` in 64 of 64 Linux and `false` in 27 of 27 macOS**, with
+`EXTPROC` gating `TIOCPKT_IOCTL` entirely, so a kernel that drops the flag emits no control packet
+and the drain has nothing to consume there. The notes and the in-tree comment the repair was checked
+against say *identical on 6.18* and *byte-identical on 7.0 and 6.18* — **claims about two Linux
+kernels**, carried across the Linux/Darwin boundary without a figure changing, so there was nothing
+numerically wrong to notice. Two things caught it: the clause contradicted itself six lines later,
+and **an in-tree comment is not a citation** — it is a claim of the same kind, and this tree has now
+found that particular one stale. The drain is justified **per kernel** now, and neither reading
+licenses deleting it.
+
+*A figure moved between clauses loses its scope unless the move carries it.* The same pass
+attributed a 1.7–1.9 %-of-a-core band to both kernels when item 12 scopes it to **Darwin** (the Linux
+cost recorded at the guard's own ceiling is some three to four times lower), and quoted item 17's
+`brk +1` / `frame +0` and `parity +2` with no scope at all, both being `ftdi_sio` on Linux 7.0.0-29
+on a cross-wired FT232R pair, both guards self-skipping off Linux on `ICOUNTS_SUPPORTED`.
+
+**No gate in this tree reads design prose against the ledger, and none was built this session.** One
+was scoped and costed, and the cost is recorded here so a future filing starts from numbers rather
+than from an argument. It has two halves and they are not alike:
+
+- **The resolves half — does a cited item number exist in plan §18?** Cheap and *precise*, because
+  item numbers are structured tokens with an authoritative table behind them and `meta_ledger`
+  already parses that table. It has a demonstrated true positive from this very session: the first
+  repair's own annotation at §15.50 cited a plan item that does not exist, caught by re-reading
+  rather than by any instrument. It is still a matcher problem before it is a lookup problem, which
+  is item 100's lesson one document over — measured on this document's normative half after the
+  repairs above, **33 citation sites over 13 distinct item numbers, of which 3 wrap across a line
+  break and one uses the plural `items 14 and 22` form**, so a line-anchored, singular-only scanner
+  reads 29 of them and never sees the numbers in the other four. **The ledger states this
+  population differently, and the two are not the same measurement.** Plan §18 item 108 and notes
+  §3.139 give **18 citations over 11 distinct items**, counted while the gate was being costed — in
+  the same breath as the unfixed-tree yield above, and necessarily before these repairs, since the
+  post-repair count of the scope below is 33. The repairs added **17** citation sites to that scope
+  themselves, repaired sentences and dated annotations alike, since rule 2 below requires the item
+  number *and* the date at every one of them. Under this entry's matcher the pre-repair document at
+  `800915b` reads **16 over 9** in the normative half and **19 over 11** when §16's clauses are
+  counted with it, so the ledger's distinct-item count reconciles against that wider scope while
+  its site count reproduces under neither — no scope is stated beside it, so the two figures can be
+  compared only by re-measuring, which is what this entry's own figure-scope rule asks. **Quote the
+  post-repair figure for what a gate would face** — a gate built later scans the document as it
+  then stands — and the ledger's for what the costing saw. Scope for both figures here: `plan §18
+  item(s) NN` citations, wrap-tolerant and plural-aware, over everything ahead of §15.
+- **The open-versus-executed half — does the prose describe as owed what the ledger records as
+  executed?** That is a natural-language property, and a word list is a proxy for it. Measured with a
+  ten-word list: on the unfixed tree **3 flagged, 3 true positives, 0 false alarms**; after the
+  repairs **2 flagged, 1 true positive and 1 false alarm**, the false alarm landing on this item's
+  own new era-row prose (*unobtainable rather than owed*). The precision is good. **What kills it is
+  coverage, not noise: it reaches 2 of the 6 spots corrected by the pass that costed it.** Three of
+  those cite the ledger with no item number at all, and the era row states its false claim in prose
+  naming no item — a citation-keyed gate is structurally blind to exactly the sites that cite
+  nothing, which is the population that grows. Making it see them means first **banning the bare
+  `plan §18` citation in normative prose**, which is a document-wide edit plus a standing constraint
+  on every future clause.
+
+**Compared honestly with the sibling decline.** §15.69 clause 4 declined a symbol-keyed citation gate
+with its count — 937 identifier-shaped tokens, 63 naive flags, 24 surviving five filters, **1 true
+positive** — on the grounds that a 23-entry allowance and a doc edit in every renaming commit is too
+much machinery for a defect an alignment pass catches for free. This candidate's population is
+smaller by a factor of **28** — 937 tokens over the two normative documents against 33 citation
+sites in this one's normative half — and its measured precision is far better, and its resolves half
+is not a proxy for anything. Against the ledger's pre-repair 18 the factor is **52**.
+*[**Corrected 2026-08-21:** this read "two orders of magnitude smaller", which the sentence's own
+numbers falsify — 937 ÷ 33 = 28.4 and 937 ÷ 18 = 52.1, both well short of the hundredfold that
+phrase claims. A ratio written in words beside the figures it is computed from is checkable in one
+division, which is how this one was caught.]*
+**And it is still DECLINED**, because none of that is what decides it. The coverage measurement is:
+it reaches 2 of the 6 spots corrected by the pass that costed it, and that applies to the resolves
+half as squarely as to the other, both halves being keyed to a citation the blind sites do not
+carry. The two halves *can* land separately and the cheap one is genuinely cheap; that argument was
+weighed and did not carry against a structural blind spot on the population that grows. Declined on
+item 96's grounds and re-openable on a second recurrence naming new evidence (AGENTS §5, plan §18
+item 108). **It is not claimed as built, and no fail-first proof is claimed for it**; the three true
+positives above are its measured yield on the unfixed tree and are recorded so a future filing
+starts from a number.
+
+**What holds the class today**, stated so the absence is not mistaken for coverage: §16.13's citation
+discipline, and each generation's alignment obligation — a periodic sweep, not a per-commit gate. It
+is what found (a) through (h). **And it is a sweep with a known blind spot**, which (i) demonstrates:
+that instance survived two close readings of §7.1 and was turned up by the gate-costing scan, *an
+instrument with no idea which sentence was meant to be live*, which is precisely why it read the
+stale half that careful reading had learned to skip.
+
+**The rules this entry binds.**
+
+1. **Superseded prose left inline is live prose.** Set it off as a quotation with its falsity
+   annotated beneath, or delete it. A *partly* superseded block is the worst case of all: §7.1
+   clause 7's `rts-cts` half is still accurate and carries citations the live text does not restate,
+   which is exactly what kept earning the false half a reader's trust.
+2. **A settled-system sentence that names ledgered open work carries the item number *and* the date
+   its answer landed** — never a standing promise that outlives its answer, and never a bare
+   `plan §18`.
+3. **Executing a ledger item includes grepping this document for the sentences that execution
+   falsified.** The notes entry for the item is not that grep, and neither is the plan's own status
+   line: both record what moved, while the defect is always somewhere that did not move.
+
+**One live instance is left standing and is named rather than quietly carried**, because the class is
+not closed by the sweep that found it: the graph page's repaint skip is built and cited from
+`web/src/assets/app.js` as a §15 decision, and this document carries no entry for it. Its record is
+plan §18 item 91 and the session notes (2026-08-21).
+
+### 15.73 A pre-check answers acceptance; the wire needs a peer, so the wire question is the doctor's
+
+**Status:** DECIDED and EXECUTED — §7.1 clause 8 is the contract statement, §15.53 and §15.61 are
+annotated rather than rewritten (AGENTS §5), and **no refusal, verb, predicate, configuration value
+or verdict moves**. Construction is plan §18 item 85 and notes §3.147; the item was filed as
+*needing a design decision, not a patch*, and this is the decision together with the instrument that
+makes it worth stating.
+
+**The question.** §15.53 separates two states by read-back: a driver that accepts `CRTSCTS` and
+reads the flag back clear is `AcceptedThenDropped` and refused at `load`, and one that keeps it is
+`Honoured` and allowed through. §15.62's CDC-ACM bench **keeps** it — P15 read
+`honoured_on_readback: true` and `shipped_predicate_agrees: true` on both `/dev/ttyACM*` ports,
+with `c_cflag` gaining exactly `0x80000000` on each of them (the words themselves differ per port
+and per run — `0x10021cb2` → `0x90021cb2` on `ttyACM0` against `0x100218b2` → `0x900218b2` on
+`ttyACM1` in `docs/doctor/linux-7.0-2026-08-17-a7e6070-tier3.json`, so **the delta is the quotable
+figure and neither word is**) — and the flag did nothing: a 2×2 control (peer RTS low/high ×
+`CRTSCTS` on/off, peer never reading) wrote 44672 bytes
+in every one of the four cells, spread 0, reproduced on an independent re-run. So the predicate says
+`Honoured`, the daemon loads the node, and the operator has a port that *reports* flow control and
+does not perform it. **It is §15.61's shape with the polarity reversed**, which is why it was filed
+separately rather than as that entry re-opened: §15.61's driver lied by *dropping* the flag and a
+read-back caught it; this one lies by *keeping* it, and no read-back can, because the read-back is
+what it satisfies.
+
+**The decision is to state the bound, not to close it.** §7.1 clause 8 now says in the contract what
+was true and unwritten: the load-time pre-check decides whether the driver **accepts** the setting,
+never whether the wire **honours** it, and a port reporting `Honoured` may still be inert. `load`
+and `add-node` are unchanged, the predicate is unchanged, no configuration value is added, no new
+refusal fires. **The reason is structural rather than a tolerance.** Separating *honoured* from
+*inert* needs a peer, a transfer and a stall; a pre-check has one port and one `tcsetattr`, at the
+position §11 puts it — *before anything is created* — so the transfer it would need would have to be
+driven into the operator's device before the graph exists, past every bound §7.1's open ritual is
+built on. A pre-check is the wrong instrument for this question, not a lax one, and widening it is
+not a smaller change than moving the question.
+
+**The three candidates plan §18 item 85 named, and why the third is the one taken.**
+
+1. *A functionally verified tier for `flow_control`.* **Taken as a report and refused as a refusal
+   grade**, which is the distinction that carries the whole decision. As a grade it would be a
+   configuration value the daemon cannot verify at load — a claim wearing a setting's clothes, the
+   shape §12's `has_identity_source` exists to prevent one field over — because the verification
+   the grade names is exactly the one a pre-check structurally cannot perform. As a *reading* it is
+   the `wire_flow_control` cell below, which measures the same property where a peer exists and
+   refuses nothing on it.
+2. *A documented per-driver allowlist.* Refused on §15.61's own construction — "one predicate,
+   parameterised" — and on §16.5's ban on two copies that must agree. A driver name is not a
+   measurement, and §15.62's whole lesson is that keying on the transport's identity is how a
+   reading about an instrument became a claim about a cable.
+3. *An accepted limitation stated in §7.1.* Taken — and paid for with an instrument rather than
+   with a sentence alone, because a limitation is only worth stating if something can measure what
+   it excludes. **Where in §7.1 is worth one sentence, because the tree cites it.** Clause 2's four
+   states already *implied* the bound — only `AcceptedThenDropped` refuses, and all four are read-back
+   answers — and the shipped code and plan §18 item 85 both cite clause 2 for it. Clause **8** is
+   that citation made literal rather than a second home for it: it says in as many words what clause
+   2 said by enumeration, so a reader who follows the citation finds the sentence instead of
+   inferring it. Nothing in clause 2 moves.
+
+**What was built: P15 gains a `wire_flow_control` reading, and it counts what the peer receives.**
+One reading per direction, emitted **only** where P5 measured an RTS/CTS crossing in *both*
+directions on that pair. The certification is the precondition and not a convenience: a reading that
+answered *inert* where CTS never followed the peer's RTS would be blaming a driver for a cable,
+which is §15.69 clause 1's lesson carried one instrument over. Three cells on the same wire, at
+115200 with a 1024-byte payload and a 300 ms receive window — the subject (`CRTSCTS` set, peer
+holding RTS low) and two controls (the flag cleared with the peer still not ready; the flag set with
+the peer ready) — then the peer raises RTS and the release is read. **Bytes delivered to the peer,
+never bytes the kernel accepted:** the accepted count rides beside each cell precisely because it is
+the number that cannot answer the question. Six words come out — `gated`, `partly-gated`, `inert`,
+`gated-then-lost`, `no-cts-path`, `unmeasurable` — with `honoured_on_the_wire` reserved as `null`
+for the last two, which are statements about the bench rather than about the driver. One byte of the
+payload crossing under backpressure is enough to leave `gated`.
+
+**The reading's own stimulus control runs first, before any comparison** — does *this* transmitter's
+CTS follow the peer's RTS at both levels? — so a bench that cannot be asked answers `no-cts-path`
+with `honoured_on_the_wire: null` instead of `inert`. It is proven on the bench rather than argued:
+with the stimulus withheld, the gated cell delivers **1024 bytes, byte for byte the count that reads
+`inert` when the stimulus arrived** (notes §3.147). A 3-wire rig is §5's own stated assumption and a
+CDC stack manufactures the bit (§15.62, §15.68, §15.69 clause 1); on both of those a transmitter that
+does not stall is what an **honest** driver does, and calling it `inert` would be §15.69 clause 1's
+harm reappearing one instrument over — the same mistake with the nouns swapped, which is why the
+ordering is a check and not a comment.
+
+**And it is reported, never judged.** No pre-check consults it, no `load` is refused on it, P15's
+verdict does not move on it, and P15's `question` — the string an era is keyed on — is unchanged. A
+stricter word in that vocabulary can only ever change a sentence in a report, never redden a lane.
+
+**Why delivery rather than acceptance, and how the payload is sized — the scope the instrument's own
+constants cite this entry for.** Plan §18 item 85 was filed with an instrument that counts what the
+*writer* got rid of, and that number has a per-driver threshold under it: at 1024 bytes all three
+cells accept every byte on the bench of record, so acceptance separates nothing there, and the same
+bench shows the separation appearing higher up — with a **65536**-byte payload and a 2 s budget it
+accepted **4608** bytes under backpressure against **27648** with the flag off, 2 of 2. Delivery has
+no such threshold, which is why it is what the reading folds. The payload is then sized between a
+floor and a ceiling. *The floor* is whatever the transmitter can absorb without sending: a payload
+small enough to sit inside the adapter would read `delivered: 0` on a bench where nothing gated
+anything, which is the one way this instrument could manufacture a false `gated`. It is demonstrated
+rather than looked up — at 1024 bytes the two control cells deliver the whole payload on the bench
+of record while the gated cell delivers none of it — and **the threshold itself is not measured
+anywhere, so no number for it is quotable from this entry or from the constant that cites it.** *The
+ceiling* is airtime: 1024 bytes at 115200 8N1 is 89 ms, better than three times inside the 300 ms
+window, and the whole block costs one pair of opens and about two seconds.
+
+**The evidence, and it is narrower than an entry like this usually gets to claim. Exactly one arm
+has been read off hardware.** The FT232R pair `BH00L4KU` ↔ `BH00LW9U` on Linux 7.0.0-30 under
+`ftdi_sio` reads `gated` in both directions in all three captures: **0 of 1024 bytes** delivered
+while the peer held RTS low, against **1024 of 1024 in each of the two controls on the same wire**,
+1024 arriving once the peer raised RTS, and `cts_after_release: true`
+(`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`, `probe_set`
+`4317ea5ac187f506`). P5 in those same captures reads
+`5-wire crossover: RTS/CTS both ways, DTR moves nothing`, so the wiring is not a variable in any of
+it. **Every other arm — `inert` included — has executed under a fixture and on no bench**, and that
+is a construction rather than a shortfall: no bench in this record produces both halves of item 85's
+discrimination pair — the FT232R gates, and the transport that is inert is the one P5 will not
+certify — so each arm is folded against the others (AGENTS §9) instead of against whichever bench
+happens to be plugged in.
+
+*Recorded rather than quietly dropped, because it is the more useful half:* an earlier draft of this
+instrument's own documentation cited a second hardware arm, "the CDC-ACM capture's `inert`".
+**No such capture exists.** The CDC-ACM bench was read 2026-08-16/17, before this cell existed, and
+no artifact in `docs/doctor/` carries a `wire_flow_control` block other than the three named above.
+§15.62's inert *finding* is real and was taken with that session's bespoke 2×2, not with this
+instrument — and that is exactly the distinction the sentence erased: a session's measurement and an
+instrument's arm are not interchangeable evidence, however identical the word they produce. An entry
+whose whole subject is *reported versus performed* had a fabricated citation in it, which is the
+tell worth keeping.
+
+**The bench that motivated the item is one this instrument cannot be run on**, and that bounds every
+reading it will ever accumulate. §15.62's CDC-ACM ports read CTS `stuck-high` in both directions;
+`stuck-high` is not a crossing, so P5 does not certify the pair and the cell reports the bench
+instead of the driver. **The transport whose defect prompted the measurement is the transport that
+defeats it.** Answering there needs a driver that manufactures nothing and is inert anyway —
+hardware this record does not hold.
+
+**The captures this entry cites are one `field_set` behind the instrument, and that bounds what they
+prove.** They were taken at `9a75a9f83a83a617`; `released_intact` — the comparison that separates a
+transmitter which held *the payload* from one that held *some bytes* — landed after them, moving
+`field_set` to `b73dba8f32301a84` (notes §3.147). So the hardware arm above proves the stall and the
+release **count**, while the **content** half of the `gated`/`gated-then-lost` separation has
+executed under fixture only, and the corpus holds no capture of this instrument at the current
+digest. `jq -e -f expectations/linux.jq` accordingly exits **1** on all three, isolated to that one
+conjunct: adding the single key to a copy of each takes it to exit **0**, measured on all three.
+**That is the scope of a decided property and not a finding** — notes §3.146 (i) enumerated where the
+expectation files execute (the `doctor` job's step, the `macos` job's step, and
+`itest/tests/expectation_gates.rs`, which always runs the doctor fresh) and recorded that **no
+committed artifact is ever gated by them**. The scope is wider than these three, and is worth one
+number so nobody mistakes the platform gate for a corpus validator: in the current era, **18 of 18
+passive captures satisfy their platform's expectation file and 1 of 26 Tier-3 captures does** — the
+one taken on the build that added the field the gate now requires. §13's era law keeps a `field_set`
+move from closing anything, while `expectations/*.jq` requires each field from the moment it lands,
+so a Tier-3 capture satisfies that gate on the day it is taken and is cited afterwards under §16.13
+for the readings it carries, never for its exit status.
+
+**Era, and it is the reason `question` was left alone.** Widening P15's `question` string is a
+`probe_set` move, which would close an era for a wording change — §15.59's first step, repeated on
+purpose — so the string is unchanged, `probe_set` stays `4317ea5ac187f506`, and **no era closes**
+(§13's era law clause 4; the record already carries `field_set` moves that closed nothing, notes
+§3.89/§3.90). `field_set` moves four times across this session's Linux Tier-3 line, all at one
+`-dirty` commit string: `64eb252e565113b2`, then `f18630922c4eecc7` with plan §18 item 73's software
+cross-check (571 → 573 leaf paths, the two added being that cell for each named port), then
+`9a75a9f83a83a617` as this reading lands, then `b73dba8f32301a84` as `released_intact` joins it
+(notes §3.146, §3.147). **A `-dirty` artifact named by its commit alone therefore names four
+different trees**, and the digest is the only field that separates them. `expectations/linux.jq` and
+`expectations/macos.jq` gained their clauses in the same change as the fields they type-check, and
+both admit a P15 row carrying no `wire_flow_control` block at all — which is what keeps a bench with
+no certified pair, and every capture that predates the key, legal rather than red.
+
+**What this does not decide, stated because they are the obvious over-reads.** It says nothing about
+`cdc_acm` as a class or `ftdi_sio` as a class: one port, one driver, one peer, one rate, one
+payload. It does not reopen §15.53 or §15.61 — an accept-then-drop port is still refused, on the
+same predicate, in the same position, for the same reason. And it does not promise a refusal later:
+if a wire reading is ever to gate anything, that is a fresh decision needing its own evidence, and
+the ground for declining one here is not that the evidence is thin but that the pre-check is not the
+instrument.
+
 
 ## 16. Post-completion review: reliability through simplification
 
@@ -5448,6 +6479,10 @@ Three of the five worst audit findings were instance-level violations of the sam
 lifecycle rules; one supervisor abstraction encodes concurrent halves, park-don't-teardown, loss
 notification, and join-then-transition once, property-tested once, with serial, exec, and leg
 rebased onto it. The pty/log rebase recipe (notes §3.21) is plan §18 item 42.
+*[**Annotated 2026-08-21 (plan §18 item 108, §15.72):** item 42 is **EXECUTED 2026-08-12**
+(notes §3.88) — `BlockingReader` became `BlockingWorker`, the loss counter became optional
+*structurally* rather than by convention, and all three call sites rebased — so the sentence above
+points at a closed item, never at owed work.]*
 
 ### 16.2 Make the borrow tripwire unrepresentable
 
@@ -5542,6 +6577,14 @@ The three surviving shell scripts (license gate, external-consumer build, wait h
 with the suite; where each went is plan §18 item 29's deliverable. The evaluated-and-kept decline
 rides with it, restated at plan §3: **sim doubles stay subprocesses, never in-process libraries** —
 cross-process scheduling is load-bearing realism, exactly what exposed §15.19's timer-floor bug.
+*[**Annotated 2026-08-21 (plan §18 item 108, §15.72): the destination record is no longer owed.**
+Plan §18 item 29 is **EXECUTED 2026-08-12**, answered from the git history rather than from memory,
+which is what the item asked for: `scripts/lib/wait-for.sh`,
+`scripts/validate/phase0/license-gate.sh` and `scripts/validate/phase8/external-codec.sh` were all
+three deleted in one commit — `563fb9c`, 2026-07-24 — which is this entry's own execution, and the
+same commit created their successors (`itest/tests/p0_license_gate.rs`, a rewritten
+`itest/tests/p8_external_codec.rs`, and the `wait_until`/`wait_for` helpers in the harness). The
+"is owed" wording above is a dated record of the filing.]*
 
 ### 16.12 Wire-identifier maxima
 

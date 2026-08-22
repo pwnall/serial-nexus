@@ -65,6 +65,69 @@ pub const TAP_QUEUE_CAP: usize = 128;
 /// runtime-scheduling gap.
 pub const TAP_FEED_CAP: usize = 256;
 
+/// The most pattern waits one host-facing endpoint may hold armed at the same
+/// time (design §15.70; plan §18 item 64(a)).
+///
+/// **This is a per-chunk scan cost and an allocation, both chosen by an operator
+/// input, and until it was capped it was the one dimension of the pattern wait
+/// with no stated maximum.** §10 clause 2 gives every *request* dimension one —
+/// pattern count and length, compiled size, lookback, context, deadline — and
+/// §15.56 declined an unbounded lookback in those exact terms: "a match window
+/// without a stated maximum is an allocation and a scan cost an operator input
+/// controls". The number of windows is the same quantity with the same
+/// multiplier: [`TapHub::ingest`] walks `waits` per chunk and each entry rescans
+/// its whole retained window, so the hub's per-chunk work is
+/// `waits.len() × lookback × the pattern's cost per byte`. Two of those three
+/// factors were capped and the product therefore was not.
+///
+/// **Measured on this tree before the number was chosen** (plan §18 item 64(a);
+/// release build, 4 KiB chunks fed straight into `TapHub::ingest`, windows warmed
+/// to [`crate::pattern::MAX_LOOKBACK`], a 20-core box under a load average of
+/// 3.6–5.7 — so these are ceilings on a busy machine, not best cases):
+///
+/// * **Per armed wait, per chunk, and flat in the list's length**: 6.1–6.2 µs for
+///   a literal (`login:`), 111–112 µs for a regex with no literal to prefilter on
+///   (`(?-u)[a-zA-Z0-9]{200}` and `(?-u)[^\n]{4000}`, both over console-shaped
+///   text). Per scanned byte that is **0.089 ns against 1.60** — an 18× spread the
+///   *pattern* chooses, on top of the window the request chooses.
+/// * **Per open tap, per chunk: 20–22 ns**, flat, on the same list in the same
+///   run. A wait costs 130–190× a tap at the cheapest measured pattern and about
+///   5300× at the dearest, which is why taps ride this list uncapped and waits do
+///   not.
+/// * **End to end** (`info` over the control socket while a pty firehose feeds the
+///   endpoint, three runs, load 9.9–19.0): p50 0.11–0.22 ms with nothing armed,
+///   7.8–11.7 ms with **one** max-lookback regex wait, 60–72 ms with eight, and a
+///   p90/max of 0.63–1.06 s with 64. This is the worst case the tree can build —
+///   a software firehose, the maximum lookback, a prefilter-defeating pattern —
+///   and **not** a console figure.
+///
+/// **Why 64.** Per-wait cost is flat from 8 waits through 128 across three runs
+/// (2.7–4.0 µs each with a rare-byte literal) and then climbs — 3.5–4.1 µs at
+/// 256, 4.8–5.1 at 512, 5.4–6.0 at 1024 — as the retained windows outgrow cache.
+/// Past that knee each additional wait costs more than the one before it, so the
+/// operator's input stops buying linear cost; 64 sits a binary step inside the
+/// measured flat region. It bounds the retained windows to **4 MiB** per endpoint
+/// at the maximum lookback and the hub's per-chunk work to a *stated* 0.40 ms
+/// (literal) or 7.2 ms (no-prefilter regex) where it had no bound at all. It is
+/// also eight times [`crate::pattern::MAX_PATTERNS`], which is the escape hatch
+/// that constant's own doc names — "a caller that wants more opens a second
+/// connection" — so 512 patterns can still be watched on one endpoint at once.
+///
+/// **What the cap does not do, said here because the numbers above say it.** One
+/// wait already moves that `info` p50 by 40–110×, and the cap cannot touch that:
+/// the other two factors — the lookback and the pattern's cost per byte — are the
+/// dominant term and are *already* stated maxima the design accepts. This bounds
+/// the product; it does not make the worst case comfortable.
+///
+/// **What one connection can hold is 1**, so this is a cap on *connections*
+/// waiting on one endpoint: §15.20 runs one waiting verb per connection, and
+/// `tap.wait` is not on the web bridge's allowlist (§15.34, §10 clause 8), so
+/// every armed wait is one control-socket connection that arrived over the
+/// 0600/0660 socket. That is a real bound but not a stated one — this box's fd
+/// limit is 524288 — and a client that leaks connections reaches it by accident
+/// exactly as an adversary reaches it on purpose.
+pub const MAX_ARMED_WAITS: usize = 64;
+
 /// Cap on the size of one replay-snapshot piece delivered on `tap.open --replay`,
 /// so a large ring becomes a handful of `tap.data` notifications rather than one
 /// giant line. Matches the data-plane read buffer.
@@ -320,6 +383,13 @@ pub enum Armed {
     },
     /// Registered and watching. The parked verb owns the receiver.
     Parked(oneshot::Receiver<WaitEnd>),
+    /// The endpoint already holds [`MAX_ARMED_WAITS`] armed waits, so this one was
+    /// refused (§15.70). **Nothing was armed and nothing was scanned** — not even
+    /// the replay ring — which is what keeps the refusal itself cheap: a ring scan
+    /// is up to `MAX_REPLAY_RING` bytes of work on the runtime thread, so a hub at
+    /// its cap that still scanned would hand a refused caller a bigger lever than
+    /// an accepted one.
+    Refused { armed: usize, max: usize },
 }
 
 /// One armed pattern wait inside a [`TapHub`] (§10 *The pattern wait*).
@@ -474,6 +544,13 @@ pub struct TapHub {
     /// boundaries matches by construction. Feeding a matcher through a bounded
     /// channel like a tap's would have made "no match" mean "no match, unless the
     /// channel was full", which is not an answer.
+    ///
+    /// **Its length is capped at [`MAX_ARMED_WAITS`]** (§15.70). It is walked per
+    /// chunk and every entry rescans its whole retained window, so the length is a
+    /// per-chunk cost on the thread that runs every console — the same kind of cost
+    /// §15.56 declined an unbounded lookback for, and measured at 300× to 5600× an
+    /// open tap's per element. The taps beside it stay uncapped for that measured
+    /// reason and no other.
     waits: Vec<ArmedWait>,
     ring: Option<ReplayRing>,
     /// Total hostward bytes ever ingested at this endpoint (plan §11.8): the monotonic
@@ -677,6 +754,10 @@ impl TapHub {
     /// scanned (§10 clause 5). That is the concrete thing the daemon-side matcher
     /// buys over the client recipe §15.56 declines: a client can only ever scan what
     /// its own bounded channel could be handed.
+    ///
+    /// Answers [`Armed::Refused`] when the endpoint already holds
+    /// [`MAX_ARMED_WAITS`] — checked first, ahead of the ring scan, so a refusal
+    /// costs the hub nothing.
     pub fn arm_wait(
         &mut self,
         id: u64,
@@ -685,6 +766,15 @@ impl TapHub {
         context: usize,
         replay: bool,
     ) -> Armed {
+        // **The occupancy maximum, checked before anything is armed *or scanned***
+        // (§15.70; §10 clause 2's shape for every other dimension). Ahead of the
+        // ring scan deliberately: see [`Armed::Refused`].
+        if self.waits.len() >= MAX_ARMED_WAITS {
+            return Armed::Refused {
+                armed: self.waits.len(),
+                max: MAX_ARMED_WAITS,
+            };
+        }
         let mut scan = ScanWindow::new(matcher, lookback, context, self.ingested);
         let mut from_offset = self.ingested;
         let mut replay_scanned = 0u64;
@@ -1384,6 +1474,152 @@ mod tests {
         .expect("compiles")
     }
 
+    /// **The armed-wait list has a stated maximum, so the hub's per-chunk work
+    /// does too** (design §15.70; plan §18 item 64(a)).
+    ///
+    /// [`TapHub::ingest`] walks `waits` on every chunk and each entry rescans its
+    /// whole retained window. The sibling guard in [`crate::pattern`] bounds *one*
+    /// wait's window at its lookback; this bounds how many of them there can be,
+    /// which is the other factor of the same product and the one that had no
+    /// maximum at all. Measured before the number was chosen: 6.1–6.2 µs per wait
+    /// per 4 KiB chunk for a literal and 111–112 µs for a regex with no literal to
+    /// prefilter on, against 20–22 ns for an open tap on the same list in the same
+    /// run (see [`MAX_ARMED_WAITS`]).
+    ///
+    /// Four properties, because three of them can hold while the fourth is broken:
+    ///
+    /// 1. The endpoint accepts exactly [`MAX_ARMED_WAITS`] — **the bound is
+    ///    reached**, not merely respected, so this cannot pass against a cap of 0
+    ///    or a hub that refuses everything.
+    /// 2. The next one is refused, and the refusal names the occupancy and the
+    ///    maximum rather than answering a bare `Parked`.
+    /// 3. A refusal arms **nothing**: the hub still holds exactly the maximum.
+    /// 4. A capped endpoint answers `Refused` **even when the ring already holds
+    ///    the pattern** — the refusal is never quietly converted into a free
+    ///    `AlreadyMatched`, which would let a caller at the cap keep asking and
+    ///    keep being served. The pattern seeded below is sitting in the ring, so an
+    ///    `AlreadyMatched` here is exactly that.
+    ///
+    /// **What property 4 does NOT assert, stated because the comment above it is
+    /// what a reviewer reads** (AGENTS §3's weaker-than-its-comment register). The
+    /// *reason* the check is `arm_wait`'s first statement is that a ring scan is up
+    /// to `MAX_REPLAY_RING` bytes of work on the runtime thread, so a hub at its cap
+    /// that scanned anyway would hand a **refused** caller a bigger lever than an
+    /// accepted one — measured at 15.0 ms (literal) and 92.0 ms (a regex with no
+    /// literal prefilter) per `tap.wait --replay` over a 16 MiB ring. That is a
+    /// **cost**, and a cost leaves no outcome behind: moving the check to sit
+    /// between the ring scan and the `AlreadyMatched` return still answers
+    /// `Refused`, and this guard stays green — **measured, not assumed** (plant 3
+    /// below). The ordering is therefore held by construction — the check is the
+    /// function's first statement — and only its outcome half is asserted here.
+    ///
+    /// **Fail-first, four plants, one of them a null** (plan §18 item 64(a)):
+    ///
+    /// 1. Delete the `waits.len() >= MAX_ARMED_WAITS` arm → property 2 reddens
+    ///    naming the unbounded list.
+    /// 2. Spell it `>` → the same probe reddens at `MAX_ARMED_WAITS + 1` armed.
+    /// 3. Move the arm below the ring-scan block but above the `AlreadyMatched`
+    ///    return → **nothing reddens**, for the reason above.
+    /// 4. Move it below the `AlreadyMatched` return → property 4 reddens.
+    #[test]
+    fn the_armed_wait_list_is_capped_so_per_chunk_work_has_a_stated_maximum() {
+        let (hub, _active, _fd) = TapHub::new("usb0", 64);
+        // A pattern that IS in the ring, so property 4 has something to catch.
+        hub.with_mut(|h| h.ingest(&Chunk::from_static(b"login: ")));
+
+        let mut parked = Vec::new();
+        for id in 0..MAX_ARMED_WAITS as u64 {
+            match hub.with_mut(|h| {
+                h.arm_wait(id, matcher(b"login:"), 4096, 64, /* replay */ false)
+            }) {
+                Armed::Parked(rx) => parked.push(rx),
+                other => panic!(
+                    "wait {id} of {MAX_ARMED_WAITS} was not parked: {}",
+                    describe(&other)
+                ),
+            }
+        }
+        assert_eq!(
+            hub.with(|h| h.snapshot().waits.len()),
+            MAX_ARMED_WAITS,
+            "the maximum must be REACHED, or every assertion below holds for a hub \
+             that refused the first wait too"
+        );
+
+        // Property 2, on its own so its failure names its own defect: without a
+        // ring scan to settle it, the only two outcomes are the refusal and the
+        // unbounded list.
+        match hub.with_mut(|h| {
+            h.arm_wait(
+                MAX_ARMED_WAITS as u64,
+                matcher(b"login:"),
+                4096,
+                64,
+                /* replay */ false,
+            )
+        }) {
+            Armed::Refused { armed, max } => {
+                assert_eq!(armed, MAX_ARMED_WAITS, "the refusal names the occupancy");
+                assert_eq!(max, MAX_ARMED_WAITS, "the refusal names the maximum");
+            }
+            other => panic!(
+                "a {}th wait {} on an endpoint whose stated maximum is \
+                 {MAX_ARMED_WAITS}: the list `TapHub::ingest` walks per chunk is \
+                 unbounded again, and with it the hub's per-chunk work (§15.70)",
+                MAX_ARMED_WAITS + 1,
+                describe(&other)
+            ),
+        }
+
+        // Property 4, separately, because property 2 cannot see it: this request
+        // *would* settle from the ring, and must be refused before the scan runs.
+        match hub.with_mut(|h| {
+            h.arm_wait(
+                MAX_ARMED_WAITS as u64 + 1,
+                matcher(b"login:"),
+                4096,
+                64,
+                /* replay */ true,
+            )
+        }) {
+            Armed::Refused { .. } => {}
+            Armed::AlreadyMatched { .. } => panic!(
+                "the endpoint was at its {MAX_ARMED_WAITS}-wait maximum and scanned the \
+                 replay ring anyway. A ring scan is up to MAX_REPLAY_RING bytes of work \
+                 on the thread that runs every console, so a hub at its cap would cost a \
+                 REFUSED caller more than an accepted one, per call, forever (§15.70)"
+            ),
+            Armed::Parked(_) => panic!("the cap did not hold with `replay` asked"),
+        }
+        assert_eq!(
+            hub.with(|h| h.snapshot().waits.len()),
+            MAX_ARMED_WAITS,
+            "a refused wait must leave the endpoint exactly as it found it"
+        );
+
+        // The cap is *occupancy*, not a lifetime quota: a slot freed is a slot
+        // reusable, which is what makes the refusal's "retry" advice true.
+        assert!(hub.with_mut(|h| h.disarm(0)).is_some());
+        parked.remove(0);
+        match hub.with_mut(|h| h.arm_wait(9_000, matcher(b"login:"), 4096, 64, false)) {
+            Armed::Parked(rx) => parked.push(rx),
+            other => panic!(
+                "a freed slot must be reusable, or the cap is a quota on the endpoint's \
+                 whole life: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    /// A one-word name for an [`Armed`] outcome, for the panic messages above.
+    fn describe(a: &Armed) -> &'static str {
+        match a {
+            Armed::AlreadyMatched { .. } => "AlreadyMatched",
+            Armed::Parked(_) => "Parked",
+            Armed::Refused { .. } => "Refused",
+        }
+    }
+
     /// **A replay scan must not run across a hole in the ring** (§10 clause 4/5).
     ///
     /// The ring stores bytes and nothing else, so a feed-hop hole leaves no trace in
@@ -1408,6 +1644,7 @@ mod tests {
                 "the ring's two halves were never adjacent on the wire; matching across                  them is a false positive manufactured by the loss: {matched:?}"
             ),
             Armed::Parked(_) => {}
+            other => panic!("this hub holds no other waits: {}", describe(&other)),
         }
         // And the wait says its scan was not whole, so a later `matched: null` is
         // read at its true strength rather than as a clean negative.

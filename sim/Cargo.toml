@@ -16,6 +16,11 @@ clap = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 nix = { workspace = true, features = ["term", "fs", "poll", "ioctl"] }
 serial-nexus-sys.workspace = true
+# The §15.43 stdin-EOF leash, one implementation for every binary that carries one
+# (plan §18 item 79). `serial-nexus-rpc` is where the other cross-binary policy the
+# separate processes must agree on already lives (the §10 socket path, item 51), and
+# it is `std`-only for this: linking it adds serde + a `nix` uid read, nothing else.
+serial-nexus-rpc.workspace = true
 libc.workspace = true
 anyhow.workspace = true
 sha2.workspace = true

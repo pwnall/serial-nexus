@@ -338,6 +338,483 @@ fn has_code_token(src: &str, token: &str) -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The Rust-literal-aware masker, and the scanners built on it.
+//
+// **This is the root-cause repair of three matcher holes an adversarial plant found
+// in the no-`exec` gate on 2026-08-21** (design §15.71, plan §18 item 104). Every
+// scanner below used to be a character walk that cut each line at its first `//` and
+// counted brackets and braces as it met them — three assumptions a Rust source file
+// does not honour, and all three were *demonstrated* rather than argued:
+//
+//   1. a string literal may contain `//`. This tree is full of URLs, and the line
+//      `let (doc, out) = ("https://…", Command::new("getcap").output());` truncated
+//      at the URL, so the spawn after it was invisible. The gate reported **green**
+//      on the real defect restored into `read_caps`, and the binary built from that
+//      tree execed `getcap` from `preflight` — confirmed with a `PATH` shim.
+//   2. a string literal may contain an unbalanced `]`, which dropped the attribute
+//      pass's bracket depth to zero before the attribute ended, so an `#[arg(help =
+//      "a ] bracket", env = "SNX_PORT")]` spread over four lines scanned clean.
+//   3. a string literal may contain a brace, which moves where a `#[cfg(test)] mod`
+//      block ends and therefore what counts as product code at all.
+//
+// One masker answers all three, and it is the honest shape for the job: every gate
+// here asks "does this token appear in **code**", and the only way to answer that is
+// to know where code is not.
+// ---------------------------------------------------------------------------
+
+/// Replace `out[from..to]`'s ASCII with spaces, leaving newlines and every non-ASCII
+/// byte alone.
+///
+/// Newlines stay so line numbers survive; non-ASCII bytes stay so the result is
+/// **always valid UTF-8 whatever offsets it is handed** — a multibyte character can
+/// never be half-masked into invalid bytes, and it can never match an ASCII needle
+/// either, so leaving it costs the scan nothing.
+fn mask_ascii(out: &mut [u8], from: usize, to: usize) {
+    for byte in out.iter_mut().take(to).skip(from) {
+        if byte.is_ascii() && *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+/// Is `b[i]` preceded by an identifier byte? A literal prefix (`r`, `b`, `c`) only
+/// counts at the start of a token, so `crate` and `r#type` are not string opens.
+fn follows_identifier(b: &[u8], i: usize) -> bool {
+    i > 0 && (b[i - 1] == b'_' || b[i - 1].is_ascii_alphanumeric())
+}
+
+/// If a string literal opens at `i`, its `(opening quote offset, hash count, raw)`.
+///
+/// Covers `"…"`, `r"…"`, `r#"…"#` at any hash count, and the byte and C forms
+/// `b"…"`, `br#"…"#`, `c"…"`, `cr#"…"#`. Returns `None` for a raw *identifier*
+/// (`r#type`) and for any identifier that merely starts with one of the prefix
+/// letters (`crate`, `bool`, `rest`), which is what the `"` requirement buys.
+fn string_open(b: &[u8], i: usize) -> Option<(usize, usize, bool)> {
+    let mut k = i;
+    if matches!(b.get(k), Some(b'b' | b'c')) {
+        k += 1;
+    }
+    let raw = b.get(k) == Some(&b'r');
+    let mut hashes = 0usize;
+    if raw {
+        k += 1;
+        while b.get(k) == Some(&b'#') {
+            hashes += 1;
+            k += 1;
+        }
+    }
+    (b.get(k) == Some(&b'"')).then_some((k, hashes, raw))
+}
+
+/// Where the string literal whose opening quote is at `quote` ends, and whether it
+/// was actually closed. An unclosed literal masks to end of file, which is why the
+/// caller reports it rather than trusting the result.
+fn string_end(b: &[u8], quote: usize, hashes: usize, raw: bool) -> (usize, bool) {
+    let n = b.len();
+    let mut j = quote + 1;
+    if raw {
+        // No escapes in a raw string: the terminator is a quote followed by exactly
+        // the opening hash count, which is the whole reason the hash count exists.
+        while j < n {
+            if b[j] == b'"' {
+                let mut k = j + 1;
+                let mut seen = 0usize;
+                while seen < hashes && b.get(k) == Some(&b'#') {
+                    seen += 1;
+                    k += 1;
+                }
+                if seen == hashes {
+                    return (k, true);
+                }
+            }
+            j += 1;
+        }
+        return (n, false);
+    }
+    while j < n {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return (j + 1, true),
+            _ => j += 1,
+        }
+    }
+    (n, false)
+}
+
+/// The byte length of the UTF-8 character whose lead byte is `first`.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
+/// If a char literal opens at the quote `q`, the offset just past its closing quote.
+///
+/// `None` when the `'` is a **lifetime or a loop label**, which in this tree it is
+/// far more often than not — `&'a str`, `Foo<'_>`, `'outer: loop`. That is the whole
+/// difficulty of the character: `'` is not a delimiter in Rust, it is two unrelated
+/// things, and a masker that guessed wrong in the permissive direction would swallow
+/// code from `&'a` to the next apostrophe anywhere in the file.
+fn char_literal_end(b: &[u8], q: usize) -> Option<usize> {
+    let n = b.len();
+    let mut j = q + 1;
+    if b.get(j) == Some(&b'\\') {
+        j += 1;
+        match b.get(j) {
+            // `\xNN`, and `\u{…}` whose body is variable-length.
+            Some(b'x') => j += 3,
+            Some(b'u') => {
+                while j < n && b[j] != b'}' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            // `\n`, `\t`, `\\`, `\0`, and — the one that matters — `\'`.
+            Some(_) => j += 1,
+            None => return None,
+        }
+    } else {
+        j += utf8_len(*b.get(j)?);
+    }
+    (b.get(j) == Some(&b'\'')).then_some(j + 1)
+}
+
+/// `src` with every comment and every literal **masked** — ASCII replaced by spaces,
+/// newlines and byte offsets kept — and the reason, if any, that the lex did not
+/// finish cleanly.
+///
+/// Handles, each planted in [`the_source_scanner_knows_what_a_rust_literal_is`]:
+/// `//` line comments; `/* … */` block comments **including Rust's nesting**; string
+/// literals with escapes; raw strings at any hash count; byte and C strings and their
+/// raw forms; byte and char literals including `'\''` and `'"'`; and the `'` that is
+/// a lifetime or a label rather than a literal at all.
+///
+/// **What it does not know, said rather than implied.** It assumes `src` is valid
+/// Rust — which every file it is pointed at is, because the workspace builds — and
+/// its one failure mode is the dangerous direction: a construct it opens and never
+/// closes masks the rest of the file, and a masked file is a *green* file. That is
+/// why the second half of the return value exists and why every gate below asserts it
+/// is `None` for every file it scanned. It does not expand macros, so a spawn
+/// assembled by token pasting is invisible to it; and it does not follow `include!`.
+fn mask_comments_and_literals(src: &str) -> (String, Option<String>) {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out = b.to_vec();
+    let mut unterminated: Option<String> = None;
+    let line_of = |at: usize| src[..at].bytes().filter(|c| *c == b'\n').count() + 1;
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            let end = src[i..].find('\n').map_or(n, |o| i + o);
+            mask_ascii(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            // Rust nests block comments, so this counts rather than scanning for the
+            // first `*/`.
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < n {
+                if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            let j = j.min(n);
+            if depth != 0 && unterminated.is_none() {
+                unterminated = Some(format!(
+                    "a `/* … */` block comment opened at line {} is never closed",
+                    line_of(i)
+                ));
+            }
+            mask_ascii(&mut out, i, j);
+            i = j;
+            continue;
+        }
+        if (c == b'"' || (matches!(c, b'r' | b'b' | b'c') && !follows_identifier(b, i)))
+            && let Some((quote, hashes, raw)) = string_open(b, i)
+        {
+            let (end, closed) = string_end(b, quote, hashes, raw);
+            if !closed && unterminated.is_none() {
+                unterminated = Some(format!(
+                    "a string literal opened at line {} is never closed",
+                    line_of(i)
+                ));
+            }
+            mask_ascii(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if c == b'\'' || (c == b'b' && b.get(i + 1) == Some(&b'\'') && !follows_identifier(b, i)) {
+            let quote = if c == b'\'' { i } else { i + 1 };
+            if let Some(end) = char_literal_end(b, quote) {
+                mask_ascii(&mut out, i, end);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let masked = String::from_utf8(out)
+        .expect("masking replaces ASCII with ASCII and leaves every other byte alone");
+    (masked, unterminated)
+}
+
+/// [`mask_comments_and_literals`] and [`blank_test_modules`] together: `src` reduced
+/// to the code a `setcap` or a `cargo build --release` actually ships, line-for-line
+/// with `src` so a hit still names a line the reader can open.
+fn product_code(src: &str) -> String {
+    blank_test_modules(&mask_comments_and_literals(src).0)
+}
+
+/// **The source scanners know what a Rust literal is** (§15.71, plan §18 item 104).
+///
+/// The battery AGENTS §3 asks for, applied to the *masker* rather than to a gate
+/// built on it: plant the construct in **every spelling the thing claims to cover**
+/// and watch it behave. It is a separate test from the gates because the masker is
+/// now the floor all of them stand on — a hole here is a hole in each of them at once,
+/// and the three that an adversarial plant opened in the no-`exec` gate's first draft
+/// were one hole, in this exact layer, wearing three symptoms.
+///
+/// Two directions are asserted for every form, because only the pair says anything:
+/// a token **after** a literal must still be seen (the hole), and a token **inside**
+/// one must not (the reason a masker is needed at all).
+#[test]
+fn the_source_scanner_knows_what_a_rust_literal_is() {
+    // A spawn that follows the literal must still be found. `//`, `]` and `}` are the
+    // three characters that used to end the scan early, so each form carries one.
+    for (what, planted) in [
+        (
+            "a `//` inside a plain string — the URL case, and the shape the \
+             adversarial plant used to restore the real defect into `read_caps`",
+            "fn f() { let (d, c) = (\"https://man7.org/x\", Command::new(\"y\")); }\n",
+        ),
+        (
+            "an escaped quote ahead of the `//`, which a naive quote-counter reads as \
+             the end of the string",
+            "fn f() { let (d, c) = (\"a \\\" b // c\", Command::new(\"y\")); }\n",
+        ),
+        (
+            "a raw string with no hashes",
+            "fn f() { let (d, c) = (r\"//\", Command::new(\"y\")); }\n",
+        ),
+        (
+            "a raw string with one hash, holding a quote it does not end on",
+            "fn f() { let (d, c) = (r#\"// \" ]\"#, Command::new(\"y\")); }\n",
+        ),
+        (
+            "a raw string with two hashes, holding the one-hash terminator",
+            "fn f() { let (d, c) = (r##\"a \"# b //\"##, Command::new(\"y\")); }\n",
+        ),
+        (
+            "a byte string",
+            "fn f() { let (d, c) = (b\"// }\", Command::new(\"y\")); }\n",
+        ),
+        (
+            "a raw byte string",
+            "fn f() { let (d, c) = (br#\"// }\"#, Command::new(\"y\")); }\n",
+        ),
+        (
+            "a C string",
+            "fn f() { let (d, c) = (c\"// ]\", Command::new(\"y\")); }\n",
+        ),
+        (
+            "a raw C string",
+            "fn f() { let (d, c) = (cr#\"// ]\"#, Command::new(\"y\")); }\n",
+        ),
+        (
+            "a char literal holding a double quote — which a masker without char \
+             literals reads as a string open, swallowing the rest of the file",
+            "fn f() { let q = '\"'; Command::new(\"y\"); }\n",
+        ),
+        (
+            "a char literal holding an escaped single quote",
+            "fn f() { let q = '\\''; Command::new(\"y\"); }\n",
+        ),
+        (
+            "a byte char literal holding a double quote",
+            "fn f() { let q = b'\"'; Command::new(\"y\"); }\n",
+        ),
+        (
+            "an escaped-unicode char literal, whose body is variable length",
+            "fn f() { let q = '\\u{1F600}'; Command::new(\"y\"); }\n",
+        ),
+        (
+            "a **lifetime**, which shares the character and is not a literal at all",
+            "fn f<'a>(s: &'a str) { Command::new(\"y\"); }\n",
+        ),
+        (
+            "a loop **label**, the other thing that apostrophe is",
+            "fn f() { 'outer: loop { Command::new(\"y\"); } }\n",
+        ),
+        (
+            "a raw **identifier**, which is `r` and `#` and not a raw string",
+            "fn f() { let r#type = 1; Command::new(\"y\"); }\n",
+        ),
+        (
+            "an identifier that merely starts with a literal prefix letter",
+            "fn f() { let crate_dir = 1; let bytes = 2; Command::new(\"y\"); }\n",
+        ),
+        (
+            "a block comment holding an apostrophe, which must not open a char literal",
+            "/* don't read this as a literal */\nfn f() { Command::new(\"y\"); }\n",
+        ),
+        (
+            "a line comment holding an unterminated string, which must not run on",
+            "// he said \"hi\nfn f() { Command::new(\"y\"); }\n",
+        ),
+    ] {
+        assert_eq!(
+            process_spawn_sites(planted, true).len(),
+            1,
+            "the masker eats code after {what}: {planted:?}"
+        );
+    }
+
+    // ...and the other direction: a token *inside* a literal or a comment is not code,
+    // which is the whole reason for masking rather than grepping.
+    for (what, planted) in [
+        ("a plain string", "fn f() { let s = \"Command::new\"; }\n"),
+        (
+            "a raw string",
+            "fn f() { let s = r#\"Command::new(\"getcap\")\"#; }\n",
+        ),
+        (
+            "a block comment",
+            "/* the ban: no Command::new(\"getcap\") here */\nfn f() {}\n",
+        ),
+        (
+            "a **nested** block comment, which Rust allows and a first-`*/` scan does \
+             not survive",
+            "/* outer /* Command::new(\"getcap\") */ still comment */\nfn f() {}\n",
+        ),
+        ("a line comment", "// no Command::new here\nfn f() {}\n"),
+        (
+            "a doc comment, which is a line comment with one more slash",
+            "/// Never call Command::new from this module.\nfn f() {}\n",
+        ),
+    ] {
+        assert!(
+            process_spawn_sites(planted, true).is_empty(),
+            "the masker leaves {what} readable as code: {planted:?}"
+        );
+    }
+
+    // The masker's own failure mode, which is the dangerous direction: an unterminated
+    // construct masks the rest of the file, and a masked file is a *green* file. It is
+    // reported rather than swallowed, and the gates assert the report is empty for
+    // every file they scanned.
+    for (what, planted) in [
+        (
+            "an unterminated string",
+            "fn f() { let s = \"never closed;\n",
+        ),
+        (
+            "an unterminated block comment",
+            "fn f() {}\n/* never closed\n",
+        ),
+        (
+            "a raw string whose hash count never comes back",
+            "fn f() { let s = r#\"never closed\";\n}\n",
+        ),
+    ] {
+        assert!(
+            mask_comments_and_literals(planted).1.is_some(),
+            "the masker ran off the end on {what} and said nothing: {planted:?}"
+        );
+    }
+    assert!(
+        mask_comments_and_literals("fn f() { let s = \"closed\"; }\n")
+            .1
+            .is_none(),
+        "an ordinary file must not be reported as unlexable, or the report is noise \
+         and will be ignored"
+    );
+
+    // Offsets and line counts survive, which is what lets a failure name a line the
+    // reader can open — and what lets `product_code` be zipped against the original.
+    let src = "fn f() {\n    let s = \"a // b\";\n    // ünïcöde in a comment\n}\n";
+    let (masked, why) = mask_comments_and_literals(src);
+    assert!(why.is_none());
+    assert_eq!(masked.len(), src.len(), "byte offsets moved");
+    assert_eq!(
+        masked.lines().count(),
+        src.lines().count(),
+        "line numbers moved"
+    );
+    assert!(
+        masked.contains("let s = "),
+        "the masker ate code as well as the literal: {masked:?}"
+    );
+    assert!(
+        !masked.contains("// b"),
+        "the string's contents survived masking: {masked:?}"
+    );
+
+    // And the test-module blanker, in the two shapes the plant broke it on: it must
+    // blank a `mod` through any attributes and a visibility, and must blank **nothing**
+    // when the attribute is on something that is not a module.
+    for (what, planted, expect) in [
+        (
+            "a plain test module",
+            "#[cfg(test)]\nmod tests {\n    fn t() { Command::new(\"y\"); }\n}\n",
+            0,
+        ),
+        (
+            "a test module behind a further attribute and a visibility",
+            "#[cfg(test)]\n#[allow(clippy::pedantic)]\npub(crate) mod tests {\n    fn t() { Command::new(\"y\"); }\n}\n",
+            0,
+        ),
+        (
+            "a test module holding a brace inside a string, which used to end it early",
+            "#[cfg(test)]\nmod tests {\n    const S: &str = \"}\";\n    fn t() { Command::new(\"y\"); }\n}\n",
+            0,
+        ),
+        (
+            "`#[cfg(test)]` on a **const**, where the product function after it must \
+             stay product code",
+            "#[cfg(test)]\nconst X: u32 = 1;\nfn product() { Command::new(\"y\"); }\n",
+            1,
+        ),
+        (
+            "`#[cfg(test)]` on a **function**, likewise — cutting less leaves more \
+             under the ban, which is the safe direction",
+            "#[cfg(test)]\nfn helper() {}\nfn product() { Command::new(\"y\"); }\n",
+            1,
+        ),
+        (
+            "`mod tests;` with no body, which has nothing to blank",
+            "#[cfg(test)]\nmod tests;\nfn product() { Command::new(\"y\"); }\n",
+            1,
+        ),
+        (
+            "an identifier that starts with `mod`",
+            "#[cfg(test)]\nstruct ModeSet;\nfn product() { Command::new(\"y\"); }\n",
+            1,
+        ),
+    ] {
+        assert_eq!(
+            process_spawn_sites(planted, true).len(),
+            expect,
+            "the test-module blanker is wrong about {what}: {planted:?}"
+        );
+    }
+}
+
 /// Every crate root in the tree (a directory holding a `Cargo.toml`), relative to
 /// `root`, excluding the workspace manifest itself. Used to prove the `RefCell` ban
 /// list is *complete* rather than merely non-empty.
@@ -2063,6 +2540,757 @@ fn every_devprep_verb_answers_on_both_platform_arms() {
 }
 
 // ---------------------------------------------------------------------------
+// The privileged helper's argv-only / no-`exec` / no-environment bounds
+// (AGENTS §4, design §15.45 amended by §15.70 — plan §18 item 104).
+//
+// AGENTS §4 lists five bounds on `serial-nexus-devprep`, the one binary in this
+// workspace meant to carry a root-equivalent Linux file capability. Four of them had
+// something watching:
+//
+//   * the capability *set* — `the_bounds_question_folds_every_required_capability…`
+//     pins `REQUIRED_CAPS.len()` at two with `assert_eq!`, deliberately not a floor;
+//   * the port-name-not-a-path bound — `sysfs.rs`'s `validate_port_name` tests and
+//     `a_validated_port_cannot_escape_the_constant_root`;
+//   * the kernel-confirms-the-filesystem bound — `caps.rs`'s
+//     `sysfs_is_recognised_by_the_kernel_and_a_lookalike_path_is_not`;
+//   * `PR_SET_NO_NEW_PRIVS` — established and read back, with the disposition split
+//     out and asserted directly.
+//
+// **The argv-only / no-`exec` / no-environment-read bound had nothing at all**, and
+// the tree was violating it. `install` shelled out to `getcap`; the argument that
+// made that safe was a refusal on the `install` verb while any capability is held —
+// true of that verb, false of the module, because `preflight` calls the same code
+// with no refusal in front of it. Measured on the rig box with a `PATH` shim reading
+// its *parent's* `/proc/<ppid>/status`: the spawning process held
+// `CapPrm`/`CapEff` `000000000000000a` — `CAP_DAC_OVERRIDE|CAP_FOWNER` — and a shim
+// answering "carries nothing" turned a correctly blessed copy's verdict from `ready`
+// into `Unblessed("(none)")` with a `sudo setcap` remedy attached. The environment
+// steering the answer of a binary whose first stated bound is that it reads none.
+//
+// The gate below is structural, because that is the shape the bound has: it is not a
+// behaviour to test but a class of construct to be absent.
+//
+// **Its scope is every first-party crate linked into the blessed binary**, which is
+// `devprep/src` and `sys/src`, and the list is derived from the manifests rather than
+// typed (2026-08-21, §15.71). It covered `devprep/src` alone in its first draft, and
+// that was a mismatch between the gate and the bound it names: the file capability
+// lands on one *binary*, not on one crate, and `serial_nexus_sys` is linked into it —
+// the very change that removed the `getcap` spawn put a new syscall in `sys/src/caps.rs`
+// and so moved code *into* the blessed process and *out of* the scan on the same day.
+// A `Command::new` landing there would be inside the capability-holding process and
+// outside the gate.
+//
+// What stays out of scope, said rather than implied: the three third-party crates
+// (`clap`, `serde_json`, and `sys`'s `nix`/`libc`). A scan of this workspace's own
+// sources cannot see what a dependency does on the helper's behalf, which is why
+// `devprep/Cargo.toml` says in as many words that its dependency list is part of its
+// security argument — and why the assertion below pins that list to those four names,
+// so a fifth has to be looked at by a human rather than merely compiled.
+// ---------------------------------------------------------------------------
+
+/// The spellings of "spawn a **process**" — the two that name one and nothing else,
+/// applied to every crate in scope.
+///
+/// `Command` is the one no spawn can avoid, and it is matched as a **substring**
+/// rather than a whole word, deliberately: `use std::process::Command as Cmd;`,
+/// `std::os::unix::process::CommandExt`, `<std::process::Command>::new()` and
+/// `use std::process::*;` all put those seven characters in the file, and a
+/// whole-word match would miss `CommandExt`. `.exec(` is `CommandExt::exec`, the
+/// in-place replacement that never becomes a child at all.
+///
+/// Safe Rust has no other route: `devprep` is `#![forbid(unsafe_code)]` at its root
+/// (`devprep/src/main.rs`), so a bare `libc::execve` will not compile there. `sys` is
+/// the one crate that *may* write `unsafe` (§16.3), and it is the reason the two-tier
+/// split below exists rather than a single list.
+const SPAWN_SPELLINGS: [&str; 2] = ["Command", ".exec("];
+
+/// Belt-and-braces spellings for the one case `Command` cannot see — a spawn built by
+/// a *type this scan cannot name*, arriving through a dependency — applied to
+/// **`devprep/src` only**, and the narrower scope is the honest one.
+///
+/// They are cheap in a crate of five files that starts no threads and runs no
+/// builders. They are not cheap in `sys/`, which is the workspace's syscall floor and
+/// where `std::thread::spawn` is a legitimate thing to grow — its own test module
+/// already has one — so applying them there would buy a nuisance red rather than a
+/// bound, and a nuisance red is how a gate gets relaxed instead of fixed. What holds
+/// the bound in `sys/` is [`SPAWN_SPELLINGS`]: a *process* still has to be named to be
+/// started, and both names are in that list.
+const WIDE_SPAWN_SPELLINGS: [&str; 3] = [".spawn(", ".output(", ".status("];
+
+/// The spellings of "read the environment" this gate covers.
+///
+/// `env::` catches every path-qualified use — `std::env::var`, `env::var_os`,
+/// `env::vars`, `env::temp_dir`, `use std::env::{…}` — by shared prefix; `use
+/// std::env` catches the import that would otherwise let `use std::env as e; e::var(…)`
+/// slip past it; `env!`/`option_env!` are the compile-time reads, banned too, because
+/// baking a build machine's variable into a capability-carrying binary is the same
+/// channel arriving a step earlier; and `getenv` covers a safe wrapper over the libc
+/// call, which nothing here can reach but which costs a token.
+const ENV_SPELLINGS: [&str; 5] = ["env::", "env!(", "option_env!(", "use std::env", "getenv"];
+
+/// The environment-touching spellings that are **allowed**, by spelling and not by
+/// file, with the assertion below that each is actually reached.
+///
+/// One entry. `std::env::current_exe()` lives in the `env` module and is not an
+/// environment read at all: on Linux it reads `/proc/self/exe`, the kernel's answer
+/// to "which binary am I", and the helper needs it because `repo_root()` derives the
+/// checkout from its own location rather than from a variable or an argument.
+///
+/// `std::env::args`/`args_os` are **not** here, and their absence is a decision
+/// rather than an oversight: reading argv is the sanctioned input, so a direct call
+/// would be legitimate — it simply does not exist, because clap's derive does the
+/// reading. If one ever lands it reddens this gate, and the repair is an entry here
+/// naming it, not a weakened matcher.
+const SANCTIONED_ENV_SPELLINGS: [&str; 1] = ["std::env::current_exe("];
+
+/// Every product-code line of `src` that sits inside a `#[…]` attribute, as
+/// `(line number, **masked** line)`.
+///
+/// The line comes back masked ([`mask_comments_and_literals`]) rather than verbatim,
+/// because the caller *matches* on it — `contains_word(line, "env")` on a raw line
+/// would fire on `#[arg(long = "portenv")]`, which is a string and not a fallback.
+/// The two scanners whose callers only count use the verbatim line instead, so a
+/// failure message names what an operator opens the file to.
+///
+/// Attributes get their own pass because clap's derive can read the environment
+/// **without any of [`ENV_SPELLINGS`] appearing**: `#[arg(env = "SNX_FOO")]`, or the
+/// bare `#[arg(env)]`, makes a flag fall back to a variable, and neither spelling
+/// contains `env::` or an import. That is the one env-read spelling in reach of this
+/// crate that does not look like one.
+///
+/// Continuation lines count, tracked by bracket depth from the opening `#[`, so an
+/// attribute rustfmt spread over four lines is covered rather than only its first —
+/// a limit worth eight lines of counting, because "the token is on line two" is
+/// exactly how a scanner claims coverage it does not have.
+///
+/// **The depth is counted over masked source, and that is load-bearing** (§15.71,
+/// plan §18 item 104). Counted over raw source, a `]` inside a string closed the
+/// attribute early: an adversarial plant of
+///
+/// ```text
+/// #[arg(
+///   help = "a ] bracket",
+///   env = "SNX_PORT",
+/// )]
+/// ```
+///
+/// scanned green, because the bracket in the help text dropped the depth to zero one
+/// line before the `env`. The same masking removes the mirror defect in the other
+/// direction — a `[` inside a string used to leave the depth stuck above zero, which
+/// dragged every following product line into the attribute pass and made an ordinary
+/// local named `env` a violation.
+fn attribute_lines(src: &str) -> Vec<(usize, String)> {
+    let product = product_code(src);
+    let mut out = Vec::new();
+    let mut depth: isize = 0;
+    for (n, code) in product.lines().enumerate() {
+        if depth > 0 || code.contains("#[") {
+            out.push((n + 1, code.trim().to_owned()));
+            depth += code.matches('[').count() as isize;
+            depth -= code.matches(']').count() as isize;
+            depth = depth.max(0);
+        }
+    }
+    out
+}
+
+/// The dependency names a crate manifest declares as **linked**: `[dependencies]` and
+/// any `[target.'cfg(…)'.dependencies]`, and deliberately not `dev-` or `build-`,
+/// neither of which is linked into a shipped binary and neither of which can therefore
+/// put a `Command::new` inside a capability-holding process.
+fn linked_dependency_names(manifest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_deps = t.ends_with("dependencies]")
+                && !t.contains("dev-dependencies")
+                && !t.contains("build-dependencies");
+            continue;
+        }
+        if !in_deps || t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = t.split_once('=') else {
+            continue;
+        };
+        // `serde_json = "1"`, `clap.workspace = true` and
+        // `nix = { workspace = true, features = […] }` all name the crate first.
+        let name = key.trim().split('.').next().unwrap_or("").trim_matches('"');
+        if !name.is_empty() {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// The relative directory of `name` if it is a **first-party** (path) dependency —
+/// declared inline in the crate's own manifest, or inherited from
+/// `[workspace.dependencies]`, which is how every internal crate is spelled here.
+fn first_party_path(workspace: &str, crate_manifest: &str, name: &str) -> Option<String> {
+    let find = |m: &str| -> Option<String> {
+        m.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(name) && l[name.len()..].starts_with(['=', ' ', '.']))
+            .find_map(|l| {
+                let rest = &l[l.find("path")?..];
+                let open = rest.find('"')?;
+                let close = rest[open + 1..].find('"')?;
+                Some(rest[open + 1..open + 1 + close].to_owned())
+            })
+    };
+    find(crate_manifest).or_else(|| find(workspace))
+}
+
+/// Every first-party crate linked into the binary produced by `entry` — transitively,
+/// as workspace-relative directories — and the third-party names met on the way.
+///
+/// Derived rather than typed because the bound is about a **binary**: what a `setcap`
+/// blesses is one executable image, and every first-party crate compiled into it is
+/// inside the process the bounds are written about. A hand-kept list is the drift this
+/// repository keeps finding, and here the drift would be silent — a new first-party
+/// dependency would simply not be scanned.
+fn linked_first_party_crates(root: &Path, entry: &str) -> (Vec<String>, Vec<String>) {
+    let workspace =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("the workspace manifest");
+    let mut queue = vec![entry.to_owned()];
+    let mut crates: Vec<String> = Vec::new();
+    let mut third_party: Vec<String> = Vec::new();
+    while let Some(dir) = queue.pop() {
+        if crates.contains(&dir) {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(root.join(&dir).join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("{dir}/Cargo.toml: {e}"));
+        crates.push(dir);
+        for name in linked_dependency_names(&manifest) {
+            match first_party_path(&workspace, &manifest, &name) {
+                Some(path) => queue.push(path),
+                None => third_party.push(name),
+            }
+        }
+    }
+    crates.sort();
+    third_party.sort();
+    third_party.dedup();
+    (crates, third_party)
+}
+
+/// Every product-code line of `src` that spawns a process, as `(line number, line)`.
+///
+/// `wide` adds [`WIDE_SPAWN_SPELLINGS`]; it is set for `devprep/src` and clear for
+/// `sys/src`, for the reason written at that constant.
+fn process_spawn_sites(src: &str, wide: bool) -> Vec<(usize, String)> {
+    let mut v: Vec<(usize, String)> = SPAWN_SPELLINGS
+        .iter()
+        .chain(
+            wide.then_some(WIDE_SPAWN_SPELLINGS.iter())
+                .into_iter()
+                .flatten(),
+        )
+        .flat_map(|s| code_lines_containing(src, s))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Every product-code line of `src` that reaches for the environment, sanctioned or
+/// not — the filtering is the caller's, so the allowlist is visible at the assertion
+/// rather than buried in the scanner.
+fn environment_read_sites(src: &str) -> Vec<(usize, String)> {
+    let mut v: Vec<(usize, String)> = ENV_SPELLINGS
+        .iter()
+        .flat_map(|s| code_lines_containing(src, s))
+        .collect();
+    // The attribute pass matches on the masked line and reports the verbatim one, so
+    // everything in `v` is the text an operator would find at that line number.
+    let verbatim: Vec<&str> = src.lines().collect();
+    v.extend(
+        attribute_lines(src)
+            .into_iter()
+            .filter(|(_, masked)| contains_word(masked, "env"))
+            .map(|(n, masked)| {
+                let line = verbatim.get(n - 1).map_or(masked, |l| l.trim().to_owned());
+                (n, line)
+            }),
+    );
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// **The privileged helper spawns nothing and reads no environment variable**
+/// (AGENTS §4, §15.45's first three bounds; §15.70 — plan §18 item 104).
+///
+/// The narrowness of `serial-nexus-devprep` *is* the safety argument for handing it
+/// `CAP_DAC_OVERRIDE`, which bypasses every DAC check on the system. Two of the five
+/// bounds are about what may enter the process: argv and nothing else. An `exec`
+/// hands a child the whole environment and picks the binary out of `PATH`; an
+/// environment read hands a caller a lever on a capability-carrying process directly.
+///
+/// This gate exists because those two were the **only** bounds with no enforcement,
+/// and the tree had been violating them since `install` first shelled out to
+/// `getcap` — invisible for as long as it was, because the refusal that was supposed
+/// to contain it guarded a *verb* and the spawn lived in a *module* two verbs used.
+///
+/// **What this covers and what it does not**, stated rather than implied:
+///
+/// * **Scope is the first-party crates linked into the blessed binary** —
+///   `devprep/src` and `sys/src` — enumerated from the manifests rather than typed,
+///   so a first-party dependency added to either is scanned on arrival. It is not
+///   `devprep/src` alone: the capability lands on a *binary*, and the change that
+///   removed the `getcap` spawn added a syscall to `sys/src/caps.rs`, moving code
+///   into the blessed process on the same day it was moving code out of the scan.
+/// * A spawn or an environment read performed on the helper's behalf by a
+///   **third-party dependency** is invisible to it. That is why
+///   `devprep/Cargo.toml` says in as many words that its dependency list is part of
+///   its security argument, and why the manifest assertion below pins that list to
+///   four names — `clap`, `serde_json`, `nix`, `libc`.
+/// * The two tiers of spawn spelling differ by crate and the difference is asserted,
+///   not merely written down: see [`WIDE_SPAWN_SPELLINGS`].
+/// * `#[command(version)]` expands to an `env!("CARGO_PKG_VERSION")` **inside clap's
+///   macro**, so this binary does contain a build-time environment read that no
+///   source scan of this crate can see. That is the accepted instance, it is a
+///   compile-time constant, and it is named here so the gate's claim is "no such
+///   spelling in these sources" rather than the larger claim it might be read as.
+/// * Macros are not expanded and `include!` is not followed, so a spawn assembled by
+///   token pasting is out of reach. Neither construct exists in either crate.
+/// * `#[cfg(all(test, …))]` and `#[cfg_attr(…)]` are not recognised as test-module
+///   markers, so code under them stays **under** the ban: a loud false positive, never
+///   a silent hole.
+///
+/// A `/* … */` block comment **is** recognised as of 2026-08-21, along with every
+/// other literal and comment form, by [`mask_comments_and_literals`] — which is the
+/// repair the three planted holes forced, and the reason this list can say what it
+/// covers rather than hedging.
+///
+/// The macOS arm is scanned too. It can never carry a capability — there is no such
+/// thing to carry on Darwin, which is why its verbs answer "nothing to do" — but the
+/// bound is written about the helper and a rule with a platform-shaped hole in it is
+/// a rule someone will land the violation in.
+#[test]
+fn the_privileged_helper_neither_spawns_a_process_nor_reads_the_environment() {
+    // 0. The matcher, in **every spelling it claims to cover**, planted one at a
+    //    time (AGENTS §3: prove the matcher, not only the walker). A gate that
+    //    listed five tokens and matched two would report the same green as this one.
+    for (what, planted) in [
+        ("the import", "use std::process::Command;\n"),
+        ("the aliased import", "use std::process::Command as Cmd;\n"),
+        (
+            "the glob import's call",
+            "fn f() { let c = Command::new(\"getcap\"); }\n",
+        ),
+        (
+            "the fully-qualified call, with no import at all",
+            "fn f() { std::process::Command::new(\"getcap\").output(); }\n",
+        ),
+        (
+            "the unix exec extension, which a whole-word match on `Command` misses",
+            "use std::os::unix::process::CommandExt;\n",
+        ),
+        ("an in-place exec", "fn f() { let e = thing.exec(); }\n"),
+    ] {
+        for wide in [false, true] {
+            assert_eq!(
+                process_spawn_sites(planted, wide).len(),
+                1,
+                "the spawn scanner misses {what} at wide={wide}: {planted:?}"
+            );
+        }
+    }
+    // ...and the belt-and-braces tier, which must fire under `devprep`'s scope and
+    // must be **silent** under `sys`'s. Asserting the silence is what makes the
+    // two-tier split a measured property rather than a sentence in a doc comment.
+    for (what, planted) in [
+        (
+            "a spawn on something this scan cannot name",
+            "fn f() { let c = builder.spawn()?; }\n",
+        ),
+        ("a wait-for-output", "fn f() { let o = thing.output()?; }\n"),
+        ("a wait-for-status", "fn f() { let s = thing.status()?; }\n"),
+    ] {
+        assert_eq!(
+            process_spawn_sites(planted, true).len(),
+            1,
+            "the wide spawn scanner misses {what}: {planted:?}"
+        );
+        assert!(
+            process_spawn_sites(planted, false).is_empty(),
+            "the narrow tier is documented as not covering {what}, and it does — which \
+             would make `sys/src` quietly stricter than its own comment: {planted:?}"
+        );
+    }
+
+    // 0b. **The three holes an adversarial plant opened in this gate's first draft**
+    //     (§15.71, plan §18 item 104). Each was demonstrated, not argued, and each is
+    //     one root cause: a scanner that did not know what a Rust string literal is.
+    for (what, planted) in [
+        (
+            "the real defect restored into `read_caps` with a URL ahead of it on the \
+             same line — the gate reported GREEN on this, and the binary built from \
+             that tree execed `getcap` from `preflight`",
+            "fn read_caps(p: &Path) {\n    let (_d, out) = (\"https://man7.org/x/getcap.8.html\", std::process::Command::new(\"getcap\").arg(p).output());\n}\n",
+        ),
+        (
+            "`#[cfg(test)]` on a non-module item, which blanked the product function \
+             after it",
+            "#[cfg(test)]\nconst X: u32 = 1;\nfn product() { std::process::Command::new(\"getcap\").output(); }\n",
+        ),
+        (
+            "a brace inside a string inside a test module, which used to end the \
+             module early and drag the rest of the file back under the ban — the \
+             mirror direction of the same defect",
+            "#[cfg(test)]\nmod tests {\n    const S: &str = \"}\";\n}\nfn product() { Command::new(\"getcap\"); }\n",
+        ),
+    ] {
+        assert_eq!(
+            process_spawn_sites(planted, true).len(),
+            1,
+            "the spawn scanner misses {what}: {planted:?}"
+        );
+    }
+    for (what, planted) in [
+        (
+            "the runtime read",
+            "fn f() { let v = std::env::var(\"PATH\"); }\n",
+        ),
+        (
+            "its OsString twin",
+            "fn f() { let v = std::env::var_os(\"PATH\"); }\n",
+        ),
+        (
+            "the whole environment",
+            "fn f() { for (k, v) in std::env::vars() {} }\n",
+        ),
+        (
+            "TMPDIR, which is an environment read wearing a path's clothes",
+            "fn f() { let d = std::env::temp_dir(); }\n",
+        ),
+        (
+            "a write, which is the same channel in the other direction",
+            "fn f() { std::env::set_var(\"X\", \"1\"); }\n",
+        ),
+        ("the bare import", "use std::env;\n"),
+        (
+            "the renamed import, which `env::` alone would miss",
+            "use std::env as e;\n",
+        ),
+        ("the item import", "use std::env::{var, temp_dir};\n"),
+        (
+            "the compile-time read",
+            "fn f() { let v = env!(\"SNX_BUILD\"); }\n",
+        ),
+        (
+            "its fallible twin",
+            "fn f() { let v = option_env!(\"SNX_BUILD\"); }\n",
+        ),
+        (
+            "a safe wrapper over the libc call",
+            "fn f() { let v = getenv(\"PATH\"); }\n",
+        ),
+        (
+            "clap's derive, which reads a variable with no `env::` anywhere",
+            "struct C {\n    #[arg(long, env = \"SNX_PORT\")]\n    port: String,\n}\n",
+        ),
+        (
+            "clap's derive in its bare form",
+            "struct C {\n    #[arg(env)]\n    port: String,\n}\n",
+        ),
+        (
+            "clap's derive spread over several lines, where the token is not on the \
+             line that opens the attribute",
+            "struct C {\n    #[arg(\n        long,\n        env = \"SNX_PORT\",\n    )]\n    port: String,\n}\n",
+        ),
+        (
+            "the same attribute with an unbalanced `]` **inside a string** ahead of \
+             the `env` — the third hole the adversarial plant opened, which defeated \
+             the bracket-depth tracking this pass is built on (§15.71)",
+            "struct C {\n    #[arg(\n        help = \"a ] bracket\",\n        env = \"SNX_PORT\",\n    )]\n    port: String,\n}\n",
+        ),
+        (
+            "and with a `#[cfg(test)]` on a non-module item above it, which used to \
+             blank the struct that follows",
+            "#[cfg(test)]\nconst X: u32 = 1;\nstruct C {\n    #[arg(long, env = \"SNX_PORT\")]\n    port: String,\n}\n",
+        ),
+    ] {
+        assert!(
+            !environment_read_sites(planted).is_empty(),
+            "the environment scanner misses {what}: {planted:?}"
+        );
+    }
+
+    // 1. And the near-misses, every one of them a real line in this crate. A scanner
+    //    that trips on these would be red on arrival and relaxed rather than fixed.
+    for (what, near_miss) in [
+        (
+            "`std::process::exit`, which every verb ends with and which spawns nothing",
+            "fn f() -> ! { std::process::exit(2) }\n",
+        ),
+        (
+            "`std::process::id()`, used to name a scratch directory",
+            "fn f() { let p = std::process::id(); }\n",
+        ),
+        (
+            "`std::os::unix::process::parent_id()`, which the PDEATHSIG race check reads",
+            "fn f() { let parent = std::os::unix::process::parent_id(); }\n",
+        ),
+        (
+            "a `.status` FIELD read — `out.status.success()` is not a `.status(` call, \
+             and the difference is the parenthesis",
+            "fn f() { if !out.status.success() { return; } }\n",
+        ),
+        (
+            "a test helper that spawns: test modules are blanked, because the bound is \
+             about the binary a `setcap` lands on",
+            "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { Command::new(\"getcap\"); }\n}\n",
+        ),
+        (
+            "the module doc that EXPLAINS the ban — `install.rs` and `mod.rs` both \
+             name `Command::new` and `getcap` in prose, so a bare grep would be \
+             permanently red",
+            "//! `main` refuses `install` so no capability and `Command::new` coexist.\n",
+        ),
+        (
+            "the same prose in a `/* … */` block, which is now recognised rather than \
+             tolerated as a false positive",
+            "/* `main` refuses `install` so Command::new never coexists with a cap. */\n",
+        ),
+        (
+            "a **string** naming the ban — the failure message this very gate prints \
+             contains `Command::new`, and a scan that read its own diagnostic as a \
+             violation would be red on arrival",
+            "fn f() { panic!(\"do not call Command::new here\"); }\n",
+        ),
+        (
+            "a test module carrying a further attribute, and one behind a visibility",
+            "#[cfg(test)]\n#[allow(clippy::pedantic)]\npub(crate) mod tests {\n    fn t() { Command::new(\"getcap\"); }\n}\n",
+        ),
+    ] {
+        assert!(
+            process_spawn_sites(near_miss, true).is_empty(),
+            "the spawn scanner trips on {what}: {near_miss:?}"
+        );
+    }
+    for (what, near_miss) in [
+        (
+            "a local variable named `env` — `cycle` and `hold` both open an `Envelope` \
+             into one, and it is used a dozen times",
+            "fn f() { let env = Envelope::open(names)?; let ports = &env.ports; }\n",
+        ),
+        (
+            "the word `environmental`, which the preflight's two buckets are named after",
+            "fn f() { let mut environmental: Vec<String> = Vec::new(); }\n",
+        ),
+        (
+            "an ordinary attribute with no environment in it",
+            "struct C {\n    #[arg(long = \"port\", required = true)]\n    ports: Vec<String>,\n}\n",
+        ),
+        (
+            "a comment naming the ban",
+            "// it reads no environment variable, so there is no std::env::var here\n",
+        ),
+        (
+            "an attribute whose *string* contains a `[`, which used to leave the \
+             bracket depth stuck open and drag every following line into the \
+             attribute pass — where an ordinary local named `env` reads as a clap \
+             fallback (§15.71, the mirror of the `]` hole)",
+            "struct C {\n    #[arg(help = \"a [ bracket\")]\n    port: String,\n}\nfn f() { let env = 1; }\n",
+        ),
+    ] {
+        assert!(
+            environment_read_sites(near_miss).is_empty(),
+            "the environment scanner trips on {what}: {near_miss:?}"
+        );
+    }
+
+    // 2. The **walker**, against a violation planted as a *file* in a scratch tree —
+    //    the half review 37 found missing everywhere, where the offender was always a
+    //    string and never something the directory walk had to find.
+    let scratch = Scratch::new("devprep-bounds");
+    scratch.write("src/main.rs", "fn main() {}\n");
+    scratch.write(
+        "src/linux/install.rs",
+        "use std::process::Command;\nfn read_caps(p: &Path) { Command::new(\"getcap\").arg(p).output() }\n",
+    );
+    let mut planted: Vec<String> = Vec::new();
+    walk_rs(&scratch.path().join("src"), &mut |path, src| {
+        for (n, line) in process_spawn_sites(src, true) {
+            planted.push(format!("{}:{n}: {line}", path.display()));
+        }
+    });
+    assert_eq!(
+        planted.len(),
+        2,
+        "the walker does not surface a spawn planted one directory down, which is \
+         exactly where the real one lived (`devprep/src/linux/install.rs`): {planted:?}"
+    );
+
+    // 3. The tree — **every first-party crate linked into the blessed binary**,
+    //    derived from the manifests rather than typed, so the scope tracks the
+    //    dependency edge instead of a list someone remembered to update.
+    let root = repo_root();
+    let (crates, third_party) = linked_first_party_crates(&root, "devprep");
+    for expected in ["devprep", "sys"] {
+        assert!(
+            crates.iter().any(|c| c == expected),
+            "the manifest walk did not reach `{expected}`, so this gate is scanning \
+             less than the blessed binary contains — and a scan that shrank reports \
+             the same green as a compliant tree. Reached: {crates:?}"
+        );
+    }
+    // The direct third-party edges, pinned. Not because a name here is trusted, but
+    // because a *new* one is the one thing this scan structurally cannot see: it reads
+    // this workspace's sources, and a dependency's `Command::new` runs inside the
+    // blessed process just the same. `devprep/Cargo.toml` states that its dependency
+    // list is part of its security argument; this is that sentence with a gate on it.
+    const ALLOWED_THIRD_PARTY: [&str; 4] = ["clap", "libc", "nix", "serde_json"];
+    let unexpected: Vec<&String> = third_party
+        .iter()
+        .filter(|n| !ALLOWED_THIRD_PARTY.contains(&n.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a crate linked into the blessed binary gained a third-party dependency: \
+         {unexpected:?}. This gate cannot see what that crate spawns or reads, so the \
+         addition is a decision for a human — read it, then add it to \
+         `ALLOWED_THIRD_PARTY` with the reason. Reached: {third_party:?}"
+    );
+
+    let mut spawns: Vec<String> = Vec::new();
+    let mut envs: Vec<String> = Vec::new();
+    let mut unlexable: Vec<String> = Vec::new();
+    let mut files = 0usize;
+    let mut unreadable: Vec<String> = Vec::new();
+    for krate in &crates {
+        // The *directory* is what a filesystem-scanning gate spells (AGENTS §11).
+        let dir = root.join(krate).join("src");
+        let wide = krate == "devprep";
+        let stats = walk_rs(&dir, &mut |path, src| {
+            let rel = rel_path(&root, path);
+            // The masker's own non-vacuity: an unterminated literal or comment masks
+            // everything after it, and a masked file is a *green* file. Collected
+            // through the same walk as the findings, so "the scan reached the file"
+            // and "the scan could read it" are one claim.
+            if let Some(why) = mask_comments_and_literals(src).1 {
+                unlexable.push(format!("{rel}: {why}"));
+            }
+            for (n, line) in process_spawn_sites(src, wide) {
+                spawns.push(format!("{rel}:{n}: {line}"));
+            }
+            for (n, line) in environment_read_sites(src) {
+                envs.push(format!("{rel}:{n}: {line}"));
+            }
+        });
+        assert!(
+            stats.files >= 1,
+            "the walk over {krate}/src reached no .rs file at all"
+        );
+        files += stats.files;
+        unreadable.extend(stats.unreadable);
+    }
+    // The floor is today's exact count, which is affordable here and would not be in
+    // `daemon/src`: eight files across two crates — `devprep`'s `main.rs`, its three
+    // under `linux/` and its macOS arm, and `sys`'s three — and that file list is part
+    // of a security argument, so a file leaving it deserves a red rather than a
+    // quieter scan.
+    assert!(
+        files >= 8,
+        "the walk over the blessed binary's crates reached {files} .rs files — it \
+         stopped walking, and a walker that stopped reports the same green as a \
+         compliant tree (37-TEST-1)"
+    );
+    assert!(
+        unreadable.is_empty(),
+        "a scanned crate has unreadable directories, so this scan is not complete: \
+         {unreadable:?}"
+    );
+    assert!(
+        unlexable.is_empty(),
+        "a source file this gate scans could not be lexed to the end, which means the \
+         rest of it was masked and therefore unexamined — the exact shape of a gate \
+         that asserts nothing (AGENTS §3): {unlexable:?}"
+    );
+
+    assert!(
+        spawns.is_empty(),
+        "the blessed binary spawns a process. AGENTS §4 and §15.45 make \
+         *no `exec` while blessed* one of the five bounds that justify handing this \
+         binary `CAP_DAC_OVERRIDE`, and the reason it is a bound is concrete: an exec \
+         picks its binary out of `PATH` and hands the child the whole environment, so \
+         a capability-carrying process's answer becomes something the environment can \
+         steer. That is not hypothetical here — it is what `install`'s `getcap` spawn \
+         did, measured, until §15.71. Answer the question in-process (the file \
+         capability is the `security.capability` xattr, read by \
+         `serial_nexus_sys::caps::file_capabilities`), or write the amendment first:\n  {}",
+        spawns.join("\n  ")
+    );
+
+    let unsanctioned: Vec<&String> = envs
+        .iter()
+        .filter(|line| !SANCTIONED_ENV_SPELLINGS.iter().any(|ok| line.contains(ok)))
+        .collect();
+    assert!(
+        unsanctioned.is_empty(),
+        "the blessed binary reads the environment. §15.45's first bound is \
+         *argv only — no environment variable is read*, and its stated purpose is that \
+         there be no `LD_PRELOAD` and no config-file path into a process holding a \
+         root-equivalent capability. If this use is genuinely not that, add its exact \
+         spelling to `SANCTIONED_ENV_SPELLINGS` with the reason — the way \
+         `std::env::current_exe` is there — rather than loosening the scan:\n  {}",
+        unsanctioned
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    // ...and the allowlist must still be *reached*, or this gate passes because the
+    // scan found nothing at all rather than because it found the right thing. This is
+    // the non-vacuity witness collected **through the same walk** rather than by
+    // reading a known path behind the scan's back.
+    for ok in SANCTIONED_ENV_SPELLINGS {
+        assert!(
+            envs.iter().any(|line| line.contains(ok)),
+            "the scan found no `{ok}` in the blessed binary's crates — either \
+             `repo_root()` stopped deriving the checkout from the binary's own \
+             location, or the matcher stopped matching, and in the second case an \
+             unsanctioned read somewhere else would now go unnoticed. Found: {envs:?}"
+        );
+    }
+
+    // 4. The one environment read this crate's own sources cannot show, closed at the
+    //    manifest instead. clap's `#[arg(env = …)]` needs clap's `env` feature to
+    //    compile at all, so an assertion on the feature list covers every attribute
+    //    spelling — including ones rustfmt has not invented yet — and does it where
+    //    the decision is actually made. The workspace dependency is what `devprep`
+    //    inherits (`clap.workspace = true`), so that is the line to read.
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+    let clap_line = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("clap "))
+        .unwrap_or_else(|| {
+            panic!(
+                "the workspace manifest no longer spells `clap = …`, so this check reads nothing"
+            )
+        });
+    assert!(
+        clap_line.contains("features"),
+        "the clap dependency line carries no feature list, so this assertion is \
+         reading something other than what it thinks: {clap_line}"
+    );
+    assert!(
+        !clap_line.contains("\"env\""),
+        "clap's `env` feature is enabled workspace-wide, which makes \
+         `#[arg(env = \"…\")]` compile — a flag that falls back to an environment \
+         variable, in a binary whose first stated bound (§15.45) is that it reads \
+         none. Give the crate that needs it its own clap dependency; \
+         `devprep/Cargo.toml` states in as many words that its dependency list is \
+         part of its security argument: {clap_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The "one shared helper" rules, forbidden a second instance rather than merely
 // having their first one tested (plan §18 item 64(g)).
 //
@@ -2086,8 +3314,9 @@ fn every_devprep_verb_answers_on_both_platform_arms() {
 // tests). Do not read the three gates below as covering it.
 // ---------------------------------------------------------------------------
 
-/// `src` with every `#[cfg(test)] mod … { … }` block **blanked** — every character
-/// inside replaced by a space, newlines kept — so line numbers survive the strip.
+/// `masked` — already run through [`mask_comments_and_literals`] — with every
+/// `#[cfg(test)] mod … { … }` block **blanked**: every ASCII character inside replaced
+/// by a space, newlines kept, so line numbers survive the strip.
 ///
 /// The gates below are about **product** code: a test that calls `encode` to build
 /// a fixture frame, or spawns a thread to bound a join, is not a second framer or a
@@ -2097,21 +3326,35 @@ fn every_devprep_verb_answers_on_both_platform_arms() {
 /// the reader can open; a gate that names a line nobody can find is a gate nobody
 /// acts on.
 ///
-/// Naive about braces inside string literals and about `#[cfg(test)]` on a
-/// non-module item; both make the stripper cut *less* than intended, which leaves
-/// more code under the ban rather than less. The direction matters: a stripper that
-/// over-cut would hide product code from every gate below.
-fn blank_test_modules(src: &str) -> String {
-    let mut out: Vec<char> = src.chars().collect();
+/// **It blanks a `mod`, and only a `mod`** (repaired 2026-08-21, §15.71, plan §18
+/// item 104). It used to blank from the attribute to the close of the *next brace
+/// pair it could find*, whatever that brace belonged to — so `#[cfg(test)] const X:
+/// u32 = 1;` followed by a product function blanked the **function**, and a plant of
+/// exactly that shape scanned green with a `Command::new("getcap")` in the body. That
+/// is AGENTS §3's fifth register twice over: the mechanism was strictly weaker than
+/// the comment above it, and the comment is what a reviewer reads. The attribute must
+/// now introduce a `mod` with a body — through any number of further attributes and
+/// an optional visibility, both of which are real spellings in this tree — or nothing
+/// is blanked at all.
+///
+/// Cutting *less* is the safe direction and stays the deliberate answer for the
+/// spellings this still does not recognise: `#[cfg(all(test, …))]`, `#[cfg_attr(…)]`,
+/// and a bare `#[test]` fn outside a test module all leave their code **under** the
+/// ban, where the worst case is a loud false positive rather than a silent hole.
+fn blank_test_modules(masked: &str) -> String {
+    const ATTR: &str = "#[cfg(test)]";
+    let b = masked.as_bytes();
+    let mut out = b.to_vec();
     let mut i = 0usize;
-    while let Some(at) = src[i..].find("#[cfg(test)]") {
+    while let Some(at) = masked[i..].find(ATTR) {
         let at = i + at;
-        let Some(open) = src[at..].find('{').map(|o| at + o) else {
-            break;
+        i = at + ATTR.len();
+        let Some(open) = test_module_body_open(b, i) else {
+            continue;
         };
         let mut depth = 0usize;
-        let mut end = src.len();
-        for (o, c) in src[open..].char_indices() {
+        let mut end = b.len();
+        for (o, c) in masked[open..].char_indices() {
             match c {
                 '{' => depth += 1,
                 '}' => {
@@ -2124,18 +3367,73 @@ fn blank_test_modules(src: &str) -> String {
                 _ => {}
             }
         }
-        // Char indices, since `out` is a Vec<char>: this tree is ASCII in code and
-        // has non-ASCII in comments and strings, so byte offsets would misalign.
-        let start_c = src[..at].chars().count();
-        let end_c = src[..end].chars().count();
-        for c in out.iter_mut().take(end_c).skip(start_c) {
-            if *c != '\n' {
-                *c = ' ';
-            }
-        }
+        mask_ascii(&mut out, at, end);
         i = end;
     }
-    out.into_iter().collect()
+    String::from_utf8(out).expect("masking replaces ASCII with ASCII")
+}
+
+/// Starting just past a `#[cfg(test)]`, the offset of the `{` that opens the module
+/// body that attribute introduces — or `None` if it introduces something else.
+///
+/// Skips any further attributes (`#[cfg(test)] #[allow(…)] mod tests { … }` is a
+/// real spelling) and an optional `pub` / `pub(crate)` / `pub(super)`. Requires the
+/// word `mod`, so `mod_something` is not one, and requires a body, so `mod tests;`
+/// blanks nothing — there is nothing here to blank.
+fn test_module_body_open(b: &[u8], from: usize) -> Option<usize> {
+    let n = b.len();
+    let is_word = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    let mut i = from;
+    let skip_space = |i: &mut usize| {
+        while *i < n && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    let skip_group = |i: &mut usize, open: u8, close: u8| {
+        let mut depth = 0usize;
+        while *i < n {
+            if b[*i] == open {
+                depth += 1;
+            } else if b[*i] == close {
+                depth -= 1;
+                if depth == 0 {
+                    *i += 1;
+                    return;
+                }
+            }
+            *i += 1;
+        }
+    };
+    loop {
+        skip_space(&mut i);
+        if b.get(i) == Some(&b'#') && b.get(i + 1) == Some(&b'[') {
+            i += 1;
+            skip_group(&mut i, b'[', b']');
+            continue;
+        }
+        break;
+    }
+    if b.get(i..i + 3) == Some(b"pub") {
+        i += 3;
+        skip_space(&mut i);
+        if b.get(i) == Some(&b'(') {
+            skip_group(&mut i, b'(', b')');
+            skip_space(&mut i);
+        }
+    }
+    if b.get(i..i + 3) != Some(b"mod") {
+        return None;
+    }
+    i += 3;
+    if b.get(i).copied().is_some_and(is_word) {
+        return None;
+    }
+    skip_space(&mut i);
+    while i < n && is_word(b[i]) {
+        i += 1;
+    }
+    skip_space(&mut i);
+    (b.get(i) == Some(&b'{')).then_some(i)
 }
 
 /// Every product-code line in `src` (test modules blanked, `//`-comments ignored)
@@ -2148,12 +3446,12 @@ fn blank_test_modules(src: &str) -> String {
 /// `format!("encode hello: {e}")` names it in an error message on a line whose
 /// *other* half is a call to something else entirely.
 fn code_call_sites(src: &str, name: &str) -> Vec<(usize, String)> {
-    let product = blank_test_modules(src);
+    let product = product_code(src);
+    let needle = format!("{name}(");
     let mut out = Vec::new();
-    for (n, line) in product.lines().enumerate() {
-        let code = line.split_once("//").map_or(line, |(head, _)| head);
-        if contains_word(code, &format!("{name}(")) {
-            out.push((n + 1, code.trim().to_owned()));
+    for (n, (code, original)) in product.lines().zip(src.lines()).enumerate() {
+        if contains_word(code, &needle) {
+            out.push((n + 1, original.trim().to_owned()));
         }
     }
     out
@@ -2164,12 +3462,11 @@ fn code_call_sites(src: &str, name: &str) -> Vec<(usize, String)> {
 /// `thread::spawn(`, `thread::Builder` — where a whole-word match on the last
 /// segment would also match an unrelated `.spawn(` on a `Command`.
 fn code_lines_containing(src: &str, needle: &str) -> Vec<(usize, String)> {
-    let product = blank_test_modules(src);
+    let product = product_code(src);
     let mut out = Vec::new();
-    for (n, line) in product.lines().enumerate() {
-        let code = line.split_once("//").map_or(line, |(head, _)| head);
+    for (n, (code, original)) in product.lines().zip(src.lines()).enumerate() {
         if code.contains(needle) {
-            out.push((n + 1, code.trim().to_owned()));
+            out.push((n + 1, original.trim().to_owned()));
         }
     }
     out
@@ -2281,10 +3578,29 @@ fn the_daemon_builds_a_targetward_frame_in_exactly_one_place() {
 ///
 /// A hand-rolled boundary must start an OS thread, and the daemon's product code
 /// does that in exactly two places, both named here. The second is not a boundary
-/// and is why this gate is an allowlist rather than a count of one: `watch_stdin_eof`
-/// is the leash watcher — deliberately detached, no stop flag, no join, reclaimed by
+/// and is why this gate is an allowlist rather than a count of one: the stdin-EOF
+/// leash watcher is deliberately detached — no stop flag, no join, reclaimed by
 /// process exit — and its module doc argues that shape at length. Adding a third
 /// means either rebasing onto [`BlockingWorker`] or amending §16.1.
+///
+/// **The leash left this crate on 2026-08-21 and the gate followed it** (plan §18
+/// item 79). It was three verbatim copies — `daemon/src/lib.rs`, `web/src/main.rs`
+/// and a sim variant — and the repair item 51 set the precedent for was to hoist one
+/// implementation into `serial_nexus_rpc`, the shared home the thin client already
+/// uses. So the scan now walks `rpc/src` beside `daemon/src`, and the allowlist names
+/// `rpc/src/leash.rs` where it named `daemon/src/lib.rs`.
+///
+/// Widening the walk is not a formality: it is the whole reason this gate survived
+/// the hoist as something other than a rubber stamp. Had the walk stayed on
+/// `daemon/src`, the *stray* half would have gone quiet about the leash entirely —
+/// the code moved out from under the scan — while the reached-anchor half went red
+/// for what looks like a bookkeeping reason. **A gate whose subject moves must move
+/// with it, or it keeps asserting over the half of the tree that no longer holds the
+/// thing.** The anchor caught the move, which is what an anchor is for.
+///
+/// The property is also strictly stronger than it was, and stated that way below:
+/// each of the two crates holds *exactly one* sanctioned start, rather than the pair
+/// being satisfiable by two starts in one file.
 #[test]
 fn the_daemon_starts_an_os_thread_only_in_the_supervisor_and_the_leash() {
     // 0. The matcher, in both spellings an OS-thread start can take, and against the
@@ -2333,29 +3649,41 @@ fn the_daemon_starts_an_os_thread_only_in_the_supervisor_and_the_leash() {
 
     let root = repo_root();
     // The two sanctioned starts, by file rather than by line: a line number rots on
-    // the next edit, and a gate that rots is a gate that gets relaxed.
-    const SANCTIONED: [&str; 2] = ["daemon/src/boundary.rs", "daemon/src/lib.rs"];
+    // the next edit, and a gate that rots is a gate that gets relaxed. One per crate
+    // walked, which is why they are paired with their trees rather than listed flat —
+    // a flat list is satisfied by two starts in one file and none in the other.
+    const SANCTIONED: [(&str, &str, usize); 2] = [
+        ("daemon/src", "daemon/src/boundary.rs", 10),
+        ("rpc/src", "rpc/src/leash.rs", 3),
+    ];
     let mut sites: Vec<String> = Vec::new();
-    let stats = walk_rs(&root.join("daemon/src"), &mut |path, src| {
-        let rel = rel_path(&root, path);
-        for (n, line) in scan(src) {
-            sites.push(format!("{rel}:{n}: {line}"));
-        }
-    });
-    assert!(
-        stats.files >= 10,
-        "the walk over daemon/src reached {} .rs files — it stopped walking",
-        stats.files
-    );
+    for (tree, _, floor) in SANCTIONED {
+        let stats = walk_rs(&root.join(tree), &mut |path, src| {
+            let rel = rel_path(&root, path);
+            for (n, line) in scan(src) {
+                sites.push(format!("{rel}:{n}: {line}"));
+            }
+        });
+        assert!(
+            stats.files >= floor,
+            "the walk over {tree} reached {} .rs files against a floor of {floor} — \
+             it stopped walking, and a walk that stops finds no strays",
+            stats.files
+        );
+    }
 
     let strays: Vec<&String> = sites
         .iter()
-        .filter(|s| !SANCTIONED.iter().any(|ok| s.starts_with(&format!("{ok}:"))))
+        .filter(|s| {
+            !SANCTIONED
+                .iter()
+                .any(|(_, ok, _)| s.starts_with(&format!("{ok}:")))
+        })
         .collect();
     assert!(
         strays.is_empty(),
         "the daemon's product code starts an OS thread outside `boundary.rs`'s \
-         `spawn_named` and `lib.rs`'s stdin leash. §16.1 gives the tree one boundary \
+         `spawn_named` and `rpc`'s stdin leash. §16.1 gives the tree one boundary \
          supervisor precisely because the lifecycle rules — concurrent halves, \
          park-don't-teardown, loss notification, join-then-transition — were being \
          re-derived by hand per node, and a hand-rolled pair passes every test \
@@ -2369,12 +3697,17 @@ fn the_daemon_starts_an_os_thread_only_in_the_supervisor_and_the_leash() {
     );
     // ...and the allowlist must still be *reached*, or this gate passes because the
     // scan found nothing at all rather than because it found the right things.
-    for ok in SANCTIONED {
-        assert!(
-            sites.iter().any(|s| s.starts_with(&format!("{ok}:"))),
-            "the scan found no OS-thread start in {ok} — either the supervisor's \
-             `spawn_named` moved, or the matcher stopped matching, and in both cases \
-             a stray somewhere else would now go unnoticed. Found: {sites:?}"
+    for (tree, ok, _) in SANCTIONED {
+        let found = sites
+            .iter()
+            .filter(|s| s.starts_with(&format!("{ok}:")))
+            .count();
+        assert_eq!(
+            found, 1,
+            "{tree} holds {found} sanctioned OS-thread start(s) in {ok}, not the one \
+             this gate is built on — either the supervisor's `spawn_named` or the \
+             stdin leash moved, or the matcher stopped matching, and in every case a \
+             stray somewhere else would now go unnoticed. Found overall: {sites:?}"
         );
     }
 }

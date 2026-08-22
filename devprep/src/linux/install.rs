@@ -7,15 +7,42 @@
 //! destroyed by the next build and would have to be re-applied — with a `sudo` —
 //! on every rebuild. The stable copy is touched only by `install`.
 //!
-//! **This module is the only place in the crate that spawns a process, and it is
-//! unreachable from a blessed process**: `main` refuses `install` when **any**
-//! capability in [`REQUIRED_CAPS`] is held, so no file capability and
-//! `Command::new` ever coexist.
+//! **Nothing in this crate spawns a process, and as of 2026-08-21 that is enforced
+//! rather than argued** (design §15.71, plan §18 items 103 and 104).
+//!
+//! This module used to answer "what does this file carry" by running `getcap`, and
+//! the argument that made that safe was that `main` refuses `install` while any
+//! capability in [`REQUIRED_CAPS`] is held — so the spawn and the capability could
+//! never coexist. The argument was true of `install` and false of the module:
+//! [`preflight`](super::preflight) calls [`inspect`] with no such refusal in front of
+//! it, so a blessed copy execed a `PATH`-selected binary while holding
+//! `cap_dac_override,cap_fowner`. Measured on the rig box twice by two agents, with a
+//! shim that reads its *parent's* `/proc/<ppid>/status`: `CapPrm`/`CapEff`
+//! `000000000000000a`, which is exactly those two bits — and a shim that answers
+//! "carries nothing" flips the helper's verdict from `READY` to `BLOCKED-ON-BLESS`,
+//! which is the environment deciding the answer of a binary whose first stated bound
+//! is that it reads none.
+//!
+//! The capability set of a file *is* its `security.capability` extended attribute, so
+//! the answer is one `getxattr(2)`, in `serial_nexus_sys::caps` because §16.3 puts
+//! every syscall there. No `PATH` lookup, no child, no inherited environment, and no
+//! dependency on libcap being installed — which `docs/vmcell-requirements.md` had
+//! already recorded as breaking this module's own sweep test on a userland without
+//! `getcap`. `itest/tests/meta_gates.rs`'s
+//! `the_privileged_helper_neither_spawns_a_process_nor_reads_the_environment` is what
+//! keeps it that way; before it, this was the one AGENTS §4 tripwire with no gate.
+//!
+//! **The blessed-copy refusal on `install` stays**, with the reason it should always
+//! have carried: `install` is the one verb that writes files outside sysfs, and a
+//! process holding `CAP_DAC_OVERRIDE` bypasses every permission check on that write.
+//! The copy that places and mode-restricts the blessed binary should be the unblessed
+//! one.
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use serial_nexus_sys::caps::FileCaps;
 
 /// Where blessed copies live: project-local and gitignored, never `~/.cargo/bin`
 /// or `/usr/local/bin`.
@@ -41,7 +68,7 @@ pub enum InstallState {
     /// Installed, byte-identical to the build, mode `0700`, and carrying **every**
     /// capability in [`REQUIRED_CAPS`] with the effective bit.
     ///
-    /// Not `cap_dac_override` alone: [`field_grants_required_caps`] requires the
+    /// Not `cap_dac_override` alone: [`grants_required_caps`] requires the
     /// whole set, and its own test pins that half a set does not read as blessed.
     /// This doc said otherwise until 2026-08-12 — the same contradicts-itself-one-
     /// screen-apart shape the §15.55 alignment pass repaired in `sys/src/caps.rs`.
@@ -72,22 +99,84 @@ pub fn built_path(repo_root: &Path, profile: &str) -> PathBuf {
         .join("serial-nexus-devprep")
 }
 
-/// Extract the capability field from one `getcap` output line.
+/// Render a file's capability set in `getcap`'s vocabulary, for a report that names
+/// the grant rather than asserting one.
 ///
-/// Split deliberately from any substring test, because the naive form is a real
-/// defect that vmcell hit and recorded: `getcap` prints `<path> <caps>`, so testing
-/// the whole line for `ep` is satisfied by a *path* containing those letters —
-/// `target/debug/deps/...` does, and so does any user named `steph`. Such a test
-/// reports an un-raised `+p`-only binary as blessed, and a skip that reads as a pass
-/// is the worst outcome available.
+/// **Rendered, never re-read.** Until 2026-08-21 this module took `getcap`'s stdout
+/// and every question below was a string test over it, which is why it carried a
+/// careful field extractor and a regression test for a real defect vmcell hit:
+/// `getcap` prints `<path> <caps>`, so a whole-line test for `ep` is satisfied by the
+/// *path* (`target/debug/deps/…` contains those letters, and so does any user named
+/// `steph`), and an un-raised `+p`-only binary read as blessed. Reading the xattr
+/// deletes that whole class rather than guarding it: there is no line and no path to
+/// mis-match, the two questions below are bit tests, and this function is the only
+/// place a string is produced at all — printed by its caller and parsed by nobody.
 ///
-/// Returns the capability text only, so the caller can test *it* rather than the
-/// line.
-pub fn getcap_field(line: &str) -> Option<&str> {
-    // Format is `<path> <caps>` (older libcap used `<path> = <caps>`); the caps
-    // field is the last whitespace-separated token and always contains '='.
-    let field = line.trim().rsplit_once(char::is_whitespace)?.1;
-    field.contains('=').then_some(field)
+/// The vocabulary is libcap's on purpose, so an operator can hold this tool's report
+/// next to `getcap`'s and read the same words. Capabilities are grouped by the flags
+/// they carry; the effective *flag* raises the whole set, so it prints as `e` on
+/// every listed name exactly as libcap renders it; the flag letters go in libcap's
+/// `e`,`i`,`p` order; and an attribute that grants nothing prints as libcap's bare
+/// `=` rather than as an empty string, because "carries the attribute and grants
+/// nothing" and "carries no attribute" are different answers and the sweep acts on
+/// the difference.
+///
+/// **A capability this tool does not name prints as its kernel bit number** —
+/// `cap_12` where `getcap` says `cap_net_admin`. Deliberate, and stated rather than
+/// implied: the alternative is a forty-odd-entry name table in a tree whose recurring
+/// defect is a hand-kept list going stale, the bit number is the kernel's own
+/// identifier, and `capsh --decode=0x…` resolves it. [`REQUIRED_CAPS`] is the one
+/// place a capability name is written here and it names exactly the two this tool
+/// grants — which is the *right* two to name, because an unrecognised name in this
+/// report is precisely the case a human is being asked to look at.
+pub fn describe(caps: &FileCaps) -> String {
+    fn name(bit: u32) -> String {
+        REQUIRED_CAPS
+            .iter()
+            .find(|(_, b)| *b == bit)
+            .map_or_else(|| format!("cap_{bit}"), |(n, _)| (*n).to_owned())
+    }
+    let rootid = match caps.rootid {
+        // A revision-3 blob is honoured only inside a user namespace whose root maps
+        // to this uid. Printing it like an ordinary blessing would describe a grant
+        // that does not exist on the box reading it.
+        Some(uid) => format!(" [namespaced, rootid {uid}]"),
+        None => String::new(),
+    };
+    // Grouped by the (inheritable, permitted) pair, in bit order, which is both
+    // libcap's grouping and a stable order for a string humans compare across runs.
+    let mut groups: Vec<((bool, bool), Vec<String>)> = Vec::new();
+    for bit in 0..64u32 {
+        let mask = 1u64 << bit;
+        let key = (caps.inheritable & mask != 0, caps.permitted & mask != 0);
+        if key == (false, false) {
+            continue;
+        }
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, names)) => names.push(name(bit)),
+            None => groups.push((key, vec![name(bit)])),
+        }
+    }
+    if groups.is_empty() {
+        return format!("={rootid}");
+    }
+    let clauses: Vec<String> = groups
+        .iter()
+        .map(|((inheritable, permitted), names)| {
+            let mut flags = String::new();
+            if caps.effective {
+                flags.push('e');
+            }
+            if *inheritable {
+                flags.push('i');
+            }
+            if *permitted {
+                flags.push('p');
+            }
+            format!("{}={flags}", names.join(","))
+        })
+        .collect();
+    format!("{}{rootid}", clauses.join(" "))
 }
 
 /// The capabilities a blessed copy must carry, and why each is there — **the one
@@ -103,7 +192,7 @@ pub fn getcap_field(line: &str) -> Option<&str> {
 /// Each entry carries **both** representations the tree needs — the `setcap` name
 /// and the `linux/capability.h` bit — because they were two lists before, and two
 /// lists that must agree is the shape that let the no-`exec`-while-blessed refusal
-/// key on `cap_dac_override` alone while `field_grants_required_caps` required
+/// key on `cap_dac_override` alone while `grants_required_caps` required
 /// both: a copy blessed with only `cap_fowner` carried a capability and was not
 /// refused. One list, two projections, and the drift is unrepresentable.
 pub const REQUIRED_CAPS: &[(&str, u32)] = &[
@@ -116,31 +205,27 @@ pub fn required_cap_names() -> Vec<&'static str> {
     REQUIRED_CAPS.iter().map(|(name, _)| *name).collect()
 }
 
-/// Does a capability field *mention* any capability in [`REQUIRED_CAPS`], whatever
-/// the flags?
+/// Does this file carry any capability in [`REQUIRED_CAPS`] at all, in either mask
+/// and whatever the effective flag says?
 ///
-/// A deliberately looser question than [`field_grants_required_caps`], because it is
-/// a different question. That one asks "is this copy blessed" and must be strict:
-/// every name, both flags, or the helper would report itself ready and then fail the
-/// write. This one asks "is this file one of *ours*", and the two answers diverge in
-/// exactly the cases orphan hygiene is about. A copy blessed before `cap_fowner`
-/// joined the set carries `cap_dac_override=ep`, is **not** blessed by the strict
-/// test, and is still a root-equivalent capability sitting on a file nothing looks
-/// for (notes §3.81). A `+p`-only copy is one `capset(2)` — a call the process can
-/// make itself — away from effective, which is the same reasoning
-/// `unhardened_disposition` uses to treat `+p` as privilege.
+/// A deliberately looser question than [`grants_required_caps`], because it is a
+/// different question. That one asks "is this copy blessed" and must be strict: every
+/// capability, permitted, and the effective flag, or the helper would report itself
+/// ready and then fail the write. This one asks "is this file one of *ours*", and the
+/// two answers diverge in exactly the cases orphan hygiene is about. A copy blessed
+/// before `cap_fowner` joined the set carries `cap_dac_override=ep`, is **not**
+/// blessed by the strict test, and is still a root-equivalent capability sitting on a
+/// file nothing looks for (notes §3.81). A `+p`-only copy is one `capset(2)` — a call
+/// the process can make itself — away from effective, which is the same reasoning
+/// `unhardened_disposition` uses to treat `+p` as privilege. And a capability sitting
+/// only in the *inheritable* mask is still a capability on a file, which is why this
+/// asks [`FileCaps::carries`] rather than [`FileCaps::permits`].
 ///
-/// Used only to *describe* what the sweep found. What the sweep removes is decided
-/// by [`orphans_in`], on the broader "carries a capability at all" test, for the
-/// reason recorded there.
-pub fn field_carries_a_required_cap(field: &str) -> bool {
-    // The names half is everything left of the last `=`; a field with no `=` at all
-    // never reaches here, because `getcap_field` requires one.
-    let names = field.rsplit_once('=').map(|(n, _)| n).unwrap_or(field);
-    names
-        .split(',')
-        .map(|n| n.trim().trim_start_matches('+'))
-        .any(|n| REQUIRED_CAPS.iter().any(|(want, _)| n == *want))
+/// Used only to *describe* what the sweep found. What the sweep removes is decided by
+/// [`orphans_in`], on the broader "carries the attribute at all" test, for the reason
+/// recorded there.
+pub fn carries_a_required_cap(caps: &FileCaps) -> bool {
+    REQUIRED_CAPS.iter().any(|(_, bit)| caps.carries(*bit))
 }
 
 /// A capability-carrying file in the blessed directory that is not the copy
@@ -148,10 +233,13 @@ pub fn field_carries_a_required_cap(field: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Orphan {
     pub path: PathBuf,
-    /// What `getcap` said it carries, verbatim — so the report names the grant
-    /// rather than asserting one.
-    pub field: String,
-    /// Whether [`field`](Self::field) names a capability this tool grants
+    /// What the file's `security.capability` attribute decodes to, as bits.
+    pub caps: FileCaps,
+    /// [`caps`](Self::caps) in `getcap`'s vocabulary, so the report names the grant
+    /// rather than asserting one. Rendered by [`describe`] from the bits above, which
+    /// is why the two can never disagree.
+    pub grant: String,
+    /// Whether [`caps`](Self::caps) includes a capability this tool grants
     /// ([`REQUIRED_CAPS`]). False means the file carries something this tree never
     /// asks for, which is worth a human's eye and is still not left lying there.
     pub ours: bool,
@@ -170,10 +258,14 @@ pub struct Orphan {
 /// hand-kept list would have got wrong the day `cap_fowner` joined (§15.55).
 ///
 /// `read` is injected rather than called directly so the **walker** is provable
-/// without root: no unprivileged test can create a file carrying a capability, so a
-/// sweep that only ever ran against a real `getcap` would have its directory walk and
-/// its keep-exclusion asserted by nothing (AGENTS §3 — a scanning gate proves its
-/// matcher *and* its walker).
+/// without root: no unprivileged test can create a file carrying a capability
+/// (`setcap` needs `CAP_SETFCAP`, and this box's unprivileged-userns route is closed),
+/// so a sweep that only ever ran against the real reader would have its directory walk
+/// and its keep-exclusion asserted by nothing (AGENTS §3 — a scanning gate proves its
+/// matcher *and* its walker). The injection also survived the reader changing
+/// underneath it: it was shaped around `getcap`'s stdout and takes the xattr decoding
+/// unchanged, because what it abstracts is "what does this file carry", not "what did
+/// that subprocess print".
 ///
 /// Symlinks are skipped: `read_dir`'s file type does not follow them, and a symlink
 /// carries no capability of its own — only its target does, and if that target is in
@@ -181,7 +273,7 @@ pub struct Orphan {
 pub fn orphans_in(
     dir: &Path,
     keep: &Path,
-    read: &dyn Fn(&Path) -> io::Result<Option<String>>,
+    read: &dyn Fn(&Path) -> io::Result<Option<FileCaps>>,
 ) -> io::Result<Vec<Orphan>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -205,10 +297,11 @@ pub fn orphans_in(
         if path.canonicalize().ok() == keep_real && keep_real.is_some() {
             continue;
         }
-        if let Some(field) = read(&path)? {
+        if let Some(caps) = read(&path)? {
             found.push(Orphan {
-                ours: field_carries_a_required_cap(&field),
-                field,
+                ours: carries_a_required_cap(&caps),
+                grant: describe(&caps),
+                caps,
                 path,
             });
         }
@@ -267,39 +360,34 @@ pub fn ready_description() -> String {
     )
 }
 
-/// Whether a capability field grants **every** capability in [`REQUIRED_CAPS`]
-/// *effectively*.
+/// Whether this file grants **every** capability in [`REQUIRED_CAPS`] *effectively*.
 ///
-/// `+p`/`=p` without `e` is permitted-but-not-raised: the helper would still fail
-/// the write. Both flags must be present, and every required name must appear —
-/// checked per name rather than by string equality, because libcap is free to
-/// print them in any order and to add ones we did not ask for.
-pub fn field_grants_required_caps(field: &str) -> bool {
-    let Some((names, flags)) = field.rsplit_once('=') else {
-        return false;
-    };
-    // libcap prints either `cap_dac_override=ep` or, with several caps,
-    // `cap_dac_override,cap_fowner=ep`; `=` may also be `+`-prefixed per-cap.
-    let present: Vec<&str> = names
-        .split(',')
-        .map(|n| n.trim_start_matches('+'))
-        .collect();
-    let all_named = REQUIRED_CAPS.iter().all(|(want, _)| present.contains(want));
-    all_named && flags.contains('e') && flags.contains('p')
+/// Permitted without the effective flag is permitted-but-not-raised: the exec'd
+/// helper would have to `capset(2)` for itself and, as written, would fail the sysfs
+/// write instead. So both halves are required — every bit in the permitted mask, and
+/// `VFS_CAP_FLAGS_EFFECTIVE` set — and each is asked of the mask rather than of a
+/// rendering, so the order libcap happens to print names in, and any extra capability
+/// beyond the two asked for, are both irrelevant by construction rather than by a
+/// parser that remembered to allow for them.
+///
+/// Revision-agnostic on purpose: a namespaced (revision 3) blob answers here on its
+/// bits like any other, and [`describe`] is what tells the operator it is namespaced.
+/// The authoritative answer to "does the process hold this" is not a file reading at
+/// all — it is `serial_nexus_sys::caps::capability_state`, which `main` already takes
+/// from `/proc` and which is what every refusal keys on.
+pub fn grants_required_caps(caps: &FileCaps) -> bool {
+    caps.effective && REQUIRED_CAPS.iter().all(|(_, bit)| caps.permits(*bit))
 }
 
-/// Ask `getcap` what the file carries. `Ok(None)` when it carries nothing.
-fn read_caps(path: &Path) -> io::Result<Option<String>> {
-    let out = Command::new("getcap").arg(path).output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "getcap {} failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    Ok(getcap_field(&text).map(str::to_owned))
+/// Ask the **kernel** what the file carries. `Ok(None)` when it carries nothing.
+///
+/// One `getxattr(2)` on `security.capability`, which is where a file capability
+/// actually lives — see the module doc for what this replaced and what it cost while
+/// it stood. Kept as a named function rather than inlined at its two call sites
+/// because it is the default the sweep's injection point substitutes for, and because
+/// naming it is what lets the module doc point at one place.
+fn read_caps(path: &Path) -> io::Result<Option<FileCaps>> {
+    serial_nexus_sys::caps::file_capabilities(path)
 }
 
 /// Inspect the stable copy against the freshly-built one.
@@ -321,8 +409,8 @@ pub fn inspect(repo_root: &Path, profile: &str) -> io::Result<InstallState> {
         return Ok(InstallState::WrongMode(mode));
     }
     match read_caps(&blessed)? {
-        Some(field) if field_grants_required_caps(&field) => Ok(InstallState::Ready),
-        Some(field) => Ok(InstallState::Unblessed(field)),
+        Some(caps) if grants_required_caps(&caps) => Ok(InstallState::Ready),
+        Some(caps) => Ok(InstallState::Unblessed(describe(&caps))),
         None => Ok(InstallState::Unblessed("(none)".to_owned())),
     }
 }
@@ -412,6 +500,7 @@ pub fn remedy_for(state: &InstallState, profile: &str, blessed: &Path) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_nexus_sys::caps::{CAP_DAC_OVERRIDE, CAP_FOWNER};
 
     /// **Only one of the four repairs is privileged, and the report used to claim
     /// all of them were.** Fail-first: with `remedy_for` replaced by
@@ -473,106 +562,226 @@ mod tests {
         assert!(remedy_for(&InstallState::Ready, "debug", path).contains("nothing to do"));
     }
 
-    /// The `/deps/` trap, planted in every spelling it could take. A matcher that
-    /// tests the whole line passes all of these; the field parser must not.
-    #[test]
-    fn a_path_containing_the_flag_letters_does_not_read_as_blessed() {
-        // `+p` only — permitted, not effective. The path contains "deps" and "ep".
-        let line = "/home/steph/repo/target/debug/deps/serial-nexus-devprep cap_dac_override=p\n";
-        let field = getcap_field(line).expect("a caps field is present");
-        assert_eq!(field, "cap_dac_override=p");
-        assert!(
-            !field_grants_required_caps(field),
-            "a +p-only binary must not read as blessed"
-        );
-        // The naive test this exists to prevent would have passed:
-        assert!(
-            line.contains("ep"),
-            "the trap is real: the line does contain 'ep'"
-        );
-    }
-
-    /// The accepting cases, including the multi-capability spelling.
-    #[test]
-    fn an_effective_dac_override_is_recognised_in_each_spelling() {
-        for line in [
-            "/x/serial-nexus-devprep cap_dac_override,cap_fowner=ep",
-            "/x/serial-nexus-devprep cap_fowner,cap_dac_override=pe",
-            "/x/serial-nexus-devprep cap_dac_override,cap_fowner,cap_net_admin=ep",
-            "/x/serial-nexus-devprep cap_net_admin,cap_fowner,cap_dac_override=ep\n",
-        ] {
-            let field = getcap_field(line).unwrap_or_else(|| panic!("field in {line:?}"));
-            assert!(
-                field_grants_required_caps(field),
-                "{line:?} should read as blessed"
-            );
+    /// A capability set in the terms `setcap` is given them, for the tests below.
+    ///
+    /// They build `FileCaps` directly because **no unprivileged test can create a
+    /// capability-carrying file** — `setcap` needs `CAP_SETFCAP`, and this box's
+    /// unprivileged-userns route is closed (`unshare -Ur` answers `Operation not
+    /// permitted` writing `uid_map`). That is the same reason
+    /// `serial_nexus_sys::caps::parse_file_capability_xattr` takes bytes: the
+    /// decoding is pinned there against the rig's real twenty-byte blob, and the
+    /// *decisions* are pinned here against the bits it produces.
+    fn caps_of(permitted: &[u32], inheritable: &[u32], effective: bool) -> FileCaps {
+        let mask = |bits: &[u32]| bits.iter().fold(0u64, |m, b| m | (1u64 << b));
+        FileCaps {
+            permitted: mask(permitted),
+            inheritable: mask(inheritable),
+            effective,
+            rootid: None,
         }
     }
 
-    /// Refusals: a different capability, no capability, and empty output.
+    /// Permitted without the effective flag is not blessed — **and the trap that used
+    /// to make this hard is now unrepresentable.**
+    ///
+    /// The test this replaces was called
+    /// `a_path_containing_the_flag_letters_does_not_read_as_blessed`, and it existed
+    /// because the answer arrived as a `getcap` *line*: `getcap` prints
+    /// `<path> <caps>`, so a whole-line test for `ep` was satisfied by
+    /// `/home/steph/repo/target/debug/deps/serial-nexus-devprep cap_dac_override=p` —
+    /// a `+p`-only binary reading as blessed off the letters in its own path. The
+    /// input is now a 20-byte kernel record with no path in it and the effective flag
+    /// is one bit, so there is no line to mis-match and no spelling of that defect
+    /// left. What survives, and is what the old test was actually protecting, is the
+    /// decision: `+p` is not blessed (§15.71, plan §18 item 103).
     #[test]
-    fn other_capabilities_and_empty_output_do_not_read_as_blessed() {
-        let f = getcap_field("/x/y cap_net_raw=ep").expect("field");
-        assert!(!field_grants_required_caps(f));
-        assert_eq!(getcap_field(""), None);
-        assert_eq!(getcap_field("/x/y-with-no-caps\n"), None);
-        // A path with a space is why the field is taken from the right, not the left.
-        let f = getcap_field("/x/my dir/serial-nexus-devprep cap_dac_override,cap_fowner=ep")
-            .expect("field");
-        assert!(field_grants_required_caps(f));
+    fn a_permitted_only_blessing_is_not_blessed_however_it_is_spelled() {
+        let plus_p = caps_of(&[CAP_DAC_OVERRIDE, CAP_FOWNER], &[], false);
+        assert!(
+            !grants_required_caps(&plus_p),
+            "the helper would have to capset(2) for itself and, as written, fails the \
+             sysfs write instead — a report of `ready` here is a skip that reads as a pass"
+        );
+        assert!(
+            carries_a_required_cap(&plus_p),
+            "...and it is still privilege sitting on a file, which is the orphan sweep's \
+             question, not this one"
+        );
+        // The rendering says `p` and not `ep`, so the operator-facing line and the
+        // decision cannot disagree.
+        assert_eq!(describe(&plus_p), "cap_dac_override,cap_fowner=p");
+    }
+
+    /// The required pair reads as blessed, with or without capabilities beyond it,
+    /// and in no particular order — because there **is** no order.
+    ///
+    /// The test this replaces walked four textual spellings
+    /// (`cap_dac_override,cap_fowner=ep`, `cap_fowner,cap_dac_override=pe`, and two
+    /// with a third capability mixed in) because libcap is free to print names in any
+    /// order. Asking the mask removes the axis: the same four cases are the same two
+    /// bits, and only the extra-capability case still says anything, which it does.
+    #[test]
+    fn the_required_pair_reads_as_blessed_even_beside_capabilities_nobody_asked_for() {
+        assert!(grants_required_caps(&caps_of(
+            &[CAP_DAC_OVERRIDE, CAP_FOWNER],
+            &[],
+            true
+        )));
+        // A third capability does not un-bless the file. It *is* worth a human's eye,
+        // and the report is where that happens — `describe` names it, by number,
+        // because `REQUIRED_CAPS` is the only place a name is written.
+        let extra = caps_of(&[CAP_DAC_OVERRIDE, CAP_FOWNER, 12], &[], true);
+        assert!(grants_required_caps(&extra));
+        assert_eq!(describe(&extra), "cap_dac_override,cap_fowner,cap_12=ep");
+    }
+
+    /// Refusals: a capability that is not ours, an attribute that grants nothing, and
+    /// **half the set**.
+    #[test]
+    fn a_foreign_capability_an_empty_attribute_and_half_the_set_do_not_read_as_blessed() {
+        // cap_net_raw is 13. Not ours; not blessed.
+        assert!(!grants_required_caps(&caps_of(&[13], &[], true)));
+        // The attribute is present and grants nothing. `getcap` spells that `=`, and
+        // so does this — because it is a different answer from "no attribute", which
+        // the reader returns as `None` and never reaches here.
+        let nothing = caps_of(&[], &[], true);
+        assert!(!grants_required_caps(&nothing));
+        assert_eq!(describe(&nothing), "=");
+        assert!(nothing.is_empty());
         // **Half the set is not the set.** A copy blessed before `cap_fowner` joined
         // the requirement replugs fine and then cannot grant, which is precisely the
         // failure §15.55 exists to remove — so it must not read as blessed.
-        let half = getcap_field("/x/y cap_dac_override=ep").expect("field");
         assert!(
-            !field_grants_required_caps(half),
+            !grants_required_caps(&caps_of(&[CAP_DAC_OVERRIDE], &[], true)),
             "cap_dac_override alone must not read as blessed once cap_fowner is required"
+        );
+        assert!(
+            !grants_required_caps(&caps_of(&[CAP_FOWNER], &[], true)),
+            "and neither must the other half"
         );
     }
 
     /// The orphan matcher is looser than the blessed matcher, and the two cases where
     /// they disagree are the whole reason it exists (plan §18 item 52 (d)).
     ///
-    /// **Fail-first, recorded.** Reimplementing [`field_carries_a_required_cap`] as
-    /// `field_grants_required_caps` — the obvious "reuse what is there" mistake —
-    /// turns the first two assertions below red: a pre-§15.55 blessing
+    /// **Fail-first, recorded.** Reimplementing [`carries_a_required_cap`] as
+    /// [`grants_required_caps`] — the obvious "reuse what is there" mistake — turns
+    /// the first two assertions below red: a pre-§15.55 blessing
     /// (`cap_dac_override=ep`) and a `+p`-only copy both stop counting as
     /// capability-carrying, which is precisely the orphan notes §3.81 left behind.
     #[test]
     fn the_orphan_matcher_counts_a_capability_the_blessed_matcher_rejects() {
         // The actual orphan §3.81 describes, in the two shapes it can take.
+        let pre_55 = caps_of(&[CAP_DAC_OVERRIDE], &[], true);
         assert!(
-            field_carries_a_required_cap("cap_dac_override=ep"),
+            carries_a_required_cap(&pre_55),
             "a pre-§15.55 blessing is not a blessed copy, and is still a live capability"
         );
         assert!(
-            !field_grants_required_caps("cap_dac_override=ep"),
+            !grants_required_caps(&pre_55),
             "the two matchers must disagree here — that disagreement is the point"
         );
         assert!(
-            field_carries_a_required_cap("cap_dac_override=p"),
+            carries_a_required_cap(&caps_of(&[CAP_DAC_OVERRIDE], &[], false)),
             "`+p` is one capset(2) away from effective and the process can make that \
              call itself"
         );
-        assert!(field_carries_a_required_cap(
-            "cap_dac_override,cap_fowner=ep"
-        ));
+        assert!(carries_a_required_cap(&caps_of(
+            &[CAP_DAC_OVERRIDE, CAP_FOWNER],
+            &[],
+            true
+        )));
         assert!(
-            field_carries_a_required_cap("cap_fowner=ep"),
+            carries_a_required_cap(&caps_of(&[CAP_FOWNER], &[], true)),
             "the second capability alone is still one of ours — the hand-kept-list \
              failure §15.55 already cost this tree once"
         );
+        // **Inheritable-only**, which the text era could see only if libcap happened
+        // to print the name, and which the bits make unmissable: a capability in the
+        // inheritable mask is a capability on the file.
+        assert!(
+            carries_a_required_cap(&caps_of(&[], &[CAP_DAC_OVERRIDE], false)),
+            "`carries` is the union of both masks; `permits` is not"
+        );
+        assert!(!grants_required_caps(&caps_of(
+            &[],
+            &[CAP_DAC_OVERRIDE, CAP_FOWNER],
+            true
+        )));
         // Not ours. Still swept (see `orphans_in`), but the report says so.
-        assert!(!field_carries_a_required_cap("cap_net_raw=ep"));
-        assert!(!field_carries_a_required_cap(
-            "cap_net_admin,cap_sys_ptrace=ep"
-        ));
-        // The `/deps/` trap one file over: a *name* that merely contains one of ours
-        // is not one of ours. `getcap_field` has already removed the path by here,
-        // but the comparison is still per-name equality rather than `contains`.
-        assert!(!field_carries_a_required_cap(
-            "cap_dac_override_not_really=ep"
-        ));
+        assert!(!carries_a_required_cap(&caps_of(&[13], &[], true)));
+        assert!(!carries_a_required_cap(&caps_of(&[12, 19], &[], true)));
+    }
+
+    /// The report speaks `getcap`'s dialect, checked against `getcap`'s **actual
+    /// output on this repository's own blessed copy**.
+    ///
+    /// Measured 2026-08-21 on the rig box:
+    ///
+    /// ```text
+    /// $ getcap .snx-bin/debug/serial-nexus-devprep
+    /// .snx-bin/debug/serial-nexus-devprep cap_dac_override,cap_fowner=ep
+    /// $ python3 -c 'import os;print(os.getxattr("...","security.capability").hex())'
+    /// 010000020a000000000000000000000000000000
+    /// ```
+    ///
+    /// The right-hand side of that pair is the fixture in
+    /// `serial_nexus_sys::caps`'s decoder test; the left-hand side is the string
+    /// below. Between them the whole path from twenty kernel bytes to the sentence an
+    /// operator reads is pinned to a stock tool's answer on real hardware — which is
+    /// what makes "the vocabulary is libcap's" a claim rather than an intention.
+    #[test]
+    fn the_rendered_grant_matches_what_getcap_prints_for_the_real_blessing() {
+        assert_eq!(
+            describe(&caps_of(&[CAP_DAC_OVERRIDE, CAP_FOWNER], &[], true)),
+            "cap_dac_override,cap_fowner=ep"
+        );
+    }
+
+    /// The renderer's remaining shapes: two flag groups, a capability with no name
+    /// here, and a namespaced blob.
+    ///
+    /// None of these is what `setcap` writes for this tool, which is exactly why they
+    /// are asserted — the report exists for the file *nobody expected*, and a renderer
+    /// that only ever produced the expected string would be a report that cannot
+    /// describe a surprise.
+    #[test]
+    fn the_renderer_groups_by_flags_numbers_what_it_cannot_name_and_marks_a_namespaced_blob() {
+        // Two groups: permitted-and-effective, then inheritable-and-effective. libcap
+        // groups the same way and prints the groups in capability order.
+        assert_eq!(
+            describe(&caps_of(&[CAP_DAC_OVERRIDE], &[CAP_FOWNER], true)),
+            "cap_dac_override=ep cap_fowner=ei"
+        );
+        // The effective flag is one bit for the whole file: clear it and no group
+        // carries `e`.
+        assert_eq!(
+            describe(&caps_of(&[CAP_DAC_OVERRIDE], &[CAP_FOWNER], false)),
+            "cap_dac_override=p cap_fowner=i"
+        );
+        // A capability this tool does not name prints as the kernel's own number.
+        // `capsh --decode` resolves it; a hand-kept table of forty-odd names would not
+        // stay true, and this report's whole job is to be true about a surprise.
+        assert_eq!(describe(&caps_of(&[21], &[], true)), "cap_21=ep");
+        // A high bit, which is the half of the decoder that lives in the second
+        // 32-bit pair.
+        assert_eq!(describe(&caps_of(&[40], &[], true)), "cap_40=ep");
+        // Revision 3: honoured only inside a user namespace whose root maps to this
+        // uid, so the report must not print it as an ordinary blessing.
+        let namespaced = FileCaps {
+            rootid: Some(1000),
+            ..caps_of(&[CAP_DAC_OVERRIDE, CAP_FOWNER], &[], true)
+        };
+        assert_eq!(
+            describe(&namespaced),
+            "cap_dac_override,cap_fowner=ep [namespaced, rootid 1000]"
+        );
+        assert!(
+            grants_required_caps(&namespaced),
+            "the bits are the bits; whether this box's namespace honours them is what \
+             `capability_state` answers at run time, and the report is what says the \
+             question exists"
+        );
     }
 
     /// The **walker**, proven without root.
@@ -601,15 +810,23 @@ mod tests {
         for p in [&keep, &stray, &capless] {
             std::fs::write(p, b"x").expect("write");
         }
-        let fake_getcap = |p: &Path| -> io::Result<Option<String>> {
+        // The injected reader, now answering in bits rather than in `getcap`'s
+        // stdout. The shape of the injection did not have to change, because what it
+        // abstracts is "what does this file carry" and not "what did that subprocess
+        // print" — which is the test this change had to survive and did.
+        let fake_reader = |p: &Path| -> io::Result<Option<FileCaps>> {
             Ok(match p.file_name().and_then(|n| n.to_str()) {
-                Some("serial-nexus-devprep") => Some("cap_dac_override,cap_fowner=ep".to_owned()),
-                Some("serial-nexus-devprep.superseded") => Some("cap_dac_override=ep".to_owned()),
+                Some("serial-nexus-devprep") => {
+                    Some(caps_of(&[CAP_DAC_OVERRIDE, CAP_FOWNER], &[], true))
+                }
+                Some("serial-nexus-devprep.superseded") => {
+                    Some(caps_of(&[CAP_DAC_OVERRIDE], &[], true))
+                }
                 _ => None,
             })
         };
 
-        let found = orphans_in(&dir, &keep, &fake_getcap).expect("walk");
+        let found = orphans_in(&dir, &keep, &fake_reader).expect("walk");
         assert_eq!(
             found.iter().map(|o| &o.path).collect::<Vec<_>>(),
             vec![&stray],
@@ -620,17 +837,26 @@ mod tests {
             found[0].ours,
             "cap_dac_override is a capability this tool grants"
         );
+        assert_eq!(
+            found[0].grant, "cap_dac_override=ep",
+            "the report names the grant it found, rendered from the same bits `ours` \
+             was decided on, so the sentence and the decision cannot drift apart"
+        );
 
         // And the unlink half, over the same tree.
         let swept = sweep_orphans(&tmp, "debug").expect("sweep");
         assert_eq!(
             swept.len(),
             0,
-            "the real getcap finds no capability on a text file"
+            "the real reader finds no capability on a text file — and it now reaches \
+             that answer through `getxattr(2)`, so this line no longer needs libcap to \
+             be installed for the test to run at all (it needed it, and \
+             `docs/vmcell-requirements.md` recorded this exact test failing on a \
+             userland that ships no `getcap`)"
         );
         // Prove the deleting walk against the injected reader instead, since the
         // real one cannot see a capability this test is able to create.
-        for orphan in orphans_in(&dir, &keep, &fake_getcap).expect("walk") {
+        for orphan in orphans_in(&dir, &keep, &fake_reader).expect("walk") {
             std::fs::remove_file(&orphan.path).expect("unlink");
         }
         assert!(!stray.exists(), "the stray must actually be gone");

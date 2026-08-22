@@ -134,7 +134,7 @@ test("the rail lists every host-facing endpoint the daemon reports", async ({
   if (ECHO) await expect(railRow(page, ECHO)).toBeVisible();
 });
 
-test("a send round-trips through the echo oracle and renders in the terminal", async ({
+test("a send round-trips through the echo oracle and renders in the terminal", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
@@ -190,7 +190,7 @@ test("the drop counter is silent on a quiet console", async ({ page }) => {
 // throughput fell from 34.9 to 14.4 KiB/s over the first 2.9 MB, and a console left
 // attached falls further behind its device the longer it runs. The property that fixes
 // it is the one asserted here: the DOM holds a bounded window, whatever streamed past.
-test("the rendered scrollback stays bounded under a large burst", async ({ page }) => {
+test("the rendered scrollback stays bounded under a large burst", { tag: "@device" }, async ({ page }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
   test.setTimeout(120_000);
   await open(page);
@@ -248,7 +248,7 @@ test("the rendered scrollback stays bounded under a large burst", async ({ page 
 //
 // Three round trips through the echo device, no volume: this belongs in the per-push
 // lane, so it costs a second, not a minute.
-test("the terminal renders SGR colour, a CR overwrite and an unknown CSI", async ({
+test("the terminal renders SGR colour, a CR overwrite and an unknown CSI", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");
@@ -586,7 +586,9 @@ test("a watch-state flip during tap.open does not leak a second tap", async ({ p
 
 // Tagged `@slow` and run in the nightly lane, not per push — the project's `#[ignore]`
 // convention, in Playwright's spelling (the gate passes `--grep-invert @slow` unless
-// `SNX_UI_SLOW=1`).
+// `SNX_UI_SLOW=1`). Also `@device`, because it drives the firehose console: it is the one
+// spec in this suite that carries both tags, which is why the device-gated count is
+// eleven per push and twelve in the slow lane. `fixture.mjs` records what the tag is for.
 //
 // It is slow for a reason worth writing down rather than tuning around. Forcing a tap
 // shed means making the browser a consumer that cannot keep up; the browser then has to
@@ -603,7 +605,7 @@ test("a watch-state flip during tap.open does not leak a second tap", async ({ p
 // the observation is correct and it costs real time, which is a nightly test, not a
 // per-push one. §5 says as much about the subject anyway: this is a
 // control-and-observation tool at serial rates, not a data mover.
-test("the drop counter surfaces when the tap boundary sheds", { tag: "@slow" }, async ({
+test("the drop counter surfaces when the tap boundary sheds", { tag: ["@slow", "@device"] }, async ({
   page,
 }) => {
   test.skip(!HOSE, "no serial device on this platform (§5): nothing to firehose");
@@ -913,7 +915,7 @@ test("a rail row survives the daemon's state snapshots rather than being rebuilt
 // one was kept.
 //
 // Device-gated, because a `tap.data` needs a device to have produced bytes.
-test("a tap.data notification does not paint inside its own task", async ({ page }) => {
+test("a tap.data notification does not paint inside its own task", { tag: "@device" }, async ({ page }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing to echo");
 
   await page.addInitScript(() => {

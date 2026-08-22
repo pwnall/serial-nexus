@@ -25,7 +25,7 @@ import {
   waitNodeActive,
 } from "./fixture.mjs";
 
-test("load --replace under an open console detaches, re-anchors, and does not duplicate", async ({
+test("load --replace under an open console detaches, re-anchors, and does not duplicate", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");

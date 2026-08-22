@@ -1117,6 +1117,7 @@ dependencies = [
  "nix",
  "serde_json",
  "serial-nexus-codec-api",
+ "serial-nexus-rpc",
  "serial-nexus-sys",
  "sha2",
 ]

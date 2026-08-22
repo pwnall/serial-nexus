@@ -168,7 +168,7 @@ test("an illegal connect surfaces the daemon's named structural error", async ({
   expect(edges.some((e) => e.a === FAULT_A && e.b === FAULT_NODE)).toBe(false);
 });
 
-test("adding a console through the editor makes bytes flow end to end", async ({
+test("adding a console through the editor makes bytes flow end to end", { tag: "@device" }, async ({
   page,
 }) => {
   test.skip(!ECHO, "no serial device on this platform (§5): nothing echoes");

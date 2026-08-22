@@ -101,8 +101,56 @@ jobs:
       # The minimal daemon build §8 supports (every built-in codec dropped) must
       # also be warning-clean — the registry-as-value path is easy to leave with an
       # unused binding when no codec is registered.
+      #
+      # **`--all-targets` is plan §18 item 102's, and the workspace clippy one line
+      # above has carried it all along.** Without it clippy compiles the lib and the
+      # bin and no test target at all, so this lane — and both triples of the Apple
+      # cross-check below, which copy its spelling — never so much as *compiled* the
+      # minimal build's tests. That is how five tests in `daemon/src/registry.rs`
+      # came to hard-code the presence of the `reference` codec with no feature gate,
+      # while a sixth in the same module carried one.
+      #
+      # **The flag's own fail-first proof (§9), because the negative alone proves it
+      # was needed and not that it discriminates.** Planted a type error reachable
+      # only from the *minimal* test target — `let _plant: u32 = "…";` inside
+      # `registry.rs`'s `#[cfg(not(feature = "codec-reference"))]` test — and ran this
+      # step's command both ways against it. Without `--all-targets`: exit **0**, with
+      # `Checking serial-nexus-daemon` in the log, so it did recompile and simply had
+      # nothing to look at. With `--all-targets`: exit **101**, `error[E0308]` at
+      # `daemon/src/registry.rs:447` and `could not compile serial-nexus-daemon (lib
+      # test)`. The flag is what turns this lane from silent to loud on that class.
+      #
+      # **What it does NOT buy, because that is why the test step at the end of this
+      # job exists.** `--all-targets` never runs a test. Measured on the unfixed tree
+      # at 800915b: this exact command, `--all-targets` included, exits **0** while
+      # `cargo test -p serial-nexus-daemon --no-default-features --locked` reports
+      # `209 passed; 5 failed`. A failing assertion is a run-time fact.
+      #
+      # **But the two instruments are complementary, not ordered — an earlier draft
+      # of this comment called this one "strictly weaker" and that is measured
+      # false.** Four plants in the same minimal-only test fn, one stationary tree,
+      # `--no-default-features` throughout; this command, then `cargo test -p
+      # serial-nexus-daemon --no-default-features --locked`:
+      #
+      #   unused `use std::collections::HashMap;` | clippy 101 | test **0**, 214 passed
+      #   `codec_names().len() == 0`              | clippy 101 | test **0**, 214 passed
+      #   `!registry.contains(…)` un-negated      | clippy **0** | test 101, 1 failed
+      #   `let _plant: u32 = "…";`                | clippy 101 | test 101
+      #
+      # Three axes, and neither instrument reaches all three. *Compile* is shared, and
+      # on it `cargo test` subsumes clippy (row 4). *Lint* is clippy's alone — the
+      # workspace lint table is `clippy::all = "warn"` with only `unused_must_use`
+      # denied, so `cargo test` compiles both lint plants green, row 2 without
+      # emitting anything at all because rustc has no `len_zero` lint. *Run* is
+      # `cargo test`'s alone (row 3, which is item 102's own defect class re-planted).
+      # Keep both steps: dropping either loses an axis, not a margin.
+      #
+      # Where `--all-targets` is load-bearing rather than merely cheap: on this lane
+      # its compile half duplicates the test step and only its lint half is unique,
+      # but on the Apple cross-check's two triples nothing can be *run*, so there both
+      # halves are unique and that invocation is CI's only reader of this code.
       - name: Clippy (minimal daemon, no built-in codecs)
-        run: cargo clippy -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features --locked -- -D warnings
+        run: cargo clippy -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features --all-targets --locked -- -D warnings
       # **A `#[cfg(target_os = "linux")]` mistake in test code is invisible to every
       # step above it and to the macOS lane's own first step.** `cargo build` compiles
       # no test target, so an ungated test helper referring to a gated type builds
@@ -170,7 +218,17 @@ jobs:
       # The minimal-daemon build gets the same treatment on both triples for the reason
       # the Linux lane already gives it: the registry-as-value path is easy to leave with
       # an unused binding when no codec is registered, and "unused" is exactly the class
-      # that changes meaning with the target.
+      # that changes meaning with the target. It carries `--all-targets` for the reason
+      # the Linux minimal lane now states at length (plan §18 item 102): without it the
+      # invocation compiles no test target, so a `#[cfg]` mistake in the minimal build's
+      # *test* code — the very class this whole step exists to catch, one feature axis
+      # over — was invisible on both triples. **Do not read that as "the weaker
+      # instrument", which is what an earlier draft of this said.** Cross-compiled
+      # clippy cannot run a test, so it misses the run-time axis; but it is the only
+      # step in CI that lints these targets at all, and lints are an axis `cargo test`
+      # misses in turn (the four-plant measurement is on the Linux minimal step above,
+      # where both instruments exist and can be compared). Off Linux there is no
+      # comparison to make: this is the only reader, so it carries the flag.
       - name: Cross-check macOS targets compile AND lint (stolen cfg + macOS-only dead code)
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -178,7 +236,7 @@ jobs:
             cargo clippy --target "$t" --workspace --exclude serial-nexus-web \
               --all-targets --locked -- -D warnings
             cargo clippy --target "$t" -p serial-nexus-daemon-bin -p serial-nexus-daemon \
-              --no-default-features --locked -- -D warnings
+              --no-default-features --all-targets --locked -- -D warnings
           done
       # `cargo test` does NOT emit `target/debug/serial-nexus-daemon` (only the deps/ test
       # bins); the serial-nexus-itest harness boots that plain artifact, so build it first.
@@ -213,6 +271,89 @@ jobs:
           SNX_EXEC_CODEC: required
           SNX_TLS: required
         run: cargo test --workspace --locked --no-fail-fast
+      # **The minimal daemon build's tests, RUN — plan §18 item 102.** AGENTS.md §3 lists
+      # "the minimal-daemon clippy" among the gates, design §8 promises every built-in
+      # codec is droppable ("minimal builds drop what they don't need"), and
+      # `docs/codec-authors.md` hands that configuration to in-tree codec authors as the
+      # one their codec must keep working in. **No lane had ever run it.** It was red —
+      # five tests in `daemon/src/registry.rs` asserting a default-features property
+      # with no feature gate — for as long as nobody looked. `--all-targets` on the
+      # clippy steps above does not close this: it proves the tests compile, and these
+      # compiled.
+      #
+      # **Both ends, on a tree that did not move (§9).** The first version of this table
+      # was taken in a working tree that carried unrelated in-flight edits under
+      # `daemon/src/`, and its `ignored` column did not reproduce. Re-taken against a
+      # `git archive HEAD` copy of `800915b` in a scratch directory, where the only file
+      # that ever differs from HEAD is `daemon/src/registry.rs`, swapped by `cp` and
+      # md5-verified each way (HEAD `ead10b74…`, item 102's `3c8bdc9f…`). Linux
+      # 7.0.0-30, 20 cores, `cargo -j 6`, load average 11.3–20.7 across the runs — the
+      # box was busy and the checkout next door was being edited, which is precisely
+      # why the measurement was moved out of it. Do not re-derive these four cells from
+      # a working tree: the same day, the checkout read 215 and 222 against the table's
+      # 214 and 221, the whole difference being one test added under `daemon/src/` by
+      # work that has nothing to do with item 102.
+      #
+      #                          |      lib test binary       | doctests
+      #   HEAD, default          | 217 passed 0 failed 0 ign. | 1 passed
+      #   HEAD, minimal          | 209 passed **5 failed** 0 ign. | did not run
+      #   + item 102, default    | 221 passed 0 failed 0 ign. | 1 passed
+      #   + item 102, minimal    | 214 passed 0 failed 0 ign. | 1 passed
+      #
+      # **`0 ignored` in all four cells**; the `1`/`2` an earlier table carried in that
+      # column was the doctest line misread. The unfixed minimal row runs no doctest at
+      # all because a red lib binary ends the run before cargo reaches them — which is
+      # itself worth knowing: the configuration was not merely failing five assertions,
+      # it was not completing.
+      #
+      # Decomposed by test *name* (`-- --list`), not by count. Default 217 → 221 is
+      # **+4**, every one of them in `registry::tests` (7 names → 11); no other module
+      # moved. Minimal 214 → 214 is **+0** with exactly one name exchanged —
+      # `with_builtins_registers_the_reference_codec` out (it asserted the wrong build's
+      # contract) and `with_builtins_registers_nothing_when_every_built_in_codec_feature_is_off`
+      # in — and 5 red become 0 red. At the fixed end the two configurations share 213
+      # names; default adds 8 (6 registry `#[cfg(feature)]` ones plus two pre-existing
+      # `nodes::codec` ones) and minimal adds 1. 213+8 = 221, 213+1 = 214: closes with
+      # nothing left over.
+      #
+      # **Placed last, and conditional, because both directions of the hiding are real.**
+      # A failed step skips every unconditional step behind it, so a step here without
+      # `if:` would be hidden by a red workspace suite — notes §3.77's exact harm, the one
+      # that kept the macOS doctor gate from executing at all for two days. `!cancelled()`
+      # means nothing ahead can hide this lane: it reports on any run that was not
+      # cancelled, including one where the format check, clippy, the build or the whole
+      # suite is red, because "does the minimal configuration pass its own tests" is an
+      # independent claim about an independently compiled tree. And it is **last**, so it
+      # can hide nothing in return — the mirror harm the macOS job names where it reorders
+      # its own gate. A five-test failure must not cost the reader the whole-workspace
+      # result standing above it.
+      #
+      # No `cargo build --workspace` is needed ahead of it: this is `serial-nexus-daemon`'s
+      # own unit and property tests, not the serial-nexus-itest harness, so it boots no
+      # subprocess and resolves no `target/debug/` artifact.
+      #
+      # **The package set is spelled to match the minimal clippy step exactly**, and it
+      # was not at first: clippy took `-p serial-nexus-daemon-bin -p serial-nexus-daemon`
+      # while this step took only the library, so the comment above argued from a
+      # coverage claim the command did not meet. Aligning is the cheaper repair than
+      # explaining the gap. `serial-nexus-daemon-bin` carries 0 `#[test]` today, so the
+      # step gains one `Running unittests src/main.rs … running 0 tests` line and one
+      # compile of that thin binary in test cfg; measured warm at 1.41 s and 1.95 s
+      # against 1.24 s for the library alone, cold at 34.11 s against a 2.79 s warm
+      # library run. What it buys is that the two minimal lanes can never drift into
+      # disagreeing about which crates the minimal build *is*, and a future `#[cfg(test)]`
+      # block in the binary is covered the day it lands rather than the day someone
+      # notices. Note the feature edge that makes this honest: the workspace pins
+      # `serial-nexus-daemon = { path = "daemon", default-features = false }`, so
+      # `--no-default-features` on the binary really does yield a minimal library
+      # instead of unification quietly switching `codec-reference` back on.
+      #
+      # `--no-fail-fast` follows from that alignment and did not before it: two packages
+      # are two test binaries, and §6's rule is that a first-binary stop makes "one known
+      # failure" and "several unknown ones" look identical. It costs nothing here.
+      - name: Test (minimal daemon, no built-in codecs — item 102)
+        if: ${{ !cancelled() }}
+        run: cargo test -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features --no-fail-fast --locked
 
   # The licensing gate proven, not assumed (§13). cargo-deny plus the serial-nexus-itest test
   # that proves the gate rejects a banned crate (§16.11 folded the bash script into it;
@@ -356,6 +497,30 @@ jobs:
         env:
           SNX_PACKAGING: required
         run: cargo test -p serial-nexus-itest --test p8_packaging --locked -- --nocapture
+      # The root arm now *starts the daemon* under the packaged sandbox (item 31's
+      # four remaining `unverified` rows), so it needs the plain artifacts and not
+      # only the instrumented test binary — `cargo test` never builds
+      # `target/debug/serial-nexus-daemon`, which is the same fact `serial_nexus_itest::bin`
+      # documents for every other harness. Two packages rather than `--workspace`: the
+      # daemon the unit's `ExecStart=` names, and the CLI the probe drives it with from
+      # inside the same sandbox — not the web tier's toolchain. (`serial-nexus-daemon-bin`
+      # is the package; `serial-nexus-daemon` is the binary it emits, which is the name
+      # `RootStage::stage_binaries` looks for beside the test executable.)
+      # A probe that cannot find them SKIPS naming the miss, and `SNX_PACKAGING_ROOT=required`
+      # then turns that skip into a red lane — so a build step that silently stopped
+      # producing them cannot pass as a green measurement.
+      #
+      # **Both of the next two steps carry a condition, and it is the macOS lane's
+      # repair applied here** (plan §18 item 48's placement half, notes §3.77): a
+      # failed step skips the rest of the job, so before this the unprivileged gate
+      # going red would have hidden the root arm entirely — and a hidden gate's output
+      # is indistinguishable from a passing one, which is the tell AGENTS §3 names.
+      # The root arm keys on the *build*, not on the gate above it, so the two signals
+      # are independent and neither can mask the other.
+      - name: Build the daemon and CLI (the root arm starts them inside the sandbox)
+        id: rootbins
+        if: ${{ !cancelled() }}
+        run: cargo build -p serial-nexus-daemon-bin -p serial-nexus-ctl --locked
       # `cargo test` is deliberately NOT re-run under sudo: root has a different HOME
       # and PATH, cargo would re-resolve and rebuild, and a sudo'd build is a different
       # build. The already-built binary is run instead, and its path comes from cargo
@@ -396,7 +561,47 @@ jobs:
       # sudo probe, not an environment probe. Claiming more of it here would be the
       # assertion-weaker-than-its-comment register of AGENTS §3's tell, which is the
       # defect this whole step exists to have stopped committing.
+      #
+      # **What the arm covers as of 2026-08-21 (plan §18 item 31's four remaining
+      # `unverified` rows).** It no longer only measures what `DynamicUser=` does to a
+      # directory: it *executes the two recipes this repository prints for operators*,
+      # each from the file that prints it. The socket-group recipe is a comment block
+      # in `packaging/serial-nexus-daemon.service` — its `groupadd`/`useradd` lines are
+      # run verbatim but for the `sudo` this step already has, its static-identity
+      # directives are applied to the packaged properties, and its two predicted `stat`
+      # lines are checked. The upgrade procedure is `packaging/README.md`'s "Upgrading
+      # to this build", and its root `cp` is run step by step. Between them the real
+      # daemon is started inside the packaged sandbox and asked for `state` over its own
+      # control socket.
+      #
+      # **`--test-threads=1` below is for the output, not for the identity**, and the
+      # distinction matters because the identity is the part that would actually break.
+      # Two probes create the same system user and group; what serialises them is
+      # `p8_packaging.rs`'s `RECIPE_IDENTITY` mutex, whose guard is held for the
+      # lifetime of the `RecipeIdentity` that deletes them in `Drop`, so the binary is
+      # safe under parallelism with or without this flag. What the flag buys is that
+      # `--nocapture`'s stream stays readable: parallel test binaries interleave writes
+      # and split lines mid-write, which is notes §3.78's SKIP-line class and is how a
+      # skip reason stops being greppable.
+      #
+      # **A probe that cannot run says which precondition failed and skips**, and
+      # `SNX_PACKAGING_ROOT=required` turns every one of those skips into a red lane
+      # here — including "the daemon binary is not built", which is why the build step
+      # above cannot silently stop producing it. (`skip_no_packaging_root` asserts on
+      # the variable before it prints the SKIP line, so required mode is a panic and
+      # not a louder log.)
+      #
+      # **Cite this step by NAME and never by line number.** At `800915b` this step's
+      # `- name:` line was 399 and the `external-codec:` job was 419, which is exactly
+      # what `docs/vmcell-requirements.md` cited and exactly right at the time; two new
+      # steps and several comment blocks in one session moved both, and no number is
+      # written here because this comment would move it again. A third citation,
+      # `docs/implementation-notes.md`'s `ci.yml:195`/`:251` for the `jq -e` gates, was
+      # *already* wrong at `800915b` — the two `jq -e -f expectations/` lines stood at
+      # 279 and 481 there. A line number into a file that grows is a claim with a shelf
+      # life measured in commits; a step name is one the file itself carries.
       - name: Packaging gate (root arm — item 31's owed measurement)
+        if: ${{ !cancelled() && steps.rootbins.outcome == 'success' }}
         run: |
           BIN=$(cargo test -p serial-nexus-itest --test p8_packaging --locked --no-run \
                   --message-format=json \

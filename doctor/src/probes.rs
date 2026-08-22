@@ -5161,12 +5161,24 @@ fn crosses(
 /// modem map applies unchanged: **not wired is a valid answer**, a 3-wire rig is
 /// the design's own stated assumption, and an item that degraded every honest one
 /// would report the operator's cabling as a fault.
-fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
+///
+/// **It hands back one bit as well as the sentence** (plan §18 item 85): whether
+/// *both* RTS/CTS directions read [`CellReading::Carries`]. That bit is the
+/// precondition of P15's wire reading, which drives one end's RTS and asks whether
+/// the other end's transmitter stalls — a question that reads as a driver defect on
+/// any bench where the crossing is absent or unreadable. `None` where the handshake
+/// could not be taken at all. It is computed from the same cells the sentence is, in
+/// [`p5_handshake_line`]'s own vocabulary, so the two cannot disagree about what was
+/// read.
+fn p5_handshake(port_a: &Path, port_b: &Path) -> (String, Option<bool>) {
     let (Ok(a), Ok(b)) = (
         p5_open(port_a, 115_200, Parity::None),
         p5_open(port_b, 115_200, Parity::None),
     ) else {
-        return "unavailable (pair would not reopen for the handshake read)".to_owned();
+        return (
+            "unavailable (pair would not reopen for the handshake read)".to_owned(),
+            None,
+        );
     };
     // Both ends at rest before anything is driven, so a level left over from the
     // certificate's own opens cannot be read as a crossing.
@@ -5176,7 +5188,7 @@ fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
     }
     std::thread::sleep(P5_MODEM_SETTLE);
 
-    p5_handshake_line(&HandshakeCells {
+    let cells = HandshakeCells {
         rts_ab: crosses(|v| a.set_rts(v), || b.read_cts()),
         rts_ba: crosses(|v| b.set_rts(v), || a.read_cts()),
         dtr_ab_dsr: crosses(|v| a.set_dtr(v), || b.read_dsr()),
@@ -5192,7 +5204,21 @@ fn p5_handshake(port_a: &Path, port_b: &Path) -> String {
         // character mirrors of the two A→B lines above with `a`/`b` swapped.
         dtr_ba_dcd: crosses(|v| b.set_dtr(v), || a.read_cd()),
         dtr_ba_ri: crosses(|v| b.set_dtr(v), || a.read_ri()),
-    })
+    };
+    let crossing = Some(p5_handshake_carries_rts_cts(&cells));
+    (p5_handshake_line(&cells), crossing)
+}
+
+/// Whether **both** RTS/CTS directions of a handshake read as a crossing.
+///
+/// Pure, and spelled through [`reading`] rather than through `== "true"`, because
+/// collapsing `stuck-high` / `inverted` / `?` into "not `true`" is the exact defect
+/// §15.62 records: a CDC-ACM bench whose CTS is manufactured must answer **no**
+/// here, and answer it because the line cannot be read rather than because it is
+/// absent. Both spellings say no; only one of them is the truth, and P15's wire
+/// reading is where the difference is reported.
+fn p5_handshake_carries_rts_cts(c: &HandshakeCells) -> bool {
+    reading(&c.rts_ab) == CellReading::Carries && reading(&c.rts_ba) == CellReading::Carries
 }
 
 /// The eight crossings the handshake line is computed from.
@@ -5471,6 +5497,13 @@ pub struct VerifiedPair {
     /// three of P5's rates — §15.51's "after the certificate's baseline
     /// integrity has passed".
     pub baseline_ok: bool,
+    /// Whether P5's handshake read RTS↔CTS crossing in **both** directions; `None`
+    /// where the handshake was not taken at all (a non-UART pair, or a pair that
+    /// would not reopen). Carried for the same reason `both_uart` is: P15's wire
+    /// reading (§15.73, plan §18 item 85) must not run where a transmitter that
+    /// fails to stall could equally be a CTS the peer never reached, and the answer
+    /// it acts on has to be the one **P5 measured**.
+    pub rts_cts_crossing: Option<bool>,
 }
 
 impl RigFacts {
@@ -5727,6 +5760,7 @@ pub fn p5_rig(
             continue;
         };
         let mut baseline_ok = false;
+        let mut rts_cts_crossing: Option<bool> = None;
         if a_uart && b_uart {
             let subject =
                 p5_pair_subject(&p5_name(&ports[i], resolver), &p5_name(&ports[j], resolver));
@@ -5742,10 +5776,9 @@ pub fn p5_rig(
             // characterized is not asked a second question it cannot answer
             // either, and it is the only modem read in this probe taken with the
             // peer port *open*, which is what makes it about the wire.
-            p = p.observe(
-                format!("{subject} handshake").as_str(),
-                p5_handshake(&ports[i], &ports[j]).as_str(),
-            );
+            let (handshake, crossing) = p5_handshake(&ports[i], &ports[j]);
+            p = p.observe(format!("{subject} handshake").as_str(), handshake.as_str());
+            rts_cts_crossing = crossing;
         }
         verified.push(VerifiedPair {
             a: ports[i].clone(),
@@ -5754,6 +5787,7 @@ pub fn p5_rig(
             b_name: p5_name(&ports[j], resolver),
             both_uart: a_uart && b_uart,
             baseline_ok,
+            rts_cts_crossing,
         });
     }
 
@@ -7535,6 +7569,13 @@ struct FlowReadback {
     /// the same restore (plan §18 item 14). `Err` carries why it could not be
     /// taken: unmeasurable is data, not absence (§15.47).
     soft: Result<SoftFlowReadback, String>,
+    /// The **wire** half: does the flag this port kept on read-back actually stall
+    /// the transmitter (plan §18 item 85, design §15.73)? Filled in after every
+    /// row has been read, because it needs a *peer* — the one thing a per-port
+    /// read-back does not have, and the reason §7.1 clause 2 leaves this question to
+    /// the doctor rather than to the pre-check. `Err` carries why it could not be
+    /// taken, exactly as [`FlowReadback::soft`]'s does.
+    wire: Result<WireFlowReading, String>,
 }
 
 /// One port's answer to "did the *software* flow-control mode I asked for take?".
@@ -7570,6 +7611,40 @@ struct SoftFlowReadback {
     /// alone — is what decides whether the serial node's open turns into
     /// `failed to apply some or all settings` on a `faulted` node.
     iflag_matches_request: bool,
+    /// Does `serial_nexus_sys::honours_flow_control(path, FlowMode::XonXoff)` — the
+    /// predicate `load` consults to refuse a `flow_control = "xon-xoff"` config since
+    /// §15.61 — reach the same three-way arm as the reading this probe just took by
+    /// hand? `None` when that predicate could not run: an unreadable port is not a
+    /// disagreement (the hardware half's field carries the same disposition).
+    ///
+    /// **This cell exists because the software half had no cross-check while the
+    /// hardware half did** (plan §18 item 73). While plan §18 item 14's decline stood,
+    /// nothing in the daemon consulted the software reading, so a drift between these
+    /// two implementations moved no verdict and refused no config — reporting without
+    /// judging is what that decline *meant*. §15.61 made the reading consequential: an
+    /// accept-then-drop answer now refuses an operator's `load`, so §7.1 clause 2's
+    /// "one predicate, because two callers must not be able to disagree" applies to
+    /// this mode unchanged in force and widened in subject.
+    ///
+    /// **The by-hand arm is classified from [`Self::iflag_matches_request`], not from
+    /// [`Self::honoured`], and that choice is the whole point of the field.** The two
+    /// implementations do not read the same thing: this probe compares the **whole**
+    /// `c_iflag` word — `serial2`'s own comparison, and the one that decides whether
+    /// the node's open faults — while `honours_flow_control`'s `XonXoff` arm answers on
+    /// `contains(IXON | IXOFF)`, a two-flag **subset** test. On a driver that honours
+    /// both flags but perturbs some third `c_iflag` bit the two answer differently: the
+    /// predicate says `Honoured` and lets the `load` through, and `serial2` then faults
+    /// the node this probe's `serial2_readback_would_fault` cell predicted. Comparing
+    /// the *fate-deciding* readings is what makes this field able to see that; a field
+    /// that mirrored the subset test would agree with the predicate by construction,
+    /// which is item 56's defect — a cross-check comparing the halves that could not
+    /// differ — filed one mode over.
+    ///
+    /// No box measured here answers that way, so a `false` on this bench would be a
+    /// drift between the two implementations rather than a driver's oddity. Either is
+    /// worth the same `degraded`: a report that calls a port fine while `load` refuses
+    /// it — or the reverse — is worse than either verdict alone.
+    shipped_predicate_agrees: Option<bool>,
 }
 
 impl SoftFlowReadback {
@@ -7626,6 +7701,7 @@ impl FlowReadback {
                     "honoured_on_readback": s.honoured(),
                     "silently_dropped": s.silently_dropped(),
                     "serial2_readback_would_fault": !s.iflag_matches_request,
+                    "shipped_predicate_agrees": s.shipped_predicate_agrees,
                     "does_not_license": P15_SOFT_DOES_NOT_LICENSE,
                 }),
                 Err(e) => serde_json::json!({
@@ -7633,6 +7709,20 @@ impl FlowReadback {
                     "measured": false,
                     "unmeasurable_here": e,
                     "does_not_license": P15_SOFT_DOES_NOT_LICENSE,
+                }),
+            },
+            // **A sibling key of `software_flow_control`, not a leaf inside it**
+            // (plan §18 item 85). The two answer different questions about the same
+            // port and neither refines the other; nesting the wire reading under the
+            // software block would file a hardware finding where no reader and no
+            // `expectations/*.jq` clause looks for one.
+            "wire_flow_control": match &self.wire {
+                Ok(w) => w.observations(),
+                Err(e) => serde_json::json!({
+                    "asks": P15_WIRE_ASKS,
+                    "measured": false,
+                    "unmeasurable_here": e,
+                    "does_not_license": P15_WIRE_DOES_NOT_LICENSE,
                 }),
             },
         })
@@ -7655,8 +7745,653 @@ fn flag_bits<T: Into<u64>>(bits: T) -> u64 {
     bits.into()
 }
 
+// ---------------------------------------------------------------------------
+// P15's WIRE half — the flag the driver KEPT, asked of the line (plan §18 item 85)
+// ---------------------------------------------------------------------------
+
+/// The sub-question the wire block answers, in the report itself.
+const P15_WIRE_ASKS: &str = "With `CRTSCTS` honoured on read-back, does the driver actually stall the transmitter while the peer holds RTS low — measured by what the peer RECEIVES, against two controls on the same wire (plan §18 item 85)?";
+
+/// What a wire reading does **not** license, printed beside it.
+///
+/// **The first sentence is the one that must never go stale** (notes §3.101's
+/// register: a cell that outlives the tree it describes). §7.1 clause 2 says in as
+/// many words that the load-time pre-check decides whether the driver *accepts* the
+/// setting and never whether the wire *honours* it, and nothing in the daemon reads
+/// this block. If that ever changes, this string changes in the same commit — it is
+/// the only place in the report where the bound is stated, because
+/// `expectations/*.jq` reads observations and never `.consequence`.
+const P15_WIRE_DOES_NOT_LICENSE: &str = "measured, and deliberately NOT consulted: no pre-check reads this, no `load`/`add-node` is refused on it, and `flow_control = \"rts-cts\"` behaves exactly as §7.1 clause 2 says it does whatever this cell reports. A pre-check has no peer, no transfer and no stall — it is one port and one `tcsetattr` — so the wire question is not one it can ask, and the doctor is the instrument that can, because it holds both ends of a cable P5 has certified. What this reading licenses is one port, one driver, one peer, at this rate and this payload: an `inert` reading is that port's answer and says nothing about any other driver, and a `gated` reading clears this port rather than the class it belongs to.";
+
+/// The payload one wire cell transmits.
+///
+/// **Sized against a floor and a ceiling** (design §15.73). The floor is
+/// whatever the transmitter can absorb *without sending*: a payload small enough to
+/// sit inside the adapter would read `delivered: 0` on a bench where nothing gated
+/// anything, which is the one way this instrument could produce a false `gated`.
+/// The bound is demonstrated rather than looked up — at this size the two control
+/// cells deliver the whole payload on the bench of record while the gated cell
+/// delivers none of it, so 1024 bytes is above whatever that adapter holds. **The
+/// threshold itself is not measured here and no number for it should be quoted from
+/// this comment.** The ceiling is airtime: 1024 bytes at 115200 8N1 is 89 ms, which
+/// fits [`P15_WIRE_WINDOW`] with better than three times' margin, and the whole
+/// block costs one pair of opens and about two seconds.
+///
+/// **It is deliberately NOT sized against the kernel's write buffer**, and that is
+/// the difference between this instrument and the one plan §18 item 85 was filed
+/// with. That one counts bytes the *writer* got rid of, and at this payload all
+/// three cells here accept every byte on a bench where flow control demonstrably
+/// works — so acceptance separates the two states only above a depth that differs
+/// per driver, and the same bench shows the separation appearing higher up: with a
+/// 65536-byte payload and a 2 s budget it accepted 4608 bytes under backpressure
+/// against 27648 with the flag off, 2 of 2 (design §15.73 carries the scope).
+/// Delivery has no such threshold, which is why it is what the reading folds.
+const P15_WIRE_PAYLOAD: usize = 1024;
+
+/// The rate every wire cell runs at: the one rate P5 has already certified in both
+/// directions on every pair it hands over, so a cell that carries nothing is never
+/// this probe's choice of rate.
+const P15_WIRE_BAUD: u32 = 115_200;
+
+/// How long the peer is given to receive the payload, and the transmitter to be
+/// rid of it. 3.4× the payload's airtime at [`P15_WIRE_BAUD`].
+const P15_WIRE_WINDOW: Duration = Duration::from_millis(300);
+
+/// One cell of the wire reading: a stimulus, a control that the stimulus arrived,
+/// and two counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WireCell {
+    /// The **transmitter's** CTS, read after the peer's RTS was driven and settled.
+    ///
+    /// This is the instrument's own negative control, and it is what keeps a
+    /// 3-wire or CTS-manufacturing bench from reading as a driver defect: if
+    /// lowering the peer's RTS does not lower this, the stimulus never reached the
+    /// transmitter and no conclusion about the *driver* is available from the cell
+    /// (§15.69 clause 1's ambiguity, one instrument over). `None` when the read
+    /// itself failed.
+    cts_at_transmitter: Option<bool>,
+    /// Bytes the kernel took from the writer inside the cell's budget — **the
+    /// proxy, kept because it is the reading plan §18 item 85 was filed with and
+    /// this bench falsifies it as an instrument**, never the answer.
+    accepted: u64,
+    /// Bytes the peer actually read inside [`P15_WIRE_WINDOW`]. **This is the
+    /// reading.**
+    delivered: u64,
+    /// Every delivered byte matched the payload at its own offset. A cell that
+    /// delivered garbage has not shown that flow control works.
+    intact: bool,
+}
+
+impl WireCell {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cts_at_transmitter": self.cts_at_transmitter,
+            "bytes_accepted_by_the_kernel": self.accepted,
+            "bytes_delivered_to_the_peer": self.delivered,
+            "delivered_intact": self.intact,
+        })
+    }
+}
+
+/// What the three cells together say about the wire.
+///
+/// **Six words, and only one of them is `honoured_on_the_wire: true`.** *(This
+/// sentence read "Five words" over a six-variant enum from the day the enum was
+/// written until 2026-08-21. A count in a doc comment is a claim like any other,
+/// and `p15_wire_reading_names_the_two_shapes_between_gated_and_inert` now asserts
+/// this one so the next variant reddens a test instead of ageing a sentence.)* The
+/// two that answer `null` are the ones this instrument must reach on an honest bench that
+/// simply cannot be asked — a rig with no peer, and a transport whose CTS does not
+/// follow the peer's RTS — because a reading that says *inert* there would be
+/// blaming a driver for a cable (design §15.69 clause 1's lesson, restated one
+/// instrument over).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireReading {
+    /// The payload was held while the peer held RTS low and arrived when it was
+    /// raised: flow control performed, not merely reported.
+    Gated,
+    /// **At least one byte of the payload crossed while the peer held RTS low**,
+    /// and fewer than [`p15_wire_reading`]'s `inert` share. Not `inert` and not
+    /// `gated`: the peer said *not ready*, and whatever arrived anyway is exactly
+    /// the traffic it had no room for.
+    ///
+    /// **The rule is one byte, and it was a quarter of the payload until
+    /// 2026-08-21.** The threshold read `gated_delivered * 4 >= control`, so
+    /// 255 bytes of 1024 crossing under backpressure reported `gated` and
+    /// `honoured_on_the_wire: true` — measured on this tree across the ladder
+    /// 1/8/64/128/200/255 of 1024 with both controls at 1024, every rung reading
+    /// `gated`, and 256 the first to flip to `partly-gated`.
+    /// This doc said *"Some of the payload crossed anyway"* the whole time, so
+    /// the comment and the code stated different rules and the comment was the
+    /// one a reviewer read (AGENTS §3's register). The bench that motivates the
+    /// probe needs no tolerance at all: the FT232R pair delivers **0 of 1024**
+    /// under backpressure in both directions across three captures
+    /// (`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`
+    /// — the `-dirty-` is `doctor/build.rs`'s stamp for a binary built from a tree
+    /// with uncommitted changes, unavoidable for a capture whose instrument was that
+    /// session's own in-flight change, and it costs the comparability ladder's rung 2
+    /// (*same binary*, §13) rather than the reading; the full note is at
+    /// [`WireFacts`]), so zero is what
+    /// the hardware of record measures and zero is what the code now requires. Nothing is refused on any of these words (§7.1 clause 2), so
+    /// a stricter rule can only change a sentence in a report — never a lane.
+    PartlyGated,
+    /// The payload crossed as if the flag were not set — plan §18 item 85's defect,
+    /// measured rather than inferred.
+    Inert,
+    /// The transmitter did stall, and the payload did not come back **whole** when
+    /// the peer raised RTS: either too few bytes arrived, or the bytes that arrived
+    /// were not the payload's continuation from where the gated cell stopped. A
+    /// stall that discards or garbles is not flow control either.
+    ///
+    /// **The content half of that sentence is measured rather than assumed as of
+    /// 2026-08-21** (plan §18 item 85's repair): the release used to keep only
+    /// `Vec::len()`, so "deferred rather than dropped" rested on a byte count and
+    /// the arriving bytes were never compared with anything. `released_intact` is
+    /// that comparison, and it is what separates a transmitter that held the
+    /// payload from one that held *some* bytes.
+    GatedThenLost,
+    /// Lowering the peer's RTS did not lower the transmitter's CTS, so the stimulus
+    /// never reached the driver under test. **Not a driver finding** — and on this
+    /// bench class it is the operator-facing one anyway: no RTS/CTS mode can work
+    /// over a transport whose CTS is not the peer's RTS, whatever the read-back says.
+    NoCtsPath,
+    /// The reading could not be taken: no peer, a port that would not configure, or
+    /// a control cell that carried nothing.
+    Unmeasurable,
+}
+
+impl WireReading {
+    fn word(self) -> &'static str {
+        match self {
+            WireReading::Gated => "gated",
+            WireReading::PartlyGated => "partly-gated",
+            WireReading::Inert => "inert",
+            WireReading::GatedThenLost => "gated-then-lost",
+            WireReading::NoCtsPath => "no-cts-path",
+            WireReading::Unmeasurable => "unmeasurable",
+        }
+    }
+
+    /// The boolean an operator reads, with `null` reserved for the two arms that
+    /// are about the bench rather than about the driver.
+    fn honoured_on_the_wire(self) -> Option<bool> {
+        match self {
+            WireReading::Gated => Some(true),
+            WireReading::PartlyGated | WireReading::Inert | WireReading::GatedThenLost => {
+                Some(false)
+            }
+            WireReading::NoCtsPath | WireReading::Unmeasurable => None,
+        }
+    }
+}
+
+/// The numbers [`p15_wire_reading`] folds, split from the measurement for the
+/// reason [`p8_verdict`] gives: every arm is then reachable from a box with no
+/// hardware, so each is tested against the others rather than against whichever
+/// bench is in front of you (§9).
+///
+/// **Exactly one arm has been read off hardware**: the FT232R pair's `gated`
+/// (`docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`).
+/// Every other arm — `inert` included — has executed under a fixture and on no
+/// bench. *(This doc claimed "the two arms this record can cite — the FT232R's
+/// `gated` and the CDC-ACM capture's `inert`" until 2026-08-21. No such capture
+/// exists: the CDC-ACM bench was measured 2026-08-16/17, before this cell existed,
+/// and no artifact in `docs/doctor/` carries a `wire_flow_control` block
+/// other than the three named above. §15.62's inert *finding* is real and was taken
+/// with a bespoke 2×2 in that session, not with this instrument — which is the
+/// distinction the sentence erased.)*
+///
+/// **The `-dirty-` in those three filenames is a provenance statement, and it is
+/// stated here rather than left to pass unremarked.** `doctor/build.rs` stamps
+/// `<sha>-dirty` whenever the tree the binary was built from carried uncommitted
+/// changes, and all three carry `800915bf4078-dirty`. It is unavoidable for a
+/// capture taken by a *new* instrument: the reading and the code that takes it
+/// cannot both be committed first, so the only clean-stamped capture of this cell
+/// is a re-capture after the fact, and taking one is what retires the caveat. What
+/// the stamp denies meanwhile is the comparability ladder's rung 2, **same binary**
+/// (§13) — nothing may be diffed against another capture on the strength of the
+/// build string, and the ladder says that rung has to be claimed in prose because
+/// no fingerprint can state it (§15.44). The `8c00078-dirty` rows in
+/// `docs/doctor/README.md` record the same limitation and the remedy they used,
+/// which was to state a scoped source diff instead. What the stamp does **not**
+/// touch is the reading itself, which is three sequential runs of one bench. The
+/// three files land committed in the same commit as this line, which is what
+/// AGENTS §7 requires of a cited artifact; a citation written before that commit
+/// exists is owed rather than paid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireFacts {
+    payload: u64,
+    /// The peer's RTS was driven low and the transmitter's CTS followed.
+    cts_low_seen: bool,
+    /// …and high, and it followed there too. Both, because a line stuck at either
+    /// level passes a one-polarity test — [`crosses`]'s rule, one probe over.
+    cts_high_seen: bool,
+    gated_delivered: u64,
+    released_delivered: u64,
+    /// Every byte read in the release window was the payload's continuation from
+    /// the offset the gated cell stopped at — the *content* half of "deferred
+    /// rather than dropped", which [`released_delivered`](Self::released_delivered)
+    /// alone cannot state. Vacuously `true` when the release delivered nothing,
+    /// which the count beside it is what separates.
+    released_intact: bool,
+    flag_off_delivered: u64,
+    peer_ready_delivered: u64,
+}
+
+/// Fold three cells and a release into one word and the sentence behind it.
+///
+/// **Order matters and is the whole design.** The stimulus check comes first,
+/// because every later comparison assumes the transmitter was actually told to
+/// stop; the control check comes second, because a link that carries nothing makes
+/// a silent gated cell look like flow control; only then is the gated cell read.
+fn p15_wire_reading(f: WireFacts) -> (WireReading, String) {
+    if !f.cts_low_seen || !f.cts_high_seen {
+        return (
+            WireReading::NoCtsPath,
+            format!(
+                "The peer's RTS did not move this port's CTS at both drive levels (low seen: {}, high seen: {}), so the transmitter was never told to stop and nothing here is a statement about the driver. On such a transport no `rts-cts` edge can perform flow control whatever the read-back reports — which is a finding about the bench, and the reason this arm is not `inert`.",
+                f.cts_low_seen, f.cts_high_seen
+            ),
+        );
+    }
+    let control = f.flag_off_delivered.min(f.peer_ready_delivered);
+    if control * 2 < f.payload {
+        return (
+            WireReading::Unmeasurable,
+            format!(
+                "A control cell did not carry the payload ({} of {} bytes with the flag off, {} with the peer ready), so the gated cell's silence cannot be attributed to flow control — a link that carries nothing looks identical to one that is holding.",
+                f.flag_off_delivered, f.payload, f.peer_ready_delivered
+            ),
+        );
+    }
+    if f.gated_delivered * 4 >= control * 3 {
+        return (
+            WireReading::Inert,
+            format!(
+                "{} of {} bytes crossed while the peer held RTS low and this port reported `CRTSCTS` honoured on read-back — against {} and {} in the two control cells. The flag is kept and does nothing: an `rts-cts` edge on this port reports flow control and does not perform it.",
+                f.gated_delivered, f.payload, f.flag_off_delivered, f.peer_ready_delivered
+            ),
+        );
+    }
+    // **One byte is a leak.** The peer lowered RTS *before* the write began, so
+    // nothing was in flight and a transmitter that honours CTS has nothing it is
+    // owed to finish sending: every byte arriving here is traffic the peer said it
+    // had no room for. The threshold was `f.gated_delivered * 4 >= control` — a
+    // quarter of the payload — until 2026-08-21, which reported `gated` and
+    // `honoured_on_the_wire: true` over 255 leaked bytes of 1024 while
+    // [`WireReading::PartlyGated`]'s own doc said *"Some of the payload crossed
+    // anyway"*. The comment and the code stated different rules; this is them
+    // stating the same one, and the hardware of record needs no tolerance to pass
+    // it (0 of 1024, both directions, three captures — see that doc's citation).
+    if f.gated_delivered > 0 {
+        return (
+            WireReading::PartlyGated,
+            format!(
+                "{} of {} bytes crossed while the peer held RTS low, against {} and {} in the controls. The transmitter slowed and did not stop, and the bytes that crossed are the ones the peer had just said it had no room for.",
+                f.gated_delivered, f.payload, f.flag_off_delivered, f.peer_ready_delivered
+            ),
+        );
+    }
+    if f.gated_delivered + f.released_delivered < f.payload / 2 {
+        return (
+            WireReading::GatedThenLost,
+            format!(
+                "The transmitter stalled — {} of {} bytes crossed while the peer held RTS low — and then only {} more arrived after the peer raised RTS. The bytes were discarded rather than deferred, which is not flow control either.",
+                f.gated_delivered, f.payload, f.released_delivered
+            ),
+        );
+    }
+    // **The release is read for content as well as for length** (plan §18 item 85's
+    // repair, 2026-08-21). `released_delivered` is a count, and a count cannot tell
+    // "the payload was held and then handed over" from "some bytes turned up": the
+    // claim `gated` makes is that the transmitter *deferred* the payload, and that
+    // is a statement about bytes rather than about how many of them there were.
+    if !f.released_intact {
+        return (
+            WireReading::GatedThenLost,
+            format!(
+                "The transmitter stalled — {} of {} bytes crossed while the peer held RTS low — and {} bytes arrived after the peer raised RTS, but they were not the payload's continuation from where the gated cell stopped. Bytes that come back changed were not deferred, whatever their count says.",
+                f.gated_delivered, f.payload, f.released_delivered
+            ),
+        );
+    }
+    (
+        WireReading::Gated,
+        format!(
+            "{} of {} bytes crossed while the peer held RTS low, and {} arrived once the peer raised it — byte-for-byte the payload's continuation — against {} and {} in the two control cells on the same wire. The driver stalls the transmitter on CTS: the flag is honoured on the line and not merely on the read-back.",
+            f.gated_delivered,
+            f.payload,
+            f.released_delivered,
+            f.flag_off_delivered,
+            f.peer_ready_delivered
+        ),
+    )
+}
+
+/// One direction's finished reading.
+struct WireFlowReading {
+    peer: String,
+    gated: WireCell,
+    released_delivered: u64,
+    /// [`WireFacts::released_intact`] as measured for this direction.
+    released_intact: bool,
+    cts_after_release: Option<bool>,
+    flag_off: WireCell,
+    peer_ready: WireCell,
+    reading: WireReading,
+    why: String,
+}
+
+impl WireFlowReading {
+    fn observations(&self) -> serde_json::Value {
+        serde_json::json!({
+            "asks": P15_WIRE_ASKS,
+            "measured": true,
+            "peer_port": self.peer,
+            "baud": P15_WIRE_BAUD,
+            "payload_bytes": P15_WIRE_PAYLOAD,
+            "receive_window_ms": P15_WIRE_WINDOW.as_millis() as u64,
+            "reading": self.reading.word(),
+            "honoured_on_the_wire": self.reading.honoured_on_the_wire(),
+            "flag_on_peer_not_ready": self.gated.observations(),
+            "released_after_peer_raised_rts": self.released_delivered,
+            // **A count and a content check, side by side and never one without the
+            // other** (plan §18 item 85's repair). The count alone was the whole
+            // release evidence until 2026-08-21, while the prose around it claimed
+            // the release proved *the payload* to arrive — a claim about bytes
+            // resting on a `Vec::len()`.
+            "released_intact": self.released_intact,
+            "cts_after_release": self.cts_after_release,
+            "control_flag_off_peer_not_ready": self.flag_off.observations(),
+            "control_flag_on_peer_ready": self.peer_ready.observations(),
+            "why": self.why,
+            "does_not_license": P15_WIRE_DOES_NOT_LICENSE,
+        })
+    }
+}
+
+/// Write as much of `data` as the kernel will take, and say how much that was.
+///
+/// **Not [`p5_write_all`], and the difference is the point**: this one returns the
+/// count, because the count is the instrument plan §18 item 85 was filed with and
+/// this probe reports it beside the one that answers. A `TimedOut` here is the
+/// transmitter refusing more, which is a result rather than a failure, so the loop
+/// stops on it instead of retrying to a deadline.
+fn p15_wire_write(sp: &SerialPort, mut data: &[u8]) -> u64 {
+    let mut n = 0u64;
+    while !data.is_empty() {
+        match sp.write(data) {
+            Ok(0) => break,
+            Ok(k) => {
+                n += k as u64;
+                data = &data[k..];
+            }
+            Err(_) => break,
+        }
+    }
+    n
+}
+
+/// Read up to `want` bytes from `sp` inside `window`.
+fn p15_wire_read(sp: &SerialPort, want: usize, window: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + window;
+    let mut out: Vec<u8> = Vec::with_capacity(want);
+    while out.len() < want && Instant::now() < deadline {
+        // `p5_read_once` blocks up to the port's 20 ms read timeout, so this loop
+        // paces itself and cannot spin.
+        out.extend_from_slice(&p5_read_once(sp));
+    }
+    out
+}
+
+/// One cell: set the transmitter's flow control, drive the peer's RTS, transmit,
+/// and count what the peer receives.
+fn p15_wire_cell(
+    tx: &mut SerialPort,
+    rx: &mut SerialPort,
+    flow: FlowControl,
+    flow_label: &str,
+    peer_rts_high: bool,
+    payload: &[u8],
+) -> Result<WireCell, String> {
+    // **`set_configuration` rather than a re-open**, for two reasons: it is the
+    // call the serial node itself makes (so a driver that drops `CRTSCTS` errors
+    // here exactly as it would at the node's open, and this probe reports that
+    // rather than measuring a request that never took), and a re-open per cell
+    // would be six extra DTR toggles per pair — the cost §7.1 clause 6 states for
+    // the pre-check, multiplied.
+    let mut settings = tx
+        .get_configuration()
+        .map_err(|e| format!("get_configuration: {e}"))?;
+    settings.set_flow_control(flow);
+    tx.set_configuration(&settings)
+        .map_err(|e| format!("set_configuration(flow_control={flow_label}): {e}"))?;
+    // **The peer's own flow control is forced off in every cell, and this is not
+    // tidiness.** A port with `CRTSCTS` set has its RTS driven by the kernel as an
+    // *input* backpressure signal, so an RTS this probe lowers by hand is raised
+    // again by the driver the moment its receive buffer has room — the stimulus
+    // would then be the peer's buffer occupancy rather than this probe's ioctl,
+    // and the second direction (whose peer is the first direction's transmitter,
+    // still configured `rts-cts`) is where that would have bitten.
+    let mut peer_settings = rx
+        .get_configuration()
+        .map_err(|e| format!("peer get_configuration: {e}"))?;
+    peer_settings.set_flow_control(FlowControl::None);
+    rx.set_configuration(&peer_settings)
+        .map_err(|e| format!("peer set_configuration(flow_control=none): {e}"))?;
+    rx.set_rts(peer_rts_high)
+        .map_err(|e| format!("peer set_rts({peer_rts_high}): {e}"))?;
+    std::thread::sleep(P5_MODEM_SETTLE);
+    let cts_at_transmitter = tx.read_cts().ok();
+    let _ = rx.discard_input_buffer();
+    let accepted = p15_wire_write(tx, payload);
+    let got = p15_wire_read(rx, payload.len(), P15_WIRE_WINDOW);
+    Ok(WireCell {
+        cts_at_transmitter,
+        accepted,
+        delivered: got.len() as u64,
+        intact: payload.starts_with(got.as_slice()),
+    })
+}
+
+/// Were the bytes that arrived in the release window the payload's own continuation
+/// from where the gated cell stopped?
+///
+/// **A free function so the comparison is reachable without a peer.** Inline in
+/// [`p15_wire_direction`] it was covered by nothing but hardware, which is the shape
+/// that let the whole release ride on a `Vec::len()` in the first place: a decision
+/// only a rig can execute is a decision only a rig can catch getting weaker.
+///
+/// The gated cell's own `intact` gates this one, because the offset the comparison
+/// starts at is *its* delivered count — a cell that handed over garbage cannot say
+/// where the continuation begins. Vacuously `true` for an empty release, which is
+/// why `released_after_peer_raised_rts` is published beside it rather than replaced
+/// by it.
+fn p15_release_intact(payload: &[u8], gated: &WireCell, released: &[u8]) -> bool {
+    gated.intact
+        && payload
+            .get(gated.delivered as usize..)
+            .is_some_and(|tail| tail.starts_with(released))
+}
+
+/// One direction: `tx` transmits, `rx` is the peer whose RTS gates it.
+///
+/// Three cells and a release, in this order and no other: the gated cell first
+/// while the link is quiet, its release immediately after — the same payload, and
+/// what arrives is checked byte-for-byte against the payload's own continuation
+/// from where the gated cell stopped ([`p15_release_intact`]), which is what
+/// separates *deferred* from dropped; the release's **count** alone does not, since
+/// a transmitter that discarded the payload and then emitted 1024 bytes of anything
+/// reads identically by length (this line said the release proved deferral until
+/// 2026-08-21, which is the claim `released_intact` had to be added to earn) — then
+/// the two controls. The controls run last because each of them ends with the payload
+/// already delivered, which leaves nothing queued behind a lowered CTS for the
+/// close to wait on.
+fn p15_wire_direction(
+    tx: &mut SerialPort,
+    rx: &mut SerialPort,
+    peer: &str,
+    payload: &[u8],
+) -> Result<WireFlowReading, String> {
+    let gated = p15_wire_cell(tx, rx, FlowControl::RtsCts, "rts-cts", false, payload)?;
+
+    // The release: raise the peer's RTS and read again, without re-transmitting.
+    // What arrives here was in the transmitter when the cell above ended.
+    rx.set_rts(true)
+        .map_err(|e| format!("peer set_rts(true) for the release: {e}"))?;
+    std::thread::sleep(P5_MODEM_SETTLE);
+    let cts_after_release = tx.read_cts().ok();
+    let outstanding = payload.len().saturating_sub(gated.delivered as usize);
+    let released = p15_wire_read(rx, outstanding, P15_WIRE_WINDOW);
+    let released_delivered = released.len() as u64;
+    // **What arrived, not merely how much.** The release's whole job is to show the
+    // payload was *deferred* rather than dropped, and a length cannot say that: the
+    // bytes have to be the payload's own continuation from the offset the gated cell
+    // stopped at. A gated cell that itself delivered garbage makes that offset
+    // meaningless, so its own `intact` gates this one — an unreliable starting point
+    // cannot certify what follows it.
+    let released_intact = p15_release_intact(payload, &gated, &released);
+
+    let flag_off = p15_wire_cell(tx, rx, FlowControl::None, "none", false, payload)?;
+    let peer_ready = p15_wire_cell(tx, rx, FlowControl::RtsCts, "rts-cts", true, payload)?;
+
+    let (reading, why) = p15_wire_reading(WireFacts {
+        payload: payload.len() as u64,
+        // The stimulus control, read from the cells themselves rather than from
+        // P5's earlier certificate: P5 measured a different pair of opens minutes
+        // ago, and a guard that trusts the earlier reading cannot notice a bench
+        // that changed under it.
+        cts_low_seen: gated.cts_at_transmitter == Some(false),
+        cts_high_seen: peer_ready.cts_at_transmitter == Some(true),
+        gated_delivered: gated.delivered,
+        released_delivered,
+        released_intact,
+        flag_off_delivered: flag_off.delivered,
+        peer_ready_delivered: peer_ready.delivered,
+    });
+
+    Ok(WireFlowReading {
+        peer: peer.to_owned(),
+        gated,
+        released_delivered,
+        released_intact,
+        cts_after_release,
+        flag_off,
+        peer_ready,
+        reading,
+        why,
+    })
+}
+
+/// Restore one port to the termios P15 found on it, and verify the write took —
+/// **all four flag words and both speeds**.
+///
+/// The wire cells reconfigure through `serial2`, which sets the baud as well as the
+/// flow control, and on Darwin the speeds live outside `c_cflag` — so a check that
+/// read the two flag words [`p15_readback`]'s own restore reads would certify a
+/// port this probe had left at 115200. On Linux the baud rides in `c_cflag`'s
+/// `CBAUD` bits and the extra comparison is free; it is written for the platform
+/// where it is not.
+fn p15_wire_restore(sp: &SerialPort, before: &nix::sys::termios::Termios) -> bool {
+    use nix::sys::termios::{cfgetispeed, cfgetospeed};
+    tcsetattr(sp, SetArg::TCSANOW, before).is_ok()
+        && tcgetattr(sp)
+            .map(|t| {
+                t.control_flags == before.control_flags
+                    && t.input_flags == before.input_flags
+                    && t.output_flags == before.output_flags
+                    && t.local_flags == before.local_flags
+                    && cfgetispeed(&t) == cfgetispeed(before)
+                    && cfgetospeed(&t) == cfgetospeed(before)
+            })
+            .unwrap_or(false)
+}
+
+/// Both directions of one certified pair, plus what this probe did to the two
+/// ports' termios.
+struct WirePairOutcome {
+    a_to_b: Result<WireFlowReading, String>,
+    b_to_a: Result<WireFlowReading, String>,
+    /// `true` where the port was either never written or restored **and verified**
+    /// after the last write. Folded into the row's `baseline_restored`, which is
+    /// why that cell still describes the port as this probe leaves it (notes
+    /// §3.68's rule: the restore claim is verified by the probe's *last* read).
+    a_restored: bool,
+    b_restored: bool,
+}
+
+fn p15_wire_pair(
+    a_path: &Path,
+    b_path: &Path,
+    a_name: &str,
+    b_name: &str,
+    a_before: &nix::sys::termios::Termios,
+    b_before: &nix::sys::termios::Termios,
+) -> WirePairOutcome {
+    let payload: Vec<u8> = (0..P15_WIRE_PAYLOAD)
+        .map(|i| ((i * 37 + 11) & 0xFF) as u8)
+        .collect();
+
+    let mut a = match p5_open(a_path, P15_WIRE_BAUD, Parity::None) {
+        Ok(sp) => sp,
+        Err(e) => {
+            let msg = format!("{a_name} would not open for the wire reading: {e}");
+            return WirePairOutcome {
+                a_to_b: Err(msg.clone()),
+                b_to_a: Err(msg),
+                a_restored: true,
+                b_restored: true,
+            };
+        }
+    };
+    let mut b = match p5_open(b_path, P15_WIRE_BAUD, Parity::None) {
+        Ok(sp) => sp,
+        Err(e) => {
+            let msg = format!("{b_name} would not open for the wire reading: {e}");
+            // A opened, so A was reconfigured and owes a restore even though the
+            // reading never ran.
+            let a_restored = p15_wire_restore(&a, a_before);
+            return WirePairOutcome {
+                a_to_b: Err(msg.clone()),
+                b_to_a: Err(msg),
+                a_restored,
+                b_restored: true,
+            };
+        }
+    };
+
+    let a_to_b = p15_wire_direction(&mut a, &mut b, b_name, &payload);
+    let b_to_a = p15_wire_direction(&mut b, &mut a, a_name, &payload);
+
+    // **Leave nothing queued behind a lowered CTS.** A tty close waits for pending
+    // output to drain, and a transmitter stalled on CTS drains never — so both
+    // peers' RTS go high and both output queues are discarded before either handle
+    // is dropped. An early `?` above cannot skip this: the directions return their
+    // errors rather than propagating out of this function.
+    let _ = a.set_rts(true);
+    let _ = b.set_rts(true);
+    let _ = a.discard_buffers();
+    let _ = b.discard_buffers();
+
+    WirePairOutcome {
+        a_restored: p15_wire_restore(&a, a_before),
+        b_restored: p15_wire_restore(&b, b_before),
+        a_to_b,
+        b_to_a,
+    }
+}
+
 /// Ask one port for `CRTSCTS` and read it back, then put it back as it was.
-fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
+///
+/// **The baseline rides out beside the row** (plan §18 item 85). The wire half
+/// reconfigures both ports through `serial2`, which moves the baud as well as the
+/// flow control, and it has to restore to *this* witness — the one this probe
+/// found — rather than to whatever the first wire cell happened to leave. Returned
+/// rather than stored in [`FlowReadback`] so a row stays constructible without a
+/// tty: a `Termios` can only be obtained from `tcgetattr`, and a struct that
+/// carries one cannot be built in a unit test, which would have moved every arm of
+/// [`p15_verdict`] onto hardware.
+fn p15_readback(path: &PathBuf) -> Result<(FlowReadback, nix::sys::termios::Termios), String> {
     let fd = open(
         path,
         OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
@@ -7720,7 +8455,32 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
     // IXON|IXOFF` and `c_cflag &= !CRTSCTS`, which is exactly what the serial
     // node's open performs for `flow_control = "xon-xoff"`. Asking for anything
     // else would measure a request the daemon never makes.
-    let soft = p15_soft_readback(&fd, &before);
+    let mut soft = p15_soft_readback(&fd, &before);
+
+    // **The software half gets the same cross-check the hardware half has had since
+    // notes §3.67** (plan §18 item 73). Until this call the comparison existed for
+    // `rts-cts` alone: `SoftFlowReadback` carried no `shipped_predicate_agrees`, so the
+    // probe's hand-rolled reading and `honours_flow_control`'s `XonXoff` arm were two
+    // implementations with nothing between them. That was a *narrowness* while plan §18
+    // item 14's decline stood and nothing consulted the software cell, and it stopped
+    // being one at §15.61, which made an accept-then-drop software answer refuse an
+    // operator's `load` — the same shipped consequence the hardware answer carries, so
+    // the same §7.1 clause 2 obligation.
+    //
+    // Placed *after* the software read-back and *before* the final baseline
+    // verification, for the reason the hardware call is placed where it is: this is an
+    // external open-write-restore against the same port, and the `tcgetattr` below is
+    // what certifies the port as this probe actually leaves it.
+    //
+    // **The arm, not the read-back** — the hardware half's own correction of 2026-08-12,
+    // applied here rather than re-learned: an honest refusal and an accept-then-drop both
+    // read the flags back clear, so a comparison over `honoured` alone agrees on exactly
+    // the half that cannot differ. That is item 56, and the field would say `true`
+    // through it.
+    p15_fill_soft_cross_check(&mut soft, || {
+        serial_nexus_sys::honours_flow_control(path, serial_nexus_sys::FlowMode::XonXoff)
+    });
+    let soft = soft;
 
     // **`honours_flow_control` and the software pass are the probe's last writes to this
     // port, so the baseline has to be re-read after them** (notes §3.68).
@@ -7741,17 +8501,24 @@ fn p15_readback(path: &PathBuf) -> Result<FlowReadback, String> {
             .map(|t| t.control_flags == before.control_flags && t.input_flags == before.input_flags)
             .unwrap_or(false);
 
-    Ok(FlowReadback {
-        port: path.display().to_string(),
-        tcsetattr_ok: set.is_ok(),
-        tcsetattr_error: set.err().map(|e| e.to_string()),
-        cflag_before: flag_bits(before.control_flags.bits()),
-        cflag_after: flag_bits(after.control_flags.bits()),
-        honoured,
-        shipped_predicate_agrees: agrees,
-        restored,
-        soft,
-    })
+    let baseline = before.clone();
+    Ok((
+        FlowReadback {
+            port: path.display().to_string(),
+            // Taken by the caller, which is the only place that knows the pair: see
+            // [`p15_attach_wire_readings`].
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            tcsetattr_ok: set.is_ok(),
+            tcsetattr_error: set.err().map(|e| e.to_string()),
+            cflag_before: flag_bits(before.control_flags.bits()),
+            cflag_after: flag_bits(after.control_flags.bits()),
+            honoured,
+            shipped_predicate_agrees: agrees,
+            restored,
+            soft,
+        },
+        baseline,
+    ))
 }
 
 /// Ask one already-open port for `IXON|IXOFF` and read it back, then put the
@@ -7788,7 +8555,51 @@ fn p15_soft_readback<Fd: AsFd>(
         ixon: after.input_flags.contains(InputFlags::IXON),
         ixoff: after.input_flags.contains(InputFlags::IXOFF),
         iflag_matches_request: after.input_flags == want.input_flags,
+        // Filled by the caller, which holds the path the shipped predicate needs and
+        // owns the ordering against the final restore check. `None` until then, and
+        // `None` for good if that predicate cannot open the port.
+        shipped_predicate_agrees: None,
     })
+}
+
+/// Fill [`SoftFlowReadback::shipped_predicate_agrees`] from the shipped predicate's
+/// answer (plan §18 item 73).
+///
+/// **The predicate arrives as a closure so this function — the one that makes the
+/// decision — can be driven by a test.** It used to be an `if let` block inline in
+/// [`p15_flow_readback`], reachable only through a real serial port, so the choice
+/// below was covered by nothing: replacing `s.iflag_matches_request` with
+/// `s.honoured()` compiled and left every test in this binary green (measured, this file's
+/// `p15s_software_cross_check_compares_the_fate_deciding_readings`). Injecting the
+/// answer keeps the *production* body under test rather than a re-spelling of it,
+/// which is the difference between guarding the decision and restating it.
+///
+/// **The by-hand arm is classified from [`SoftFlowReadback::iflag_matches_request`],
+/// never from [`SoftFlowReadback::honoured`], and that is the whole value of the
+/// field.** `honours_flow_control`'s `XonXoff` arm answers on `contains(IXON|IXOFF)`
+/// — a two-flag subset test — while this probe compares the **whole** `c_iflag`
+/// word, which is `serial2`'s own comparison and the one that decides whether the
+/// node's open faults. A driver that honours both flags and perturbs some third
+/// `c_iflag` bit separates them: the predicate says `Honoured` and lets the `load`
+/// through, and `serial2` then faults the node. A field computed from `honoured()`
+/// would agree with the predicate **by construction** on that port and report `true`
+/// — a cross-check between two halves that cannot differ, which is item 56 one mode
+/// over, and it would be worse than no field at all because it reads as evidence.
+///
+/// `None` where the predicate could not run: an unreadable port is not a
+/// disagreement (§7.1, and the hardware half's field carries the same disposition).
+fn p15_fill_soft_cross_check(
+    soft: &mut Result<SoftFlowReadback, String>,
+    shipped: impl FnOnce() -> nix::Result<FlowOutcome>,
+) {
+    let Ok(s) = soft.as_mut() else {
+        return;
+    };
+    let by_hand = FlowOutcome::classify(s.tcsetattr_ok, s.iflag_matches_request);
+    s.shipped_predicate_agrees = match shipped() {
+        Ok(v) => Some(v == by_hand),
+        Err(_) => None,
+    };
 }
 
 /// The software-flow-control sentence appended to every arm that measured a port.
@@ -7830,6 +8641,22 @@ fn p15_soft_readback<Fd: AsFd>(
 /// finding nobody reads (§13's gate-blind-spot rule). The drop arm therefore leads
 /// with the defect and names the ports.
 fn p15_soft_note(rows: &[FlowReadback]) -> String {
+    // **The disagreement leads the note, and it is printed from here rather than from
+    // one verdict arm on purpose** (plan §18 item 73). This note is appended by *every*
+    // arm that measured a port, so putting the sentence here is what stops a
+    // higher-ranked finding — an unrestored port, a dropped `CRTSCTS` — from being the
+    // thing that hides it. The hardware half learned that ordering the hard way: its
+    // ranking rationale sat 150 lines from the function it justified and went stale
+    // (notes §3.101).
+    let soft_disagreeing: Vec<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.soft
+                .as_ref()
+                .is_ok_and(|s| s.shipped_predicate_agrees == Some(false))
+        })
+        .map(|r| r.port.as_str())
+        .collect();
     let dropped: Vec<&str> = rows
         .iter()
         .filter(|r| r.soft.as_ref().is_ok_and(|s| s.silently_dropped()))
@@ -7849,9 +8676,39 @@ fn p15_soft_note(rows: &[FlowReadback]) -> String {
         .filter(|r| r.soft.is_err())
         .map(|r| r.port.as_str())
         .collect();
-    let honoured = rows.len() - dropped.len() - refused.len() - unmeasured.len();
+    // **A port the cross-check disputed is not one this arm may clear** (plan §18
+    // item 73). The clearing sentence below and the disagreement sentence above were
+    // both printed about the same port for as long as this was one count: a report
+    // that says *neither reading can be trusted until they are reconciled* and then
+    // says *this reading clears these port(s) rather than merely describing them*, in
+    // one paragraph, about one port, is worse than either sentence alone — the reader
+    // takes the clearing one, because it is the one that names an outcome. The two
+    // groups are therefore split at the source, and the disputed one gets a sentence
+    // that says what is actually true about it.
+    //
+    // `honoured()` is the exact complement of the three groups above within a measured
+    // row — `dropped` is `tcsetattr_ok && !honoured()`, `refused` is `!tcsetattr_ok &&
+    // !honoured()` — so this stays the partition the subtraction it replaces was.
+    let honoured_named = |disputed: bool| -> Vec<&str> {
+        rows.iter()
+            .filter(|r| {
+                r.soft.as_ref().is_ok_and(|s| {
+                    s.honoured() && (s.shipped_predicate_agrees == Some(false)) == disputed
+                })
+            })
+            .map(|r| r.port.as_str())
+            .collect()
+    };
+    let honoured_cleared = honoured_named(false);
+    let honoured_disputed = honoured_named(true);
 
     let mut out = String::new();
+    if !soft_disagreeing.is_empty() {
+        out.push_str(&format!(
+            " **SOFTWARE flow control: this report and the daemon would answer differently about {}.** `serial_nexus_sys::honours_flow_control(.., XonXoff)` is the predicate `load` consults to refuse a `flow_control = \"xon-xoff\"` config since §15.61, and it reached a different three-way arm than the read-back this probe took by hand on the same port. **Neither reading can be trusted until they are reconciled**, and the reason is the one §15.53's hardware cross-check already carries: a report that calls a port fine while `load` refuses it — or the reverse — is worse than either verdict on its own. The two do not read the same thing, which is where to look first: this probe compares the **whole** `c_iflag` word, which is `serial2`'s own comparison and the one that decides whether the node's open faults, while the predicate answers on `contains(IXON|IXOFF)` — a two-flag subset test that a driver honouring both flags and perturbing a third `c_iflag` bit would satisfy while `serial2_readback_would_fault` says the open fails. Read that cell and `ixon_on_readback`/`ixoff_on_readback` together: if the flags are set and the whole word still differs, the port found the case §7.1 clause 2 forbids two implementations from disagreeing about.",
+            soft_disagreeing.join(", ")
+        ));
+    }
     if !dropped.is_empty() {
         out.push_str(&format!(
             " **SOFTWARE flow control: {} named port(s) ACCEPTED an `IXON|IXOFF` request and then reported it clear** ({}) — measured on the same open (plan §18 item 14). `serial2` verifies `c_iflag` by read-back exactly as it verifies `c_cflag`, so a `flow_control = \"xon-xoff\"` node on such a port would fault at its own open with the bare `failed to apply some or all settings`. **Since §15.61 it does not get that far: the config is REFUSED at `load`/`add-node`, before anything is created**, exactly as an `rts-cts` config on an accept-then-drop port is — the same predicate, the same position, and the same single arm refusing (an honest `tcsetattr` failure is not refused, and an unmeasurable port waits). Plan §18 item 14 declined this refusal *until a dropping driver was found*; this row is that driver, so the decline was paid off rather than reversed (plan §18 item 67). The remedy is `flow_control = \"none\"` for this port, or an adapter whose driver implements XON/XOFF — **not** `rts-cts`, if the hardware half of this probe reports the same port dropping that too. `serial2_readback_would_fault` is the cell that decides the node's fate, because it compares the whole `c_iflag` word rather than the two flags alone.",
@@ -7866,15 +8723,181 @@ fn p15_soft_note(rows: &[FlowReadback]) -> String {
             refused.join(", ")
         ));
     }
-    if honoured > 0 {
+    if !honoured_cleared.is_empty() {
         out.push_str(&format!(
-            " Software flow control (`xon-xoff`, `IXON|IXOFF`) was measured on the same open and {honoured} of {} named port(s) honoured it on read-back. The verdict answers for this half too since §15.59 widened the question, and since §15.61 the daemon consults the same reading: a `load`/`add-node` pre-check asks this port the same question this probe just asked it. A port that **honours** the mode is not refused — the refusal fires on accept-then-drop alone — so this reading clears these port(s) rather than merely describing them.",
+            " Software flow control (`xon-xoff`, `IXON|IXOFF`) was measured on the same open and {} of {} named port(s) honoured it on read-back. The verdict answers for this half too since §15.59 widened the question, and since §15.61 the daemon consults the same reading: a `load`/`add-node` pre-check asks this port the same question this probe just asked it. A port that **honours** the mode is not refused — the refusal fires on accept-then-drop alone — so this reading clears these port(s) rather than merely describing them.",
+            honoured_cleared.len(),
             rows.len()
+        ));
+    }
+    if !honoured_disputed.is_empty() {
+        out.push_str(&format!(
+            " Software flow control read the `IXON|IXOFF` request back set on {} — and that is **not** a clearance for those port(s): the disagreement reported above names these same port(s), so what a `load` would do with a `flow_control = \"xon-xoff\"` config here is precisely what is unsettled. This line describes the reading this probe took and decides nothing until the two implementations are reconciled.",
+            honoured_disputed.join(", ")
         ));
     }
     if !unmeasured.is_empty() {
         out.push_str(&format!(
             " Software flow control could not be read back on {} — the cell says so rather than reading as an answer (unmeasurable is data, §15.47).",
+            unmeasured.join(", ")
+        ));
+    }
+    out
+}
+
+/// The sentinel a row carries until the wire half has had its turn. Compared by
+/// value in exactly one place, so it is a constant rather than a literal typed
+/// twice — a second spelling here would silently mean *no peer* forever.
+const P15_WIRE_NOT_ATTEMPTED: &str = "not attempted";
+
+/// Take the wire reading for every port that is half of a pair P5 certified as
+/// carrying RTS/CTS **both ways**, and say why for every port that is not.
+///
+/// **The precondition is P5's, deliberately.** On a 3-wire bench, and on a
+/// transport that manufactures CTS (§15.62, §15.68), a transmitter that does not
+/// stall is exactly what an honest driver produces — there is no CTS for it to stop
+/// on — so running the cells there would file a driver defect against a cable. Such
+/// a port gets `measured: false` and the reason, never `inert`. The cells keep
+/// their own stimulus control anyway (`cts_at_transmitter`), because P5's reading
+/// was taken minutes earlier through different opens.
+fn p15_attach_wire_readings(
+    rows: &mut [FlowReadback],
+    baselines: &[nix::sys::termios::Termios],
+    pairs: &[VerifiedPair],
+) {
+    for pair in pairs {
+        let a_key = pair.a.display().to_string();
+        let b_key = pair.b.display().to_string();
+        let (Some(ai), Some(bi)) = (
+            rows.iter().position(|r| r.port == a_key),
+            rows.iter().position(|r| r.port == b_key),
+        ) else {
+            continue;
+        };
+        match pair.rts_cts_crossing {
+            Some(true) => {
+                // Index-for-index with `rows` by construction — both are pushed in
+                // one loop over the named ports, and the assertion below is the
+                // cheap version of saying so.
+                let (Some(a_before), Some(b_before)) = (baselines.get(ai), baselines.get(bi))
+                else {
+                    continue;
+                };
+                let out = p15_wire_pair(
+                    &pair.a,
+                    &pair.b,
+                    &pair.a_name,
+                    &pair.b_name,
+                    a_before,
+                    b_before,
+                );
+                rows[ai].wire = out.a_to_b;
+                rows[bi].wire = out.b_to_a;
+                // **AND-ed, never assigned.** A row whose read-back half already
+                // failed to restore does not become restored because the wire half
+                // managed it.
+                rows[ai].restored = rows[ai].restored && out.a_restored;
+                rows[bi].restored = rows[bi].restored && out.b_restored;
+            }
+            Some(false) => {
+                let msg = format!(
+                    "P5 read no RTS/CTS crossing in both directions on this pair ({} ↔ {}), so lowering the peer's RTS would not reach this port's CTS and a transmitter that failed to stall could not be told from a line that was never driven. That is a statement about this bench, not about the driver — see this pair's `handshake` cell in P5, and note that a bare conductor and a transport that manufactures the line read identically there (§15.69 clause 1).",
+                    pair.a_name, pair.b_name
+                );
+                rows[ai].wire = Err(msg.clone());
+                rows[bi].wire = Err(msg);
+            }
+            None => {
+                let msg = format!(
+                    "P5 did not take a handshake reading on this pair ({} ↔ {}), so whether the peer's RTS reaches this port's CTS is unknown and the wire question has no admissible answer here.",
+                    pair.a_name, pair.b_name
+                );
+                rows[ai].wire = Err(msg.clone());
+                rows[bi].wire = Err(msg);
+            }
+        }
+    }
+    for r in rows.iter_mut() {
+        if r.wire
+            .as_ref()
+            .err()
+            .is_some_and(|e| e == P15_WIRE_NOT_ATTEMPTED)
+        {
+            r.wire = Err(
+                "no pair P5 verified contains this port (or its peer could not be read back), and the wire question needs a peer: something has to lower RTS and something has to receive. A dangling converter — §13's Tier 1, this project's baseline rig — cannot answer it, and neither can a load-time pre-check, which is why §7.1 clause 2 does not ask."
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+/// The wire sentence appended to every arm of P15's verdict.
+///
+/// **Appended after [`p15_verdict`] rather than inside it, and the status does not
+/// move** (§15.59's first step, repeated deliberately). P15's `question` asks about
+/// a *read-back*; a verdict that degraded on the wire reading would be answering a
+/// question its own header does not ask, which is the arrangement §15.59 spent an
+/// era boundary to end. Widening the question is a `probe_set` move and closes the
+/// era, so it is filed rather than smuggled in with the measurement (plan §18).
+/// Until then the finding rides here, where an operator reads it, and in the
+/// observations, where a gate does — the two places §13 requires a finding to exist
+/// in at all.
+fn p15_wire_note(rows: &[FlowReadback]) -> String {
+    let named = |f: &dyn Fn(&WireFlowReading) -> bool| -> Vec<&str> {
+        rows.iter()
+            .filter(|r| r.wire.as_ref().is_ok_and(f))
+            .map(|r| r.port.as_str())
+            .collect()
+    };
+    let inert = named(&|w| w.reading == WireReading::Inert);
+    let leaky = named(&|w| {
+        w.reading == WireReading::PartlyGated || w.reading == WireReading::GatedThenLost
+    });
+    let no_cts = named(&|w| w.reading == WireReading::NoCtsPath);
+    let gated = named(&|w| w.reading == WireReading::Gated);
+    let unmeasured: Vec<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.wire.is_err()
+                || r.wire
+                    .as_ref()
+                    .is_ok_and(|w| w.reading == WireReading::Unmeasurable)
+        })
+        .map(|r| r.port.as_str())
+        .collect();
+
+    let mut out = String::new();
+    if !inert.is_empty() {
+        out.push_str(&format!(
+            " **WIRE flow control: {} named port(s) KEPT `CRTSCTS` on read-back and did not act on it** ({}) — the payload crossed while the peer held RTS low, against two control cells on the same wire that carried it too (plan §18 item 85, §15.73). **This is the state no read-back can see**, and the one §15.53's refusal cannot reach: the predicate `load` consults asks whether the driver *accepts* the setting, this asks whether the line *honours* it, and here the two disagree. Nothing is refused on this reading and nothing should be: §7.1 clause 2 states the bound in as many words, and a pre-check has no peer, no transfer and no stall to measure with. What an operator does with it is a decision about the port — an `rts-cts` edge here reports flow control and does not perform it, so the far end's buffer is the only backpressure the link has.",
+            inert.len(),
+            inert.join(", ")
+        ));
+    }
+    if !leaky.is_empty() {
+        out.push_str(&format!(
+            " **WIRE flow control: {} named port(s) neither stalled nor ran free** ({}) — the cells below say which shape (`partly-gated`: some of the payload crossed under backpressure; `gated-then-lost`: the transmitter stopped and the bytes never arrived after the peer released it). Either way the link loses exactly the bytes the mode was configured to protect, and neither is visible to a read-back.",
+            leaky.len(),
+            leaky.join(", ")
+        ));
+    }
+    if !no_cts.is_empty() {
+        out.push_str(&format!(
+            " **WIRE flow control: on {} named port(s) the peer's RTS never reached this port's CTS** ({}), so the transmitter was never told to stop and no `rts-cts` edge can perform flow control over this transport whatever its read-back reports. **That is a reading about the bench and not about the driver** — a bare conductor and a transport that manufactures the line are bit-identical here (§15.69 clause 1) — so this probe does not call it a driver defect and neither should a report of it. Do not re-crimp a bench on this sentence.",
+            no_cts.len(),
+            no_cts.join(", ")
+        ));
+    }
+    if !gated.is_empty() {
+        out.push_str(&format!(
+            " Hardware flow control was measured **on the wire** on {} of {} named port(s) and gated the transmitter: the payload was held while the peer held RTS low and arrived when it was raised, against two control cells on the same wire that carried it (the flag off, and the peer ready). So these port(s) are cleared of the accept-and-ignore state a read-back cannot see (plan §18 item 85), which is a fact about these ports and this driver and licenses nothing about any other. It changes no `load`/`add-node` behaviour: §7.1 clause 2's pre-check decides acceptance and never wire behaviour.",
+            gated.len(),
+            rows.len()
+        ));
+    }
+    if !unmeasured.is_empty() {
+        out.push_str(&format!(
+            " The wire reading could not be taken on {} — the cell carries the reason rather than reading as an answer (unmeasurable is data, §15.47), and it is **never** reported as a driver finding: this question needs a peer and a certified RTS/CTS crossing, and a bench that has neither is a legitimate rig (§5, §15.52).",
             unmeasured.join(", ")
         ));
     }
@@ -7937,6 +8960,37 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
             ),
         );
     }
+    // **The software half's cross-check, ranked immediately below the hardware one**
+    // (plan §18 item 73). Both are the same fact about the same port — the report and
+    // `load` would answer differently — and since §15.61 both modes carry the same
+    // shipped consequence, so this arm sits with its sibling and above every *finding*:
+    // a disagreement between the two implementations is worse than either verdict alone,
+    // which is the ranking rationale the hardware arm was given and not a new one.
+    //
+    // Hardware first, and for **stability** rather than importance — the same reason the
+    // `soft_dropped` arm below is ranked where it is. A two-defect report's headline must
+    // not move under a reader. Nothing is hidden by the ordering: `p15_soft_note` prints
+    // the software disagreement from every arm that measured a port, including the
+    // hardware disagreement arm above.
+    let soft_disagreeing: Vec<&FlowReadback> = rows
+        .iter()
+        .filter(|r| {
+            r.soft
+                .as_ref()
+                .is_ok_and(|s| s.shipped_predicate_agrees == Some(false))
+        })
+        .collect();
+    if !soft_disagreeing.is_empty() {
+        return (
+            Status::Degraded,
+            format!(
+                "**The hardware half of this cross-check agrees here and the software half does not.** `CRTSCTS` gets the same answer from this report and from `load` on every named port, and on {} of them the SOFTWARE mode does not. Until §15.61 that gap refused no config, because nothing consulted the software reading; it does now, so this is the finding the `rts-cts` cross-check has always reported, one mode over. The detail, and the bound on what it licenses, follow.{}",
+                soft_disagreeing.len(),
+                p15_soft_note(rows)
+            ),
+        );
+    }
+
     // **A port that REFUSED the request is not a port that honoured it, and the
     // verdict may not say it was** (§7.1 clause 7, §15.53). Both readings are
     // `supported` — an honest refusal is a legitimate driver answer and §7.1
@@ -8103,20 +9157,31 @@ fn p15_verdict(named: usize, rows: &[FlowReadback], errors: &[String]) -> (Statu
 /// Opt-in behind `--port` like P3/P5/P11/P14, and it restores the termios it
 /// found, checked rather than assumed — **by the probe's last read of the port,
 /// after both writes and after `honours_flow_control`'s own**.
-pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
+pub fn p15_flow_control_readback(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
     let mut p = Probe::new(
         "P15",
         "real-port flow-control honouring",
         "Does a named port honour a requested flow-control mode — hardware (CRTSCTS) or software (IXON/IXOFF) — on read-back, or accept the request and silently drop it (§7.1, §15.53)?",
     );
     let mut rows: Vec<FlowReadback> = Vec::new();
+    let mut baselines: Vec<nix::sys::termios::Termios> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for port in ports {
         match p15_readback(port) {
-            Ok(r) => rows.push(r),
+            Ok((r, baseline)) => {
+                rows.push(r);
+                baselines.push(baseline);
+            }
             Err(e) => errors.push(format!("{}: {e}", port.display())),
         }
     }
+    // **The wire half runs after every read-back, not inside one.** It needs both
+    // ends of a certified pair open at once, and it must not be holding a port when
+    // that port's own read-back takes its baseline (plan §18 item 85). Its restores
+    // fold back into the rows above, so `baseline_restored` still describes the
+    // port as this probe *leaves* it rather than as some earlier phase left it —
+    // the rule notes §3.68 wrote after the same mistake one phase over.
+    p15_attach_wire_readings(&mut rows, &baselines, pairs);
     for r in &rows {
         p = p.observe(&r.port, r.observations());
     }
@@ -8124,7 +9189,7 @@ pub fn p15_flow_control_readback(ports: &[PathBuf]) -> Probe {
         p = p.observe("unreadable_ports", serde_json::json!(errors));
     }
     let (status, consequence) = p15_verdict(ports.len(), &rows, &errors);
-    p.verdict(status, &consequence)
+    p.verdict(status, &format!("{consequence}{}", p15_wire_note(&rows)))
 }
 
 pub fn p14_max_rate(ports: &[PathBuf], pairs: &[VerifiedPair]) -> Probe {
@@ -11411,6 +12476,7 @@ mod tests {
 
     fn flow_row(port: &str, ok: bool, honoured: bool, restored: bool) -> FlowReadback {
         FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             port: port.to_owned(),
             tcsetattr_ok: ok,
             tcsetattr_error: None,
@@ -11425,6 +12491,10 @@ mod tests {
 
     /// The software half of a row, built from the two answers that classify it:
     /// did `tcsetattr` succeed, and did the flags read back.
+    ///
+    /// The cross-check defaults to `Some(true)` — agreement — so a test that says
+    /// nothing about it is testing the *other* thing it named, and the disagreement
+    /// arm has to be asked for by name (`soft_row_disagreeing`).
     fn soft_row(ok: bool, honoured: bool) -> SoftFlowReadback {
         let ixon_ixoff = 0x400 | 0x1000;
         SoftFlowReadback {
@@ -11435,7 +12505,705 @@ mod tests {
             ixon: honoured,
             ixoff: honoured,
             iflag_matches_request: honoured,
+            shipped_predicate_agrees: Some(true),
         }
+    }
+
+    /// A software row carrying **the divergence plan §18 item 73 names**, built as the
+    /// driver would produce it rather than by flipping the verdict cell: `tcsetattr`
+    /// succeeded, both flags read back set — so `honours_flow_control`'s
+    /// `contains(IXON|IXOFF)` subset test says `Honoured` — while the whole `c_iflag`
+    /// word does **not** match the request, because the driver perturbed some third
+    /// bit. That is `serial2`'s own comparison failing, so the node's open would fault
+    /// on a port the shipped predicate just cleared.
+    ///
+    /// Built here rather than injected as `shipped_predicate_agrees: Some(false)` alone,
+    /// because a row whose cells cannot produce the disagreement it claims is a fixture
+    /// asserting its own conclusion: `serial2_readback_would_fault` and the two flag
+    /// booleans have to be able to *co-exist* for this finding to be the one an operator
+    /// meets. No box in this record answers this way (the FT232R on `ftdi_sio` reads
+    /// `0x5` → `0x1405`, an exact match), which is why the arm is exercised here and the
+    /// hardware capture proves the field is computed rather than that it can go false.
+    fn soft_row_disagreeing() -> SoftFlowReadback {
+        let ixon_ixoff = 0x400 | 0x1000;
+        SoftFlowReadback {
+            tcsetattr_ok: true,
+            tcsetattr_error: None,
+            iflag_before: 0x5,
+            // The two flags the request named, plus one the request did not.
+            iflag_after: 0x5 | ixon_ixoff | 0x80,
+            ixon: true,
+            ixoff: true,
+            iflag_matches_request: false,
+            shipped_predicate_agrees: Some(false),
+        }
+    }
+
+    /// One direction's wire numbers, spelled the way the report spells them.
+    ///
+    /// `released_intact` defaults to **true** — an honest release — for the reason
+    /// [`soft_row`]'s cross-check field defaults to agreement: a test that says
+    /// nothing about it is testing the thing it named, and the garbled release has
+    /// to be asked for by name (`WireFacts { released_intact: false,
+    /// ..wire_facts(…) }`).
+    fn wire_facts(
+        cts_low: bool,
+        cts_high: bool,
+        gated: u64,
+        released: u64,
+        flag_off: u64,
+        peer_ready: u64,
+    ) -> WireFacts {
+        WireFacts {
+            payload: 1024,
+            cts_low_seen: cts_low,
+            cts_high_seen: cts_high,
+            gated_delivered: gated,
+            released_delivered: released,
+            released_intact: true,
+            flag_off_delivered: flag_off,
+            peer_ready_delivered: peer_ready,
+        }
+    }
+
+    /// **The discrimination pair plan §18 item 85 asks for, as numbers** (design
+    /// §15.73).
+    ///
+    /// The item's own validation clause is *"a bench where `CRTSCTS` is honoured on
+    /// read-back and inert on the wire must be separated from one where it is
+    /// honoured and functional, by an instrument that moves bytes"*. Both halves are
+    /// in the record and neither box can produce the other, so the fold is tested
+    /// here rather than on whichever bench is plugged in (§9):
+    ///
+    /// - the **functional** half is this rig, read *by this instrument*:
+    ///   `docs/doctor/linux-7.0-2026-08-21-800915b-dirty-wireflow-tier3{,-2,-3}.json`
+    ///   — 0 of 1024 delivered under backpressure, 1024 on release, 1024 in each
+    ///   control, both directions, three captures (on the `-dirty-` stamp these three
+    ///   carry, and what it does and does not cost, see [`WireFacts`]);
+    /// - the **inert** half is the CDC-ACM bench of §15.62, whose 2×2 wrote 44672
+    ///   bytes in all four cells with spread 0 — the same *shape*, scaled: the gated
+    ///   cell equals its controls. **That reading was taken by a bespoke 2×2 in that
+    ///   session and not by this probe**, which did not exist yet; no artifact in
+    ///   `docs/doctor/` carries a `wire_flow_control` block for it, and the fixture
+    ///   below is a model of it rather than a replay.
+    ///
+    /// A reading that answered `gated` to both would be worth nothing, which is the
+    /// vacuity the item is about.
+    #[test]
+    fn p15_wire_reading_separates_a_gated_transmitter_from_an_inert_flag() {
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 0, 1024, 1024, 1024));
+        assert_eq!(
+            r,
+            WireReading::Gated,
+            "the FT232R bench's own numbers: {why}"
+        );
+        assert_eq!(r.honoured_on_the_wire(), Some(true));
+
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 1024, 0, 1024, 1024));
+        assert_eq!(
+            r,
+            WireReading::Inert,
+            "a gated cell equal to its controls is the §15.62 shape: {why}"
+        );
+        assert_eq!(r.honoured_on_the_wire(), Some(false));
+        assert!(
+            why.contains("1024"),
+            "the sentence must carry the counts it judged: {why}"
+        );
+    }
+
+    /// **A bench the instrument could not stimulate is never a driver finding.**
+    ///
+    /// This is the false-negative guard, and its order matters: the numbers below
+    /// are byte-for-byte the `inert` case above, and they must still not read
+    /// `inert`, because the peer's RTS never reached the transmitter's CTS. A
+    /// 3-wire rig is §5's own stated assumption and a transport that manufactures
+    /// CTS is §15.62's; on both, a transmitter that does not stall is what an
+    /// *honest* driver does. Calling that a defect would be blaming a driver for a
+    /// cable — the harm §15.69 clause 1 spent an item repairing one instrument over.
+    #[test]
+    fn p15_wire_reading_never_blames_a_driver_for_a_bench_it_could_not_stimulate() {
+        for (low, high) in [(false, true), (true, false), (false, false)] {
+            let (r, why) = p15_wire_reading(wire_facts(low, high, 1024, 0, 1024, 1024));
+            assert_eq!(
+                r,
+                WireReading::NoCtsPath,
+                "cts_low_seen={low} cts_high_seen={high} read as a driver finding: {why}"
+            );
+            assert_eq!(
+                r.honoured_on_the_wire(),
+                None,
+                "a bench reading must not answer the driver's question either way"
+            );
+        }
+
+        // And a link that carried nothing in its controls cannot license the gated
+        // cell's silence: a dead wire and a held transmitter deliver the same zero.
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 0, 0, 0, 0));
+        assert_eq!(r, WireReading::Unmeasurable, "{why}");
+        assert_eq!(r.honoured_on_the_wire(), None);
+    }
+
+    /// The two shapes between `gated` and `inert`, each of which is a defect a
+    /// read-back cannot see and neither of which is the other.
+    #[test]
+    fn p15_wire_reading_names_the_two_shapes_between_gated_and_inert() {
+        // Half the payload crossed under backpressure: slowed, not stopped.
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 512, 512, 1024, 1024));
+        assert_eq!(r, WireReading::PartlyGated, "{why}");
+        assert_eq!(r.honoured_on_the_wire(), Some(false));
+
+        // Stopped, and the bytes never arrived after the peer released it.
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 0, 0, 1024, 1024));
+        assert_eq!(r, WireReading::GatedThenLost, "{why}");
+        assert_eq!(r.honoured_on_the_wire(), Some(false));
+
+        // Every word is distinct, so a reader can key on `reading` alone.
+        let words: Vec<&str> = [
+            WireReading::Gated,
+            WireReading::PartlyGated,
+            WireReading::Inert,
+            WireReading::GatedThenLost,
+            WireReading::NoCtsPath,
+            WireReading::Unmeasurable,
+        ]
+        .iter()
+        .map(|r| r.word())
+        .collect();
+        let mut sorted = words.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            words.len(),
+            "two readings share a word: {words:?}"
+        );
+        // **The enum's own doc says "Six words"**, and that sentence read "Five"
+        // over six variants until 2026-08-21. A new variant is already a compile
+        // error in `WireReading::word`, which lands its author here; this is what
+        // makes them update the sentence rather than the list alone.
+        assert_eq!(
+            words.len(),
+            6,
+            "`WireReading`'s doc comment states six words and this list carries \
+             {}: one of the two is now wrong, which is the defect that sentence \
+             carried for its whole life",
+            words.len()
+        );
+    }
+
+    /// **One leaked byte is a leak** (plan §18 item 85's repair, 2026-08-21).
+    ///
+    /// The threshold read `gated_delivered * 4 >= control` — a quarter of the
+    /// payload — while [`WireReading::PartlyGated`]'s doc said *"Some of the payload
+    /// crossed anyway"*. Measured on the unfixed tree, every rung of
+    /// 1/8/64/128/200/255 of 1024 reported `gated` with `honoured_on_the_wire:
+    /// true`, and 256 was the first to flip. A quarter of a payload crossing a gate
+    /// that reports `honoured` is the exact state this item exists to name.
+    ///
+    /// The rung that proves it is **one byte**, not 255: a guard written at the old
+    /// boundary would pass on any threshold at all below a quarter, and the property
+    /// is that there is no tolerance rather than that the tolerance is smaller.
+    #[test]
+    fn p15_wire_reading_calls_a_single_leaked_byte_a_leak() {
+        for gated in [1u64, 8, 64, 128, 200, 255, 256] {
+            let (r, why) =
+                p15_wire_reading(wire_facts(true, true, gated, 1024 - gated, 1024, 1024));
+            assert_eq!(
+                r,
+                WireReading::PartlyGated,
+                "{gated} of 1024 bytes crossed while the peer held RTS low and this \
+                 reading is not `partly-gated`: {why}"
+            );
+            assert_eq!(
+                r.honoured_on_the_wire(),
+                Some(false),
+                "a link that let {gated} bytes through under backpressure reported \
+                 the flag honoured on the wire: {why}"
+            );
+        }
+        // The other side of the boundary, so the assertion above is a boundary and
+        // not a blanket: nothing crossing is what the hardware of record measures.
+        let (r, why) = p15_wire_reading(wire_facts(true, true, 0, 1024, 1024, 1024));
+        assert_eq!(r, WireReading::Gated, "{why}");
+        assert_eq!(r.honoured_on_the_wire(), Some(true));
+    }
+
+    /// **The release is read for content, not only for length** (plan §18 item 85's
+    /// repair, 2026-08-21).
+    ///
+    /// `released_after_peer_raised_rts` is a count, and the claim the release exists
+    /// to support — the payload was *deferred* rather than dropped — is a statement
+    /// about bytes. Until this field the two were the same number: a transmitter
+    /// that discarded the payload and then emitted 1024 bytes of anything at all
+    /// read `gated`.
+    #[test]
+    fn p15_wire_reading_reads_the_release_for_content_and_not_only_for_its_length() {
+        let honest = wire_facts(true, true, 0, 1024, 1024, 1024);
+        let (r, why) = p15_wire_reading(honest);
+        assert_eq!(r, WireReading::Gated, "{why}");
+
+        let garbled = WireFacts {
+            released_intact: false,
+            ..honest
+        };
+        let (r, why) = p15_wire_reading(garbled);
+        assert_eq!(
+            r,
+            WireReading::GatedThenLost,
+            "a release of the right length carrying the wrong bytes read as flow \
+             control honoured on the wire: {why}"
+        );
+        assert_eq!(r.honoured_on_the_wire(), Some(false));
+        assert!(
+            why.contains("not the payload's continuation"),
+            "the sentence must say which half failed, since the count is intact: {why}"
+        );
+    }
+
+    /// **The release comparison itself, driven without a peer** — the half of plan
+    /// §18 item 85's repair that a rig would otherwise be the only thing to execute.
+    #[test]
+    fn p15_release_intact_compares_bytes_and_not_counts() {
+        let payload: Vec<u8> = (0..1024u32).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect();
+        let cell = |delivered: u64, intact: bool| WireCell {
+            cts_at_transmitter: Some(false),
+            accepted: 1024,
+            delivered,
+            intact,
+        };
+
+        // The bench of record: nothing crossed, everything came back.
+        assert!(p15_release_intact(&payload, &cell(0, true), &payload));
+        // A stall that let 100 bytes through and then released the rest.
+        assert!(p15_release_intact(
+            &payload,
+            &cell(100, true),
+            &payload[100..]
+        ));
+        // The right *number* of bytes, from the wrong place: this is the state a
+        // count cannot see, and the whole reason the field exists.
+        assert!(
+            !p15_release_intact(&payload, &cell(0, true), &payload[1..]),
+            "a release shifted by one byte passed a byte-for-byte comparison"
+        );
+        let mut flipped = payload.clone();
+        flipped[512] ^= 0xFF;
+        assert!(
+            !p15_release_intact(&payload, &cell(0, true), &flipped),
+            "a release with one byte changed passed a byte-for-byte comparison"
+        );
+        // A gated cell that delivered garbage cannot say where the continuation
+        // starts, so nothing after it is certified.
+        assert!(!p15_release_intact(
+            &payload,
+            &cell(100, false),
+            &payload[100..]
+        ));
+        // Vacuously true on an empty release — stated, because the count beside it
+        // in the JSON is what separates that case and this assertion is what keeps
+        // the two fields from being read as one.
+        assert!(p15_release_intact(&payload, &cell(0, true), &[]));
+    }
+
+    /// **The emitter is pinned by running it** (plan §18 item 85's repair,
+    /// 2026-08-21) — AGENTS §3's remedy in its own words: construct the
+    /// not-running case and require the output to differ.
+    ///
+    /// [`every_p15_row_carries_a_wire_cell_whatever_it_could_measure`] was named as
+    /// this pin and is not one: it builds a [`WireFlowReading`] by hand and asserts
+    /// what [`FlowReadback::observations`] does with it, so it pins the
+    /// *serialisation* and never the measurement. Measured, on this tree: planting
+    /// `return;` at the top of [`p15_attach_wire_readings`] — the binary quietly
+    /// stopping taking the reading, which is precisely the case the gate files'
+    /// tolerance for a missing `wire_flow_control` key makes invisible — left
+    /// `cargo test -p serial-nexus-doctor` at **112 passed / 0 failed** (that being
+    /// the binary's whole suite when the plant was run).
+    ///
+    /// **It needs no hardware, and the arm that needs a peer is still pinned.** The
+    /// certified-crossing arm is driven with two paths that cannot be opened, so it
+    /// reaches [`p15_wire_pair`] and comes back carrying that open's error — which
+    /// is a statement that the measurement *ran*, and is the one thing an early
+    /// `return` cannot produce. The `Termios` the arm needs comes off a pts slave
+    /// rather than off the `PtyMaster`, because Darwin answers `ENOTTY` on the
+    /// master (notes §3.93, and the software half's own test carries the same note).
+    #[test]
+    fn p15_attaches_every_wire_cell_by_running_the_measurement() {
+        let master = new_master().expect("a pty master opens");
+        let pts = sys::ptsname(&master).expect("the master names its slave");
+        let slave = open(pts.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
+            .expect("the pts slave opens");
+        let baseline = tcgetattr(&slave).expect("the slave has a termios");
+
+        const A: &str = "/nonexistent/snx-p15-wire-a";
+        const B: &str = "/nonexistent/snx-p15-wire-b";
+        let pair = |crossing: Option<bool>| VerifiedPair {
+            a: PathBuf::from(A),
+            b: PathBuf::from(B),
+            a_name: A.to_owned(),
+            b_name: B.to_owned(),
+            both_uart: true,
+            baseline_ok: true,
+            rts_cts_crossing: crossing,
+        };
+        // **The not-running case, built rather than imagined**: the rows exactly as
+        // `p15_flow_control_readback` hands them over, with the sentinel still on
+        // them. Every arm below is required to differ from *this* JSON.
+        let untouched: Vec<serde_json::Value> = [A, B]
+            .iter()
+            .map(|p| flow_row(p, true, true, true).observations()["wire_flow_control"].clone())
+            .collect();
+        assert_eq!(
+            untouched[0]["unmeasurable_here"],
+            serde_json::json!(P15_WIRE_NOT_ATTEMPTED),
+            "the fixture no longer carries the sentinel, so this test compares \
+             against the wrong not-running case"
+        );
+
+        let attach = |pairs: &[VerifiedPair], ports: &[&str]| -> Vec<serde_json::Value> {
+            let mut rows: Vec<FlowReadback> = ports
+                .iter()
+                .map(|p| flow_row(p, true, true, true))
+                .collect();
+            let baselines: Vec<nix::sys::termios::Termios> =
+                ports.iter().map(|_| baseline.clone()).collect();
+            p15_attach_wire_readings(&mut rows, &baselines, pairs);
+            rows.iter()
+                .map(|r| r.observations()["wire_flow_control"].clone())
+                .collect()
+        };
+        let reason = |cell: &serde_json::Value| -> String {
+            assert_eq!(
+                cell["measured"],
+                serde_json::json!(false),
+                "no peer exists on this box, so nothing here may read as a \
+                 measurement: {cell}"
+            );
+            cell["unmeasurable_here"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an unmeasured cell must say why (§15.47): {cell}"))
+                .to_owned()
+        };
+
+        // Each arm: the reason it is required to state, and a fragment of it.
+        for (crossing, ports, want) in [
+            (
+                Some(true),
+                &[A, B][..],
+                "would not open for the wire reading",
+            ),
+            (Some(false), &[A, B][..], "P5 read no RTS/CTS crossing"),
+            (None, &[A, B][..], "did not take a handshake reading"),
+        ] {
+            let cells = attach(&[pair(crossing)], ports);
+            for (i, cell) in cells.iter().enumerate() {
+                assert_ne!(
+                    cell, &untouched[i],
+                    "`p15_attach_wire_readings` left row {i} exactly as it found it \
+                     for rts_cts_crossing={crossing:?} — a binary that stopped taking \
+                     the reading emits this same JSON, so nothing here is pinned"
+                );
+                let why = reason(cell);
+                assert!(
+                    why.contains(want),
+                    "row {i}'s cell does not say `{want}` for \
+                     rts_cts_crossing={crossing:?}: {why}"
+                );
+                assert_ne!(
+                    why, P15_WIRE_NOT_ATTEMPTED,
+                    "the sentinel survived into a published cell, which reads as an \
+                     answer and is not one"
+                );
+            }
+        }
+
+        // A row belonging to no pair at all: the sentinel is still replaced, by the
+        // sweep at the end of the function rather than by any arm above it.
+        let cells = attach(&[], &[A]);
+        assert_ne!(cells[0], untouched[0]);
+        let why = reason(&cells[0]);
+        assert!(
+            why.contains("no pair P5 verified contains this port"),
+            "a port in no verified pair must say so: {why}"
+        );
+    }
+
+    /// **The report carries a wire cell for every row it publishes** — the pin one
+    /// level above [`p15_attaches_every_wire_cell_by_running_the_measurement`],
+    /// which drives [`p15_attach_wire_readings`] directly and therefore cannot see
+    /// whether anything still *calls* it.
+    ///
+    /// **This is the second level of one hole, and the second level was found the
+    /// same way as the first.** The emitter's guard exists because planting
+    /// `return;` at the top of [`p15_attach_wire_readings`] left this binary's
+    /// whole suite green. Deleting that emitter's one production call site — the
+    /// `p15_attach_wire_readings(&mut rows, &baselines, pairs);` line in
+    /// [`p15_flow_control_readback`] — then left the *new* guard green too:
+    /// measured on this tree, `cargo test -p serial-nexus-doctor` at **118 passed
+    /// / 0 failed**, with every published row carrying the
+    /// [`P15_WIRE_NOT_ATTEMPTED`] sentinel where an answer belongs. So this test
+    /// asserts over the value [`p15_flow_control_readback`] returns, because the
+    /// claim being made is about a **report** — every row it publishes carries a
+    /// wire cell that says something — and not about a function.
+    ///
+    /// **What level this pin is at, and what still slips past it.** It pins the
+    /// probe entry point: the function `doctor/src/main.rs` calls, one level above
+    /// the emitter. It does **not** run the binary, so it cannot see a `main.rs`
+    /// that stops calling [`p15_flow_control_readback`] or drops P15 from the
+    /// assembled probe list — `expectations/*.jq`'s `any(.probes[]; .id == "P15")`
+    /// clause is the thing that catches a missing probe, and it runs only against
+    /// a report a real run produced. Nor does either level catch a *renamed*
+    /// observation key: both this test and the gate spell `wire_flow_control`, so
+    /// renaming it in the emitter and here in one edit passes both. Level three is
+    /// a report this binary actually printed, and that needs a port.
+    ///
+    /// **It needs no hardware.** Both "ports" are pts slaves, which open and answer
+    /// `tcgetattr`, so [`p15_readback`] produces real rows; the pair is declared
+    /// with `rts_cts_crossing: Some(false)`, the one arm that reaches its answer
+    /// without opening a line or moving a byte.
+    #[test]
+    fn p15s_published_report_carries_a_wire_cell_for_every_row_it_publishes() {
+        let master_a = new_master().expect("a pty master opens");
+        let master_b = new_master().expect("a second pty master opens");
+        let a_pts = sys::ptsname(&master_a).expect("the master names its slave");
+        let b_pts = sys::ptsname(&master_b).expect("the master names its slave");
+        let ports = [PathBuf::from(&a_pts), PathBuf::from(&b_pts)];
+
+        // The published cell for one port, or a panic naming what *was* published:
+        // a test that silently asserts over an absent row is the vacuity this
+        // whole family of guards exists to prevent.
+        let cell = |p: &Probe, port: &str| -> serde_json::Value {
+            p.observations
+                .iter()
+                .find(|o| o.key == port)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P15 published no row for {port}, so this test asserts over \
+                         nothing — published keys: {:?}",
+                        p.observations.iter().map(|o| &o.key).collect::<Vec<_>>()
+                    )
+                })
+                .value["wire_flow_control"]
+                .clone()
+        };
+        let says = |c: &serde_json::Value| -> String {
+            assert_eq!(
+                c["measured"],
+                serde_json::json!(false),
+                "no peer is wired on this box, so nothing here may read as a \
+                 measurement: {c}"
+            );
+            c["unmeasurable_here"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an unmeasured cell must say why (§15.47): {c}"))
+                .to_owned()
+        };
+
+        // Arm one: a pair P5 answered *no crossing* on. The published row has to
+        // carry that answer rather than the sentinel every row is born with.
+        let pairs = [VerifiedPair {
+            a: ports[0].clone(),
+            b: ports[1].clone(),
+            a_name: a_pts.clone(),
+            b_name: b_pts.clone(),
+            both_uart: true,
+            baseline_ok: true,
+            rts_cts_crossing: Some(false),
+        }];
+        let probe = p15_flow_control_readback(&ports, &pairs);
+        for port in [&a_pts, &b_pts] {
+            let why = says(&cell(&probe, port));
+            assert_ne!(
+                why, P15_WIRE_NOT_ATTEMPTED,
+                "the report published the birth sentinel for {port}: nothing called \
+                 `p15_attach_wire_readings`, and the emitter's own guard cannot see \
+                 that because it calls the emitter itself"
+            );
+            assert!(
+                why.contains("P5 read no RTS/CTS crossing"),
+                "{port}'s published cell does not carry P5's answer: {why}"
+            );
+        }
+
+        // Arm two: no pairs at all, which is answered by the sweep at the *end* of
+        // the emitter rather than by any of its per-pair arms. Both arms redden on
+        // the same deleted call, down two different paths through it.
+        let probe = p15_flow_control_readback(&ports, &[]);
+        for port in [&a_pts, &b_pts] {
+            let why = says(&cell(&probe, port));
+            assert_ne!(
+                why, P15_WIRE_NOT_ATTEMPTED,
+                "the report published the birth sentinel for {port} on the no-pair \
+                 path, which reads as an answer and is not one"
+            );
+            assert!(
+                why.contains("no pair P5 verified contains this port"),
+                "{port}'s published cell does not say it had no peer: {why}"
+            );
+        }
+    }
+
+    /// **Every row carries the cell, whatever it could measure** — the guard that
+    /// keeps `expectations/*.jq`'s tolerance from becoming a hole.
+    ///
+    /// The gate files admit a P15 row with no `wire_flow_control` at all, on
+    /// purpose: `docs/doctor/` holds artifacts captured before the key existed and
+    /// they are frozen (§16.13). That tolerance is only safe while something else
+    /// pins the *emitter*, because otherwise a binary that quietly stopped taking
+    /// the reading would pass every clause in the set — AGENTS §3's tell, in the
+    /// register where the missing measurement is the thing being tolerated.
+    ///
+    /// **This test is not that something else, and said it was until 2026-08-21.**
+    /// It builds a [`WireFlowReading`] by hand and asserts what
+    /// [`FlowReadback::observations`] does with it: it pins the *serialisation* —
+    /// which key the cell lands under, which fields survive the encode — and cannot
+    /// see whether anything ever took a reading. Planting `return;` at the top of
+    /// [`p15_attach_wire_readings`] left this test, and the whole binary's suite,
+    /// green at 112 of 112.
+    ///
+    /// **What each guard pins, spelled out, because this paragraph claimed more than
+    /// any single one of them delivers.** Until later on 2026-08-21 it closed by
+    /// naming [`p15_attaches_every_wire_cell_by_running_the_measurement`] as *the*
+    /// pin — inside a paragraph that defines pinning as catching "a binary that
+    /// quietly stopped taking the reading" — and that was false: that guard calls
+    /// [`p15_attach_wire_readings`] itself, so it pins the **emitter's body** and is
+    /// blind to its caller. Deleting the emitter's one production call site in
+    /// [`p15_flow_control_readback`] left it, and the rest of this binary's suite,
+    /// green at 118 of 118. Three guards, three levels, and each states its own:
+    /// this one pins the **serialisation**; that one pins the **emitter's body**;
+    /// [`p15s_published_report_carries_a_wire_cell_for_every_row_it_publishes`] pins
+    /// the **probe entry point's published rows**, which is the level the deleted
+    /// call reddens. None of the three runs the binary, so a `main.rs` that stopped
+    /// calling [`p15_flow_control_readback`] or dropped P15 from the report is
+    /// caught by none of them — that is `expectations/*.jq`'s
+    /// `any(.probes[]; .id == "P15")` clause, against a report a real run produced.
+    #[test]
+    fn every_p15_row_carries_a_wire_cell_whatever_it_could_measure() {
+        let unmeasured = flow_row("/dev/ttyUSB0", true, true, true);
+        let v = unmeasured.observations();
+        let cell = &v["wire_flow_control"];
+        assert_eq!(cell["measured"], serde_json::json!(false));
+        assert!(cell["asks"].is_string(), "no sub-question: {cell}");
+        assert!(
+            cell["unmeasurable_here"].is_string(),
+            "an unmeasurable cell must say why (§15.47): {cell}"
+        );
+        assert!(
+            cell["does_not_license"].is_string(),
+            "the bound is the one thing this cell may never lose: {cell}"
+        );
+
+        let mut measured = flow_row("/dev/ttyUSB0", true, true, true);
+        measured.wire = Ok(WireFlowReading {
+            peer: "/dev/ttyUSB1".to_owned(),
+            gated: WireCell {
+                cts_at_transmitter: Some(false),
+                accepted: 1024,
+                delivered: 0,
+                intact: true,
+            },
+            released_delivered: 1024,
+            released_intact: true,
+            cts_after_release: Some(true),
+            flag_off: WireCell {
+                cts_at_transmitter: Some(false),
+                accepted: 1024,
+                delivered: 1024,
+                intact: true,
+            },
+            peer_ready: WireCell {
+                cts_at_transmitter: Some(true),
+                accepted: 1024,
+                delivered: 1024,
+                intact: true,
+            },
+            reading: WireReading::Gated,
+            why: "…".to_owned(),
+        });
+        let v = measured.observations();
+        let cell = &v["wire_flow_control"];
+        assert_eq!(cell["measured"], serde_json::json!(true));
+        assert_eq!(cell["reading"], serde_json::json!("gated"));
+        assert_eq!(cell["honoured_on_the_wire"], serde_json::json!(true));
+        // **The proxy is carried beside the answer and is not the answer.** All
+        // three cells accepted the whole payload on the bench where flow control
+        // works, which is why plan §18 item 85's own instrument — bytes the writer
+        // got rid of — could not have separated the two states at this payload
+        // size, and why the delivered counts are what the reading folds.
+        assert_eq!(
+            cell["flag_on_peer_not_ready"]["bytes_accepted_by_the_kernel"],
+            cell["control_flag_off_peer_not_ready"]["bytes_accepted_by_the_kernel"],
+            "this fixture is the measured bench: acceptance does not discriminate"
+        );
+        assert_ne!(
+            cell["flag_on_peer_not_ready"]["bytes_delivered_to_the_peer"],
+            cell["control_flag_off_peer_not_ready"]["bytes_delivered_to_the_peer"],
+            "delivery is what separates them"
+        );
+        assert!(cell["does_not_license"].is_string());
+    }
+
+    /// The wire note names the ports it found and states the bound the whole
+    /// decision rests on: nothing is refused on this reading (§7.1 clause 2).
+    #[test]
+    fn p15s_wire_note_names_its_ports_and_refuses_to_imply_a_refusal() {
+        let mut inert = flow_row("/dev/ttyACM0", true, true, true);
+        inert.wire = Ok(WireFlowReading {
+            peer: "/dev/ttyACM1".to_owned(),
+            gated: WireCell {
+                cts_at_transmitter: Some(false),
+                accepted: 44672,
+                delivered: 44672,
+                intact: true,
+            },
+            released_delivered: 0,
+            released_intact: true,
+            cts_after_release: Some(true),
+            flag_off: WireCell {
+                cts_at_transmitter: Some(false),
+                accepted: 44672,
+                delivered: 44672,
+                intact: true,
+            },
+            peer_ready: WireCell {
+                cts_at_transmitter: Some(true),
+                accepted: 44672,
+                delivered: 44672,
+                intact: true,
+            },
+            reading: WireReading::Inert,
+            why: "…".to_owned(),
+        });
+        let note = p15_wire_note(std::slice::from_ref(&inert));
+        assert!(
+            note.contains("/dev/ttyACM0"),
+            "the note must name the port: {note}"
+        );
+        assert!(
+            note.contains("Nothing is refused on this reading"),
+            "the note must state §7.1 clause 2's bound, which is the decision this \
+             whole reading was taken under: {note}"
+        );
+
+        // A bench that could not be stimulated is reported, and is not a defect.
+        let mut no_path = flow_row("/dev/ttyACM0", true, true, true);
+        no_path.wire = Ok(WireFlowReading {
+            reading: WireReading::NoCtsPath,
+            ..match inert.wire {
+                Ok(w) => w,
+                Err(_) => unreachable!(),
+            }
+        });
+        let note = p15_wire_note(std::slice::from_ref(&no_path));
+        assert!(
+            note.contains("about the bench and not about the driver"),
+            "a bench reading printed as a driver finding is item 92's harm one \
+             instrument over: {note}"
+        );
+        assert!(
+            !note.contains("does not act on it"),
+            "the inert sentence leaked into the bench arm: {note}"
+        );
     }
 
     /// **Both arms ship; only one runs per kernel.** Linux honours `CRTSCTS` and
@@ -11637,6 +13405,7 @@ mod tests {
     #[test]
     fn p15_ranks_a_daemon_disagreement_below_a_failed_restore_and_above_its_own_finding() {
         let disagreeing = |port: &str, honoured: bool, restored: bool| FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             shipped_predicate_agrees: Some(false),
             ..flow_row(port, true, honoured, restored)
         };
@@ -11663,6 +13432,7 @@ mod tests {
         // And agreement on a clean port is not a finding at all — the arm must not
         // fire on `None` (the predicate could not run), which is not a disagreement.
         let unmeasured = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             shipped_predicate_agrees: None,
             ..flow_row("/dev/ttyUSB0", true, true, true)
         };
@@ -11670,6 +13440,387 @@ mod tests {
             p15_verdict(1, &[unmeasured], &[]).0,
             Status::Supported
         ));
+    }
+
+    /// **The software half's cross-check, and the two rank relationships that hold it
+    /// in place** (plan §18 item 73).
+    ///
+    /// This is the hardware test above, one mode over, and it exists because for a long
+    /// time it could not be written: `SoftFlowReadback` carried no
+    /// `shipped_predicate_agrees` at all, so the probe's hand-rolled software reading
+    /// and `honours_flow_control`'s `XonXoff` arm were two implementations of one
+    /// question with nothing between them — the shape §7.1 clause 2 forbids. While plan
+    /// §18 item 14's decline stood that was a *narrowness*: nothing consulted the
+    /// software cell, so a drift moved no verdict. §15.61 made it consequential, because
+    /// an accept-then-drop software answer now refuses an operator's `load`.
+    ///
+    /// The rows carry the divergence as a driver would produce it (see
+    /// [`soft_row_disagreeing`]) rather than as a flipped verdict cell, so what is
+    /// asserted here is the arm an operator would actually meet.
+    #[test]
+    fn p15s_software_cross_check_degrades_and_outranks_every_finding_but_its_hardware_twin() {
+        let soft_disagrees = |port: &str, hw_honoured: bool, restored: bool| FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row(port, true, hw_honoured, restored)
+        };
+
+        // It fires at all, and it degrades. **Asserted with `starts_with` against this
+        // arm's own headline**, because every phrase that would otherwise identify it —
+        // "answer differently", "SOFTWARE", the port name — is also in the note that
+        // every arm appends, so a `contains` here would pass on the note while this arm
+        // sat unexecuted. That is AGENTS §3's weaker-than-its-comment register, and it
+        // is easy to write by accident in exactly this function.
+        let (s, c) = p15_verdict(1, &[soft_disagrees("/dev/ttyUSB0", true, true)], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.starts_with(
+                "**The hardware half of this cross-check agrees here and the software half does not.**"
+            ),
+            "the software cross-check must lead the verdict with its own headline: {c}"
+        );
+        // The port still has to reach the operator — the headline counts, the note names.
+        assert!(
+            c.contains("/dev/ttyUSB0"),
+            "the verdict must name the port it is about somewhere: {c}"
+        );
+
+        // **Above the hardware dropped-request finding.** This row *also* accepts a
+        // `CRTSCTS` request and reads it back clear, so if the ranking were the other
+        // way round the `CRTSCTS` text would win — which is what makes this assertion
+        // pin an ordering rather than restate the arm above.
+        let (s, c) = p15_verdict(1, &[soft_disagrees("/dev/ttyUSB0", false, true)], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.starts_with(
+                "**The hardware half of this cross-check agrees here and the software half does not.**"
+            ),
+            "a software disagreement must outrank the dropped-CRTSCTS finding: {c}"
+        );
+
+        // **Below its hardware twin.** Both halves disagree here; the hardware sentence
+        // leads, for stability rather than importance — since §15.61 the two carry the
+        // same shipped consequence, so a reader must not see the headline move.
+        let both = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            shipped_predicate_agrees: Some(false),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let (s, c) = p15_verdict(1, &[both], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.starts_with(
+                "**This report and the daemon would answer differently about /dev/ttyUSB0.**"
+            ),
+            "the hardware disagreement must still lead when both halves disagree: {c}"
+        );
+
+        // **Below a failed restore**, which outranks every finding in this probe: a
+        // reconfigured adapter is a worse outcome than an unanswered question.
+        let (s, c) = p15_verdict(1, &[soft_disagrees("/dev/ttyUSB0", true, false)], &[]);
+        assert!(matches!(s, Status::Degraded));
+        assert!(
+            c.contains("could not restore"),
+            "a failed restore must still outrank the software disagreement: {c}"
+        );
+
+        // **`None` is not a disagreement.** The predicate could not open the port, which
+        // §7.1 makes unmeasured and never a refusal; an arm that fired on it would
+        // degrade every box where the daemon cannot reach a device the probe already
+        // holds.
+        let unmeasured = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(SoftFlowReadback {
+                shipped_predicate_agrees: None,
+                ..soft_row_disagreeing()
+            }),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let (s, c) = p15_verdict(1, &[unmeasured], &[]);
+        assert!(
+            matches!(s, Status::Supported),
+            "a predicate that could not run is unmeasured, not a disagreement: {c}"
+        );
+        assert!(
+            !c.contains("answer differently"),
+            "an unmeasured cross-check must not print a disagreement: {c}"
+        );
+    }
+
+    /// **A higher-ranked finding must not be able to hide the software disagreement.**
+    ///
+    /// The verdict is one sentence and the arms return early, so every ranking decision
+    /// is also a decision about what a reader never sees. `p15_soft_note` is appended by
+    /// each arm that measured a port, and the disagreement sentence is printed from
+    /// *there* precisely so that the two arms ranked above it — a failed restore and the
+    /// hardware disagreement — carry it too.
+    ///
+    /// This is the register AGENTS §3 calls a gate whose passing output is identical to
+    /// its not-running output: without this test the arm above could be reordered, or
+    /// the sentence moved into the arm body, and the only visible effect would be a
+    /// sentence quietly missing from the reports that need it most.
+    #[test]
+    fn p15s_software_disagreement_survives_the_two_arms_ranked_above_it() {
+        let soft = soft_row_disagreeing();
+
+        // Ranked above it #1: the hardware disagreement.
+        let hw = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            shipped_predicate_agrees: Some(false),
+            soft: Ok(soft),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let (_, c) = p15_verdict(1, &[hw], &[]);
+        assert!(
+            c.contains(
+                "SOFTWARE flow control: this report and the daemon would answer differently"
+            ),
+            "the hardware disagreement arm dropped the software one: {c}"
+        );
+
+        // Ranked above it #2: a port this probe could not put back.
+        let unrestored = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row("/dev/ttyUSB0", true, true, false)
+        };
+        let (_, c) = p15_verdict(1, &[unrestored], &[]);
+        assert!(
+            c.contains("could not restore"),
+            "the restore failure must still lead: {c}"
+        );
+        // The restore arm deliberately carries NO soft note — nothing below it should be
+        // trusted, which is the one place suppression is the right answer. Asserted so
+        // the exemption is a decision on the record rather than an oversight.
+        assert!(
+            !c.contains("SOFTWARE flow control: this report and the daemon"),
+            "the unrestored arm says nothing below it can be trusted, so it must not \
+             also print a finding as though it could: {c}"
+        );
+    }
+
+    /// The cell reaches the JSON, under the key both expectation files gate.
+    ///
+    /// A field computed and never emitted is a cross-check no operator and no gate can
+    /// read; this asserts the wire name and the `null` spelling of "the predicate could
+    /// not run", which is the one the jq clause admits and the other cells refuse.
+    #[test]
+    fn p15s_software_cross_check_reaches_the_json_and_null_is_its_unmeasured_spelling() {
+        let agreeing = flow_row("/dev/ttyUSB0", true, true, true);
+        let v = agreeing.observations();
+        assert_eq!(
+            v["software_flow_control"]["shipped_predicate_agrees"],
+            serde_json::json!(true),
+            "the software cross-check is missing from the report: {v}"
+        );
+
+        let disagreeing = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        assert_eq!(
+            disagreeing.observations()["software_flow_control"]["shipped_predicate_agrees"],
+            serde_json::json!(false)
+        );
+
+        let unmeasured = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(SoftFlowReadback {
+                shipped_predicate_agrees: None,
+                ..soft_row_disagreeing()
+            }),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let v = unmeasured.observations()["software_flow_control"].clone();
+        assert!(
+            v.get("shipped_predicate_agrees")
+                .is_some_and(|x| x.is_null()),
+            "an unmeasured cross-check must be present and null, never absent — absent \
+             is the shape a reverted emitter produces and the gate refuses it: {v}"
+        );
+    }
+
+    /// **The cross-check compares the two *fate-deciding* readings, and that choice
+    /// is the whole value of the field** (plan §18 item 73).
+    ///
+    /// `honours_flow_control`'s `XonXoff` arm answers on `contains(IXON|IXOFF)`, a
+    /// two-flag subset test. This probe compares the **whole** `c_iflag` word, which
+    /// is `serial2`'s own comparison and the one that decides whether the node's open
+    /// faults. Classifying the by-hand arm from `honoured()` instead would make the
+    /// two halves agree **by construction** on the one port where they can differ —
+    /// item 56 one mode over, a cross-check between readings that cannot disagree —
+    /// and the report would carry a `true` that means nothing.
+    ///
+    /// **Nothing guarded that until this test.** The decision lived inline in
+    /// `p15_flow_readback`, reachable only through a real serial port, and replacing
+    /// `s.iflag_matches_request` with `s.honoured()` compiled and left all 112 tests
+    /// in this binary green (measured 2026-08-21 by planting exactly that, at
+    /// `800915b` plus this session's work). The production body now takes the shipped
+    /// predicate's answer as an argument, so the guard drives *it* rather than a
+    /// second spelling of it — the plant reddens here.
+    ///
+    /// The witness is [`soft_row_disagreeing`], built as a driver would produce it:
+    /// `tcsetattr` succeeded, both flags read back set, and the whole word still does
+    /// not match the request. Both assertions are needed: the first pins the answer,
+    /// the second pins that the mirroring rule really would have answered the other
+    /// way on this same witness, so a future reader can see the guard is about a
+    /// separation rather than about a constant.
+    #[test]
+    fn p15s_software_cross_check_compares_the_fate_deciding_readings() {
+        let witness = soft_row_disagreeing();
+
+        // The mirroring reading and the fate-deciding one genuinely separate here.
+        // Without this the test below could pass on a witness where they agree, which
+        // is the vacuous shape AGENTS §3 names.
+        assert_eq!(
+            FlowOutcome::classify(witness.tcsetattr_ok, witness.honoured()),
+            FlowOutcome::Honoured,
+            "the fixture no longer separates the two readings, so nothing below it \
+             tests anything"
+        );
+        assert_eq!(
+            FlowOutcome::classify(witness.tcsetattr_ok, witness.iflag_matches_request),
+            FlowOutcome::AcceptedThenDropped,
+            "the whole-word comparison must place this witness in the arm serial2 \
+             would fault on"
+        );
+
+        // The shipped predicate's subset test says `Honoured` on this port. The field
+        // must therefore read `false`: the two implementations answer differently, and
+        // that is exactly what §7.1 clause 2 forbids them to do unnoticed.
+        let mut soft = Ok(soft_row_disagreeing());
+        p15_fill_soft_cross_check(&mut soft, || Ok(FlowOutcome::Honoured));
+        assert_eq!(
+            soft.as_ref().unwrap().shipped_predicate_agrees,
+            Some(false),
+            "the by-hand arm is being classified from the flag pair rather than from \
+             the whole-word comparison: the two halves now agree by construction on \
+             the only port that can separate them, which is the defect this field \
+             exists to make visible"
+        );
+
+        // And it is not stuck at `false`: a predicate that reaches the same arm agrees.
+        let mut soft = Ok(soft_row_disagreeing());
+        p15_fill_soft_cross_check(&mut soft, || Ok(FlowOutcome::AcceptedThenDropped));
+        assert_eq!(
+            soft.as_ref().unwrap().shipped_predicate_agrees,
+            Some(true),
+            "agreement over the fate-deciding arm must still read as agreement"
+        );
+
+        // A predicate that could not open the port is unmeasured, never a disagreement.
+        let mut soft = Ok(soft_row(true, true));
+        p15_fill_soft_cross_check(&mut soft, || Err(nix::errno::Errno::ENOENT));
+        assert_eq!(
+            soft.as_ref().unwrap().shipped_predicate_agrees,
+            None,
+            "a predicate that could not run must leave the cell null"
+        );
+
+        // An unmeasurable read-back has no cell to fill and must not become one.
+        let mut soft: Result<SoftFlowReadback, String> = Err("tcgetattr: ENOTTY".to_owned());
+        p15_fill_soft_cross_check(&mut soft, || Ok(FlowOutcome::Honoured));
+        assert!(
+            soft.is_err(),
+            "a port whose read-back failed must stay unmeasured"
+        );
+    }
+
+    /// **A report may not clear and dispute the same port in one paragraph** (plan
+    /// §18 item 73).
+    ///
+    /// `p15_soft_note` prints the disagreement sentence — *neither reading can be
+    /// trusted until they are reconciled* — from the top of the note, and printed the
+    /// honoured sentence — *this reading clears these port(s) rather than merely
+    /// describing them* — from the bottom, counting every measured row that read the
+    /// flags back set. A port whose software cross-check disagreed is such a row, so
+    /// one paragraph refused and cleared it at once, and the clearing sentence is the
+    /// one a reader acts on because it is the one that names an outcome. That is the
+    /// same harm plan §18 item 92 found in `skip_no_rig_flow`'s hard-fail message: a
+    /// softened diagnosis is worth nothing while the sentence the operator acts on
+    /// still says the old thing.
+    #[test]
+    fn p15s_honoured_arm_does_not_clear_a_port_whose_cross_check_disagreed() {
+        let disputed = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let (_, c) = p15_verdict(1, &[disputed], &[]);
+
+        assert!(
+            c.contains("Neither reading can be trusted until they are reconciled"),
+            "the disagreement must still be reported: {c}"
+        );
+        assert!(
+            !c.contains("clears these port(s) rather than merely describing them"),
+            "the report clears a port whose software cross-check just failed, in the \
+             same paragraph that refuses it: {c}"
+        );
+        assert!(
+            c.contains("not** a clearance") && c.contains("/dev/ttyUSB0"),
+            "a disputed port must still be told what its read-back said, and told that \
+             the reading settles nothing: {c}"
+        );
+
+        // The clearing sentence is not simply gone: a port whose cross-check agreed
+        // still gets it, and gets a count that no longer includes the disputed one.
+        let (_, c) = p15_verdict(1, &[flow_row("/dev/ttyUSB1", true, true, true)], &[]);
+        assert!(
+            c.contains("1 of 1 named port(s) honoured it on read-back")
+                && c.contains("clears these port(s)"),
+            "an agreeing honoured port must still be cleared: {c}"
+        );
+
+        // **The bench of record's own sentence, pinned.** `docs/doctor/
+        // linux-7.0-2026-08-21-800915b-dirty-tier3.json` carries P15's consequence
+        // ending "2 of 2 named port(s) honoured it on read-back … so this reading
+        // clears these port(s) rather than merely describing them", from two ports
+        // whose cross-check agreed. Splitting the count must leave that capture
+        // reproducible, or the repair would have silently invalidated the artifact
+        // the item was executed against.
+        let (_, c) = p15_verdict(
+            1,
+            &[
+                flow_row("/dev/ttyUSB0", true, true, true),
+                flow_row("/dev/ttyUSB1", true, true, true),
+            ],
+            &[],
+        );
+        assert!(
+            c.contains(
+                "2 of 2 named port(s) honoured it on read-back. The verdict answers for this \
+                 half too since §15.59 widened the question, and since §15.61 the daemon \
+                 consults the same reading: a `load`/`add-node` pre-check asks this port the \
+                 same question this probe just asked it. A port that **honours** the mode is \
+                 not refused — the refusal fires on accept-then-drop alone — so this reading \
+                 clears these port(s) rather than merely describing them."
+            ),
+            "the committed 800915b capture's P15 sentence is no longer reproducible: {c}"
+        );
+
+        // Mixed: one cleared, one disputed. The count must name one, not two — a
+        // denominator-only fix would leave the disputed port inside the clearance.
+        let disputed = FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
+            soft: Ok(soft_row_disagreeing()),
+            ..flow_row("/dev/ttyUSB0", true, true, true)
+        };
+        let (_, c) = p15_verdict(
+            1,
+            &[flow_row("/dev/ttyUSB1", true, true, true), disputed],
+            &[],
+        );
+        assert!(
+            c.contains("1 of 2 named port(s) honoured it on read-back"),
+            "the clearance must count only the ports it may clear: {c}"
+        );
+        assert!(
+            c.contains("not** a clearance") && c.contains("/dev/ttyUSB0"),
+            "the disputed port must be named as the one that is not cleared: {c}"
+        );
     }
 
     /// **The software reading moves the verdict, ranked below the hardware one,
@@ -11706,6 +13857,7 @@ mod tests {
     fn p15s_software_finding_degrades_the_verdict_and_refuses_the_dropping_port() {
         // A clean hardware fleet whose driver silently drops the software mode.
         let dropping = [FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             soft: Ok(soft_row(true, false)),
             ..flow_row("/dev/ttyUSB0", true, true, true)
         }];
@@ -11752,6 +13904,7 @@ mod tests {
         // does not move under a reader — asserted because it is stable, not because
         // one finding outranks the other.
         let both = [FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             soft: Ok(soft_row(true, false)),
             ..flow_row("/dev/cu.usbserial-A", true, false, true)
         }];
@@ -11787,6 +13940,7 @@ mod tests {
         // An honest refusal: `tcsetattr` failed rather than reporting success over a
         // clear flag. Nothing to act on, and it must not be reported as a drop.
         let refused = [FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             soft: Ok(soft_row(false, false)),
             ..flow_row("/dev/ttyS9", true, true, true)
         }];
@@ -11804,6 +13958,7 @@ mod tests {
         // Unmeasurable is data, not absence (§15.47): the port is named and the
         // sentence never reads as an answer.
         let unmeasured = [FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             soft: Err("tcgetattr after xon-xoff: ENOTTY".to_owned()),
             ..flow_row("/dev/ttyUSB1", true, true, true)
         }];
@@ -11858,6 +14013,7 @@ mod tests {
     #[test]
     fn p15_ranks_an_unrestored_port_above_the_software_reading_too() {
         let rows = [FlowReadback {
+            wire: Err(P15_WIRE_NOT_ATTEMPTED.to_owned()),
             soft: Ok(soft_row(true, false)),
             ..flow_row("/dev/ttyUSB0", true, true, false)
         }];
@@ -13156,6 +15312,8 @@ mod tests {
             // The arm under test: discovery paired them, the certificate's rate
             // ladder did not round-trip, so the question cannot be asked.
             baseline_ok: false,
+            // P14 does not read it; P15's wire half does (plan §18 item 85).
+            rts_cts_crossing: None,
         };
         let ports = vec![pair.a.clone(), pair.b.clone()];
         let p = p14_max_rate(&ports, std::slice::from_ref(&pair));

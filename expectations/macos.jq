@@ -237,6 +237,23 @@ and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipp
 # way, and the reading cells are required exactly when it is `true`. The population
 # is required to be non-empty, because an `all` over zero ports is the vacuous pass
 # this file's P4 clause already exists to prevent.
+#
+# **`shipped_predicate_agrees` joined this clause at plan §18 item 73**, when the
+# software half finally got the cross-check the hardware half has had since notes
+# §3.67: `honours_flow_control(.., XonXoff)` is the predicate `load` consults, and until
+# then the probe's hand-rolled software reading had nothing comparing it to that
+# predicate — two implementations, no comparison, which is the shape §7.1 clause 2
+# forbids. Adding the key moves `field_set` and closes **no** era (§13's era law clause
+# 4), exactly as the software block's own arrival did.
+#
+# **Its disposition on `null` is the OPPOSITE of every other cell here, and that is the
+# point of spelling it with `has` rather than with `type` alone.** `null` is a real
+# answer — the predicate could not open the port, which §7.1 makes *unmeasured* and
+# never a refusal — so a present `null` must pass. An *absent* key is the shape a
+# reverted emitter produces, and `type` alone cannot tell the two apart, because a
+# missing path in jq evaluates to `null`. So the clause asks both questions. The
+# **answer** stays free here as everywhere in this block: a `false` is a finding the
+# probe degrades on and reports, not a lane to fail.
 and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
       (($p.observations | map(select(.value | type == "object")) | length) > 0
        and ($p.observations | map(select(.value | type == "object")) | all(
@@ -247,7 +264,74 @@ and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipp
                   or ((.value.software_flow_control.tcsetattr_ok | type == "boolean")
                       and (.value.software_flow_control.honoured_on_readback | type == "boolean")
                       and (.value.software_flow_control.silently_dropped | type == "boolean")
-                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean"))))))))
+                      and (.value.software_flow_control.serial2_readback_would_fault | type == "boolean")
+                      and (.value.software_flow_control | has("shipped_predicate_agrees"))
+                      and (.value.software_flow_control.shipped_predicate_agrees | type | . == "boolean" or . == "null"))))))))
+# **P15's WIRE half** (plan §18 item 85, design §15.73). §15.53 separates two
+# driver states *by read-back*, and there is a third it cannot see: a driver that
+# keeps `CRTSCTS` in `c_cflag` and never acts on it. No read-back can catch that one
+# — the read-back is what it satisfies — so the reading is taken by moving bytes
+# between two ports P5 has certified as carrying RTS/CTS both ways: the payload is
+# transmitted while the peer holds RTS low, and what the peer RECEIVES is counted,
+# against two control cells on the same wire (the flag off, and the peer ready).
+# Identical in both expectation files for the reason the two clauses above carry:
+# the interesting arm is a driver that keeps the flag and ignores it, and a clause
+# that only ran where the wire DOES gate could never catch it.
+#
+# **Absence passes, and that is deliberate rather than lenient.** `docs/doctor/`
+# holds artifacts captured before this key existed and they are frozen (§16.13), so
+# a clause requiring presence would be an instrument-version detector — the
+# disposition this file's `field_set` clause spells out at length. The hole that
+# tolerance would otherwise leave (a binary that quietly stopped taking the reading
+# passing every clause here) is closed where it can be closed without dating an
+# artifact: `every_p15_row_carries_a_wire_cell_whatever_it_could_measure` pins the
+# **emitter**, so the two together say what neither says alone.
+#
+# **Presence and type, never the answer** — with one exception that is not an
+# answer. A `gated` reading is a positive claim about a driver, and this probe
+# promises it only ever issues one with its own stimulus control satisfied: the
+# transmitter's CTS read low while the peer held RTS low. So a report claiming
+# `gated` over a `cts_at_transmitter` that is anything else is refused here, exactly
+# as a `supported` P14 carrying no measured ceiling is. Everything else stays free:
+# `inert`, `partly-gated`, `gated-then-lost`, `no-cts-path` and `unmeasurable` are
+# all legitimate readings of a legitimate bench, and a clause pinning one of them
+# would encode a policy §7.1 clause 2 explicitly declines to write — nothing in the
+# daemon consults this cell and no `load` is refused on it.
+#
+# **The two control cells are required whenever the reading was taken**, and that is
+# the clause's teeth: a gated cell with nothing to compare it against is the vacuity
+# this item exists to prevent — a link that carries nothing delivers the same zero a
+# held transmitter does.
+#
+# **The release is required to carry its content check as well as its count**
+# (`released_intact`, 2026-08-21). `released_after_peer_raised_rts` is a `Vec::len()`,
+# and the claim the release supports — the payload was *deferred* rather than dropped
+# — is about bytes; a reading that publishes only the count states less than the
+# sentence beside it claims.
+and (all(.probes[]; . as $p | ($p.id != "P15") or ($p.status | startswith("skipped")) or
+      (($p.observations | map(select(.value | type == "object")) | length) > 0
+       and ($p.observations | map(select(.value | type == "object")) | all(
+             (.value | has("wire_flow_control") | not)
+             or ((.value.wire_flow_control | type == "object")
+                 and (.value.wire_flow_control.asks | type == "string")
+                 and (.value.wire_flow_control.measured | type == "boolean")
+                 and (.value.wire_flow_control.does_not_license | type == "string")
+                 and ((.value.wire_flow_control.measured)
+                      or (.value.wire_flow_control.unmeasurable_here | type == "string"))
+                 and ((.value.wire_flow_control.measured | not)
+                      or ((.value.wire_flow_control.reading | type == "string")
+                          and (.value.wire_flow_control | has("honoured_on_the_wire"))
+                          and (.value.wire_flow_control.peer_port | type == "string")
+                          and (.value.wire_flow_control.payload_bytes | type == "number")
+                          and (.value.wire_flow_control.released_after_peer_raised_rts | type == "number")
+                          and (.value.wire_flow_control.released_intact | type == "boolean")
+                          and (.value.wire_flow_control.flag_on_peer_not_ready | has("cts_at_transmitter"))
+                          and (.value.wire_flow_control.flag_on_peer_not_ready.bytes_delivered_to_the_peer | type == "number")
+                          and (.value.wire_flow_control.flag_on_peer_not_ready.bytes_accepted_by_the_kernel | type == "number")
+                          and (.value.wire_flow_control.control_flag_off_peer_not_ready.bytes_delivered_to_the_peer | type == "number")
+                          and (.value.wire_flow_control.control_flag_on_peer_ready.bytes_delivered_to_the_peer | type == "number")
+                          and ((.value.wire_flow_control.reading != "gated")
+                               or (.value.wire_flow_control.flag_on_peer_not_ready.cts_at_transmitter == false))))))))))
 # P12 (session-boundary edge, §15.39) is the mechanism that carries §6's
 # detach-release on THIS platform — Darwin destroys the readable packet P7 measures
 # — so unlike every clause above it, macOS is where P12 is load-bearing and Linux is

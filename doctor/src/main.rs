@@ -272,7 +272,12 @@ fn main() {
     // because P14 re-proves its own baseline anyway and must stay last for the
     // wall-clock reason below. Two `tcsetattr` calls per port, so it costs nothing
     // against P14's rate ladder (notes §3.65 E).
-    probe_list.push(probes::p15_flow_control_readback(&cli.ports));
+    // It is handed P5's verified pairs for the same reason P11 is handed its
+    // `RigFacts`: the wire half of this probe (plan §18 item 85) drives one end's
+    // RTS and asks whether the other end's transmitter stalls, which is only a
+    // question about the *driver* on a pair P5 certified as carrying RTS/CTS both
+    // ways. On any other bench it reports why instead, and never a defect.
+    probe_list.push(probes::p15_flow_control_readback(&cli.ports, &pairs));
 
     // P14 — the maximum-rate search (§15.51). **Last, and that is a rule rather
     // than a habit.** The ordering note above P6/P7 says nothing may be inserted

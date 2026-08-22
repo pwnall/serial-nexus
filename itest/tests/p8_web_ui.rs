@@ -29,10 +29,25 @@
 //! into a failure, and the CI job that installs node and Chromium sets it. So the suite
 //! is optional on a developer's laptop and mandatory where it is provisioned.
 //!
+//! **What this gate asserts about the suite itself.** A green Playwright exit says
+//! nothing about *how much* ran, so the totals are held against the tool's own
+//! enumeration rather than against a number kept here: `--list`, carrying the run's own
+//! filters, answers how many specs this lane selects and how many of them are tagged
+//! `@device`, and the pass/skip split is asserted equal to those. `SPECS_TOTAL` and
+//! `SPECS_SLOW` are the one pair still kept by hand, for the one thing a derived count
+//! structurally cannot see — a suite that got smaller.
+//!
+//! **Three knobs, none of them set by the per-push CI lane.** `SNX_UI_SLOW=1` includes
+//! the `@slow` specs and is what `web-ui-nightly` sets; `SNX_UI_GREP` narrows a run while
+//! debugging and suspends all of the counting above, so a filtered run can never be
+//! mistaken for a full one; `SNX_UI_DEVICE_FREE=1` builds the fixture without its serial
+//! devices, which is how the device-free arm becomes reachable on a box that has one.
+//!
 //! Traces and screenshots for a failing spec land in `web/ui-tests/
 //! test-results/`, which the CI job uploads.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -60,44 +75,71 @@ const HOSE_CONSOLE: &str = "hose";
 /// why 16 MiB shed on one run and not on the next.
 const HOSE_BYTES: &str = "64MiB";
 
-/// The floor the browser suite must clear, **as a function of the fixture this gate
-/// built** (review 32 ITEST-4).
+/// The whole browser suite, in the only number this gate still keeps by hand — and the
+/// anchor every other count in it is derived from (review 32 ITEST-4, rebuilt 2026-08-21).
 ///
-/// `web/ui-tests/tests/` declares **30** specs (console 18, history 6, graph-editor 5,
-/// lifecycle 1). Exactly **two** are tagged `@slow` and excluded per push
-/// (`--grep-invert @slow` below), leaving **28**; eleven of those 28 `test.skip`
-/// themselves when the fixture has no serial device (`!ECHO` / `!HOSE`), leaving **17**
-/// that run on any platform. (Twelve carry a device skip in all; one of those is `@slow`
-/// and is not in the per-push run, so both counts above are per-push counts. Of the three
-/// specs added 2026-08-17, §15.65's rail-click pair is device-free and raises both floors
-/// by two; §15.67's paint-deferral spec needs a device to have produced a `tap.data` and
-/// so raises only `SPECS_WITH_DEVICE`.) (Eleven specs carry a device skip in all, but one of them is `@slow` and
-/// is not in the per-push run; both counts below are per-push counts. Recounted against
-/// the suite on 2026-08-12: this prose had said 23/21/11, four specs behind the tree,
-/// while the 15-passed/10-skipped measurement below — which is what 25 per-push specs
-/// with ten device gates reports — had matched all along.)
+/// Every floor here used to be hand-kept, and every one of them carried slack. The repair
+/// is plan §3 rule 7 — "CI loops enumerate from the tool, never a hand-kept list" —
+/// applied to the gate that was still hand-keeping: before asserting anything, this gate
+/// asks Playwright, with the **same filters the run just used**, how many specs that
+/// selection holds (`--list`; no browser, no spec executed, under a second), how many of
+/// them carry the `@device` tag, and, in the slow lane, how many carry `@slow`. The
+/// pass/skip split then falls out as an *equality* instead of a floor, so adding a spec
+/// still edits nothing here and a removed one has nowhere to hide.
 ///
-/// One constant used to do both jobs: `MIN_SPECS = 8` sat at the device-free count, which
-/// is tight on macOS and carried six specs of slack on `ubuntu-latest` — the only platform
-/// the `web-ui` job runs on, where `serial_echo()` is unconditionally `Some`. Any six
-/// specs could vanish (a deleted file, a rename off `*.spec.mjs`, a `testDir` typo, a
-/// `--grep` mistake) and the gate stayed green, while its own assertion message promised
-/// that "a *removed* spec … trips it". The gate already knows which fixture it built, so
-/// it can hold the suite to the right number instead of to the smaller of the two.
-/// **Both floors sit three specs under the recount above, deliberately.** Measured on
-/// the macOS rig on 2026-07-30 (device-free fixture, so `SPECS_DEVICE_FREE` is the arm
-/// that ran): the per-push suite reported **15 passed, 10 skipped**, against a floor of
-/// 11 — four of slack. Adding the 1009 close-code spec to `console.spec.mjs` accounts
-/// for one of those four; the other three predate it. Each floor is raised by exactly
-/// the spec added here rather than to the measured figure, because the with-device arm
-/// cannot be measured on a Mac — a pts is not a serial device here (`docs/macos.md`), so
-/// `serial_echo()` is `None` and the ten device-gated specs never run — and a floor
-/// guessed above the truth reddens the Linux lane for a reason that is not the tree's.
-/// Re-measure both on a Linux rig and set them
-/// to the counts it reports; the comment above describes what they are *for*, and that
-/// intent is right even while the constants lag.
-const SPECS_WITH_DEVICE: usize = 25;
-const SPECS_DEVICE_FREE: usize = 14;
+/// **Why one number survives the derivation.** A count taken from the tool cannot see the
+/// suite get smaller: delete a spec file and `--list` reports one fewer, the equality
+/// holds against the smaller answer, and the gate goes green over exactly the hole it
+/// exists to catch — AGENTS §3's tell in its purest form, a passing output identical to a
+/// not-running one. So one figure has to stand *outside* the tool's answer. It is written
+/// as the whole suite plus the `@slow` share, and each lane's minimum is derived from the
+/// pair: `SPECS_TOTAL - SPECS_SLOW` per push, `SPECS_TOTAL` in the slow lane.
+///
+/// That derivation is half the point. The two lanes previously asserted the *same* floor
+/// of 25, and a per-push run reports 28 — so `web-ui-nightly`, a job whose entire reason
+/// to exist is the two `@slow` specs, was asserting a number the per-push lane already
+/// cleared by three and could not have noticed either slow spec vanishing. The slow lane
+/// now also counts `@slow` specs in its own selection, which is a floor the per-push lane
+/// cannot reach at all: its `--grep-invert @slow` leaves that count structurally zero.
+///
+/// **Measured with `--list`** (read-only), this tree, Linux 7.0.0-30, 2026-08-21: 30
+/// selected unfiltered · 28 under `--grep-invert @slow` · 2 under `--grep @slow` · 12
+/// under `--grep @device` · 11 under `--grep-invert @slow --grep @device`. The forced-shed
+/// spec is the one that is both `@slow` and `@device`.
+///
+/// **And executed**, same box, same session, all four arms — the re-measurement the
+/// superseded comment here owed and called blocked on "a Linux rig", which it was not:
+/// `serial_echo()` is unconditionally `Some` on Linux (a sim pty stands in for the port),
+/// so the *with-device* arm is the one a Mac cannot reach, and the device-free arm is now
+/// reachable anywhere through `SNX_UI_DEVICE_FREE=1`:
+///
+/// | lane | fixture | passed | skipped | wall |
+/// |---|---|---|---|---|
+/// | per push | with device | 28 | 0 | 28.5 s |
+/// | per push | device-free | 17 | 11 | 13.4 s |
+/// | `SNX_UI_SLOW=1` | with device | 30 | 0 | 2.6 min |
+/// | `SNX_UI_SLOW=1` | device-free | 18 | 12 | 2.2 min |
+///
+/// Against the floors that stood here — 25 with a device, 14 device-free — that is three,
+/// three, five and four specs of slack respectively. All four readings are now equalities
+/// the gate derives rather than numbers it carries.
+///
+/// **The prose those floors rested on contradicted itself, and is replaced rather than
+/// patched.** One paragraph said twelve specs carry a device skip; the next said eleven;
+/// both then called their own totals "per-push counts". The measured answer is **twelve in
+/// the suite, eleven in the per-push selection** — the twelfth is `@slow`, so the per-push
+/// lane never sees it. Nothing kept a recount like that true, which is why the count is no
+/// longer prose at all: `--grep @device` is the authority and the tag on each spec is what
+/// it reads.
+const SPECS_TOTAL: usize = 30;
+
+/// How many of [`SPECS_TOTAL`] are tagged `@slow` — excluded per push, run by
+/// `web-ui-nightly`. Subtracted from `SPECS_TOTAL` to give the per-push lane its minimum,
+/// and asserted directly as the slow lane's own, so the two lanes can never again hold
+/// each other to the same number. Adding a `@slow` spec raises the suite and the share
+/// together and leaves the per-push minimum where it is, which is the arithmetic this pair
+/// exists to keep honest.
+const SPECS_SLOW: usize = 2;
 
 #[test]
 fn the_web_console_passes_its_headless_chromium_suite() {
@@ -138,7 +180,26 @@ fn the_web_console_passes_its_headless_chromium_suite() {
     // absent, exactly as the Rust serial tests do (§5).
     let d = Daemon::start();
     let rpc = d.rpc();
-    let echo = serial_echo();
+    // `SNX_UI_DEVICE_FREE=1` builds the *other* fixture on a box that has a device.
+    //
+    // The two arms below are two different suites — 28 specs against 17 — and until this
+    // knob existed neither machine could run both. `serial_echo()` is unconditionally
+    // `Some` on Linux, where a `serial-nexus-sim` pty stands in for the port; on macOS a
+    // pts is not a serial device at all (`docs/macos.md`), so it is unconditionally
+    // `None`. That is precisely why the floors above were *guessed* on whichever arm the
+    // author could not reach, and why the superseded comment there owed a re-measurement
+    // it described as needing a Linux rig. It never needed a rig — it needed the device-
+    // free fixture to be a choice rather than a platform accident. It is one now, and the
+    // four rows recorded at `SPECS_TOTAL` were taken through it on a single box.
+    //
+    // The knob only ever *removes* a device, so it cannot make a device-bearing run look
+    // healthier than it is, and it is off unless spelled, so the default on every machine
+    // is still whatever the platform actually offers.
+    let echo = if std::env::var("SNX_UI_DEVICE_FREE").as_deref() == Ok("1") {
+        None
+    } else {
+        serial_echo()
+    };
     let hose_link = d.run().join("hosedev");
     let hose_go = d.run().join("hose.go");
     // The `load --replace` spec re-applies the fixture onto the *same* device. That
@@ -286,10 +347,17 @@ device = "{dev}"
     // developer convenience only: CI sets `SNX_WEB_UI=required` and never sets this, so
     // a filtered run cannot be mistaken for a full one.
     let grep = std::env::var("SNX_UI_GREP").unwrap_or_default();
-    let mut pw_args: Vec<&str> = vec!["playwright", "test"];
+    let slow = std::env::var("SNX_UI_SLOW").as_deref() == Ok("1");
+
+    // The *filters* are kept apart from the verb, because the `--list` enumerations below
+    // have to be handed exactly the selection this run executes. A count derived from a
+    // different selection than the one that ran is a count about nothing — and it would
+    // fail in the reassuring direction, since a broader listing only ever raises the
+    // number the run is then held to.
+    let mut filters: Vec<&str> = Vec::new();
     if !grep.is_empty() {
-        pw_args.push("--grep");
-        pw_args.push(&grep);
+        filters.push("--grep");
+        filters.push(&grep);
     }
     // `@slow` specs are the project's `#[ignore]` in Playwright's spelling: excluded per
     // push, run in the nightly lane with `SNX_UI_SLOW=1`. Today that is two specs, both in
@@ -298,38 +366,44 @@ device = "{dev}"
     // and so spends it twice over — reasons each spec records at its own tag. Excluding by
     // *tag* rather than by name means a new slow spec joins the nightly lane by annotating
     // itself, not by editing this list.
-    if std::env::var("SNX_UI_SLOW").as_deref() != Ok("1") && grep.is_empty() {
-        pw_args.push("--grep-invert");
-        pw_args.push("@slow");
+    if !slow && grep.is_empty() {
+        filters.push("--grep-invert");
+        filters.push("@slow");
     }
-    let out = Command::new("npx")
-        .args(&pw_args)
-        .current_dir(&ui)
-        .env(
+
+    // The fixture description `tests/fixture.mjs` reads at import time, built once and
+    // handed to every `npx` this test spawns — the run and the read-only listings alike.
+    // A listing that answered about a differently-configured suite would be worse than no
+    // listing, because its number looks like a measurement.
+    let env: Vec<(&str, OsString)> = vec![
+        (
             "SNX_WEB_URL",
-            format!("http://127.0.0.1:{port}/?token={TOKEN}"),
-        )
-        .env("SNX_CTL", bin("serial-nexus-ctl"))
-        .env("SNX_SOCKET", d.socket())
-        .env("SNX_RUN", d.run().path())
-        .env("SNX_REPLACE_CFG", &replace_path)
-        .env("SNX_FAULT_A", FAULT_A)
-        .env("SNX_FAULT_B", FAULT_B)
-        .env("SNX_FAULT_NODE", FAULT_NODE)
-        .env(
+            format!("http://127.0.0.1:{port}/?token={TOKEN}").into(),
+        ),
+        ("SNX_CTL", bin("serial-nexus-ctl").into_os_string()),
+        ("SNX_SOCKET", d.socket().into_os_string()),
+        ("SNX_RUN", d.run().path().as_os_str().to_owned()),
+        ("SNX_REPLACE_CFG", replace_path.clone().into_os_string()),
+        ("SNX_FAULT_A", FAULT_A.into()),
+        ("SNX_FAULT_B", FAULT_B.into()),
+        ("SNX_FAULT_NODE", FAULT_NODE.into()),
+        (
             "SNX_ECHO_CONSOLE",
-            if echo.is_some() { ECHO_CONSOLE } else { "" },
-        )
-        .env(
+            if echo.is_some() { ECHO_CONSOLE } else { "" }.into(),
+        ),
+        (
             "SNX_HOSE_CONSOLE",
-            if echo.is_some() { HOSE_CONSOLE } else { "" },
-        )
-        .env("SNX_HOSE_GO", &hose_go)
+            if echo.is_some() { HOSE_CONSOLE } else { "" }.into(),
+        ),
+        ("SNX_HOSE_GO", hose_go.clone().into_os_string()),
         // Playwright writes its browser download cache here; leaving it at the default
         // is what lets a CI cache step hit.
-        .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
-        .output()
-        .expect("run npx playwright test");
+        ("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1".into()),
+    ];
+
+    let mut pw_args: Vec<&str> = vec!["playwright", "test"];
+    pw_args.extend_from_slice(&filters);
+    let out = playwright(&ui, &pw_args, &env);
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -350,52 +424,157 @@ device = "{dev}"
     );
 
     // A suite that ran zero specs exits 0, so prove it actually executed the specs —
-    // "assert execution, not existence", the rule the nightly fuzz loop learned the
-    // hard way (§15.36 rule 7, where a stale hand-kept list meant five parsers were
-    // compiled every night and fuzzed never). A floor rather than an exact count, so
-    // adding a spec does not have to edit this line; a *removed* spec, a filter typo, or
-    // a suite that silently self-skipped its way to nothing all trip it — which is only
-    // true now that the floor is the count for *this* fixture rather than the smaller of
-    // the two (ITEST-4).
+    // "assert execution, not existence", the rule the nightly fuzz loop learned the hard
+    // way (§15.36 rule 7, where a stale hand-kept list meant five parsers were compiled
+    // every night and fuzzed never).
     //
-    // `SNX_UI_GREP` narrows the run deliberately, so the floor does not apply to it; CI
-    // never sets it, and `SNX_WEB_UI=required` does not relax anything else.
+    // What follows used to be one floor per fixture, both hand-kept and both slack: 25
+    // with a device against a run that reports 28, 14 device-free against a run that
+    // reports 17. They are now asked of the tool with the run's own filters and asserted
+    // as equalities — plan §3 rule 7's "enumerate from the tool" applied to the last gate
+    // in this tree that was still keeping a list by hand. `SPECS_TOTAL`/`SPECS_SLOW` stay
+    // hand-kept for the one thing a derived count structurally cannot see, and their doc
+    // comment says why.
+    //
+    // `SNX_UI_GREP` narrows the run deliberately, so none of this applies to it; CI never
+    // sets it, and `SNX_WEB_UI=required` does not relax anything else.
     let passed = passed_count(&stdout);
+    let skipped = skipped_count(&stdout);
     if grep.is_empty() {
-        let floor = if echo.is_some() {
-            SPECS_WITH_DEVICE
+        let lane = if slow {
+            "the slow lane, SNX_UI_SLOW=1"
         } else {
-            SPECS_DEVICE_FREE
+            "per push"
+        };
+        let device = if echo.is_some() {
+            "with a serial device"
+        } else {
+            "device-free"
+        };
+
+        // What Playwright says this exact argv selects, and how much of that selection is
+        // device-gated. Two listings per run, three in the slow lane; measured 4.7–5.8 s
+        // each on this box — an `npx` spawn plus the config and spec transpile — and none
+        // of them starts a browser or executes a spec. Against a per-push suite that takes
+        // 28 s of real browser time and a slow lane that takes 2.6 min, that is the price
+        // of not keeping the numbers by hand.
+        let selected = listed_specs(&ui, &filters, &env);
+        let mut device_filters = filters.clone();
+        device_filters.extend_from_slice(&["--grep", "@device"]);
+        let device_gated = listed_specs(&ui, &device_filters, &env);
+
+        // The one thing a derived count cannot see: the suite getting smaller. `--list`
+        // shrinks with it, so every equality below would still hold — the gate's passing
+        // output identical to its not-running output, one directory over. This is the
+        // number that stands outside the tool's answer, and it is the reason a deleted
+        // file has to be a deliberate edit here rather than a silent one.
+        let min_selected = if slow {
+            SPECS_TOTAL
+        } else {
+            SPECS_TOTAL - SPECS_SLOW
         };
         assert!(
-            passed >= floor,
-            "the Playwright suite reported {passed} passing specs, fewer than the {floor} \
-             this fixture ({device}) exists to run — a filter, a skip, or a deleted file \
-             has shrunk it\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-            device = if echo.is_some() {
-                "with a serial device"
-            } else {
-                "device-free"
-            },
+            selected >= min_selected,
+            "Playwright selects {selected} specs for this lane ({lane}), fewer than the \
+             {min_selected} this tree declares ({total} specs, {slow_specs} of them \
+             `@slow`) — a deleted file, a rename off `*.spec.mjs`, a `testDir` typo or a \
+             filter mistake has shrunk the suite. If a spec is meant to be gone, lower \
+             `SPECS_TOTAL` in the commit that removes it; nothing else in this gate can \
+             tell the difference between a retirement and a loss.\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            total = SPECS_TOTAL,
+            slow_specs = SPECS_SLOW,
         );
 
-        // The direction a floor cannot see: a `test.skip` firing when it should not.
-        // With a device present *nothing* may skip — every `test.skip(!ECHO, …)` and
-        // `test.skip(!HOSE, …)` guard is satisfied — so a non-zero skip count means the
-        // fixture handed the browser an empty `SNX_ECHO_CONSOLE`/`SNX_HOSE_CONSOLE`, or
-        // a spec skipped itself for a reason nobody asked for. Both look identical to a
-        // count of passing specs and both silently retire real coverage.
+        // The nightly lane's entire reason to exist, asserted where it can fail. Both
+        // lanes used to hold themselves to the same floor of 25 while a per-push run
+        // reports 28, so `web-ui-nightly` cleared its own bar by three specs it had not
+        // run and could not have noticed either `@slow` spec disappearing. This count is
+        // one the per-push lane cannot satisfy however green it is: its `--grep-invert
+        // @slow` leaves the same listing at zero.
+        if slow {
+            let mut slow_filters = filters.clone();
+            slow_filters.extend_from_slice(&["--grep", "@slow"]);
+            let slow_selected = listed_specs(&ui, &slow_filters, &env);
+            assert!(
+                slow_selected >= SPECS_SLOW,
+                "the slow lane selected {slow_selected} `@slow` specs, fewer than the \
+                 {slow_specs} this suite tags — and running those is the only reason this \
+                 lane exists. Either a spec lost its tag (in which case it is now running \
+                 per push, at whatever it costs) or it is gone.\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                slow_specs = SPECS_SLOW,
+            );
+        }
+
+        // Prove the `@device` matcher is live before deriving anything from it. On a
+        // device-bearing fixture — which is every CI run of this job — a tag that stopped
+        // matching would leave `device_gated` at 0, and *both* assertions below still
+        // hold at 0: `passed == selected - 0` and `skipped == 0`. That is AGENTS §3's tell
+        // exactly, so the matcher is asserted rather than assumed. The upper bound rides
+        // along because `device_gated` is a subset of the same selection by construction,
+        // and the subtraction below trusts that.
+        assert!(
+            (1..=selected).contains(&device_gated),
+            "`--grep @device` selected {device_gated} of this lane's {selected} specs, \
+             which cannot be right: this suite tags every device-gated spec `@device`, and \
+             this gate derives the device-free spec count and the expected skip count from \
+             that tag. Zero means the tag no longer matches — renamed, or a Playwright \
+             whose `--grep` stopped reading tags — and on a device-bearing fixture that \
+             would go unnoticed, because every assertion below happens to hold at zero \
+             too.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+
+        // The direction a count of passing specs cannot see: a `test.skip` firing when it
+        // should not.
         if echo.is_some() {
-            let skipped = skipped_count(&stdout);
+            // With a device present *nothing* may skip — every `test.skip(!ECHO, …)` and
+            // `test.skip(!HOSE, …)` guard is satisfied — so a non-zero skip count means
+            // the fixture handed the browser an empty `SNX_ECHO_CONSOLE`/`SNX_HOSE_CONSOLE`,
+            // or a spec skipped itself for a reason nobody asked for. Both look identical
+            // to a count of passing specs and both silently retire real coverage.
             assert_eq!(
                 skipped, 0,
                 "{skipped} browser specs skipped themselves on a fixture that has a \
                  serial device — the device-gated specs (the reload splice, the \
                  `load --replace` re-anchor, the editor round-trip) are the ones that \
-                 guard §15.38's defects, and a floor cannot see them go\n\
+                 guard §15.38's defects, and a count of passing specs cannot see them go\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        } else {
+            // Device-free, the skips are the point — but *which* specs skipped is not
+            // something a total can say, so the two independent statements of that set are
+            // held equal instead: the `@device` tag Playwright reads before the run, and
+            // the `test.skip(!ECHO, …)` / `test.skip(!HOSE, …)` guard each spec runs. A
+            // mismatch means either a device-gated spec landed without its tag, or a spec
+            // skipped for a reason nobody declared. This arm is reachable on any platform
+            // through `SNX_UI_DEVICE_FREE=1`, which is what makes the cross-check worth
+            // stating: before that knob it could only run where the tag was never wrong.
+            assert_eq!(
+                skipped, device_gated,
+                "{skipped} browser specs skipped themselves on a device-free fixture, \
+                 against the {device_gated} tagged `@device` in this lane's selection. \
+                 These are the same set counted two ways — the tag, and the spec's own \
+                 `test.skip(!ECHO, …)` / `test.skip(!HOSE, …)` guard — so one of the two \
+                 is wrong about a spec.\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
             );
         }
+
+        // The headline, and now an equality in both arms rather than a floor in either.
+        // With a device every selected spec runs; device-free, exactly the `@device` ones
+        // stand down. Both sides come from the tool, so adding a spec changes nothing here
+        // and a removed one has nowhere left to hide.
+        let standing_down = if echo.is_some() { 0 } else { device_gated };
+        let expected = selected - standing_down;
+        assert_eq!(
+            passed, expected,
+            "the Playwright suite reported {passed} passing specs; this fixture \
+             ({device}) is handed the {selected} specs Playwright selects for {lane}, of \
+             which {standing_down} stand down as `@device`, so exactly {expected} must \
+             pass. A filter, an unasked-for skip, or a deleted file has moved it.\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
     }
 }
 
@@ -436,6 +615,69 @@ fn count_before(stdout: &str, marker: &str) -> usize {
         at = end + marker.len();
     }
     found.unwrap_or(0)
+}
+
+/// Run `npx playwright …` in the suite directory with the fixture description
+/// `tests/fixture.mjs` reads at import time.
+///
+/// The real run and every `--list` enumeration go through here, so a listing is always
+/// describing the suite the run was handed: same directory, same environment, same `npx`.
+/// Splitting those two apart is how a floor ends up being about a selection nobody ran.
+fn playwright(ui: &Path, args: &[&str], env: &[(&str, OsString)]) -> std::process::Output {
+    let mut cmd = Command::new("npx");
+    cmd.args(args).current_dir(ui);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("run `npx {}`: {e}", args.join(" ")))
+}
+
+/// How many specs Playwright *selects* for one exact set of filters — the tool's own
+/// answer, read out of the `--list` reporter's closing line ("Total: 28 tests in 4
+/// files").
+///
+/// This is plan §3 rule 7's "enumerate from the tool" for a suite that is not `cargo`:
+/// `--list` resolves `testDir`, the `*.spec.mjs` pattern, `--grep` and `--grep-invert`
+/// through the same code path the run uses, then starts no browser and executes no spec.
+/// Measured at roughly a second per call on this tree.
+///
+/// A missing or unparsable footer **panics** rather than returning 0. Every assertion
+/// built on this number is an equality or a floor against it, so a silent zero would
+/// relax all of them at once and read as a clean run — the same failure [`count_before`]
+/// exists to prevent one parser down.
+fn listed_specs(ui: &Path, filters: &[&str], env: &[(&str, OsString)]) -> usize {
+    let mut args: Vec<&str> = vec!["playwright", "test", "--list"];
+    args.extend_from_slice(filters);
+    let out = playwright(ui, &args, env);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    total_specs(&stdout).unwrap_or_else(|| {
+        panic!(
+            "`npx playwright test --list {}` printed no `Total: N tests` line, so this \
+             gate cannot ask the tool what it is about to run — and a gate that cannot \
+             read its own enumeration must not pass quietly\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            filters.join(" ")
+        )
+    })
+}
+
+/// The count in Playwright's `--list` footer, "Total: 28 tests in 4 files", or `None`
+/// when no such line was printed.
+///
+/// Read from the **last** matching line, for [`count_before`]'s reason: the listing prints
+/// every spec title before its footer, and a spec title is free to contain anything at
+/// all, this line included.
+fn total_specs(stdout: &str) -> Option<usize> {
+    stdout.lines().rev().find_map(|l| {
+        l.trim()
+            .strip_prefix("Total: ")?
+            .split_whitespace()
+            .next()?
+            .parse::<usize>()
+            .ok()
+    })
 }
 
 /// Whether `<tool> --version` runs and exits 0.

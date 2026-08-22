@@ -39,6 +39,7 @@
 //! | [`a_verb_pipelined_behind_a_parked_wait_is_refused_and_both_survive`] | handle `tap.wait` in `control.rs` beside `tap.open` instead of in the dispatch lane; it then stops being a waiting verb and the pipelined request is answered normally |
 //! | [`every_maximum_is_refused_before_anything_is_armed`] | move `parse_wait_params`/`Matcher::compile` after `arm_wait` |
 //! | [`tap_data_keeps_flowing_on_the_connection_whose_wait_is_parked`] | revert `control.rs` to the pre-CTRLW-1 inner loop, which polls only the dispatch future and the next request line — the connection then writes no notification for the wait's whole duration |
+//! | [`an_endpoint_holds_a_stated_number_of_armed_waits_and_refuses_the_next`] | delete the `waits.len() >= MAX_ARMED_WAITS` arm in `TapHub::arm_wait` (it then arms 512 and is never refused), or spell it `>` (65 arm against a stated 64) |
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -434,6 +435,175 @@ fn every_maximum_is_refused_before_anything_is_armed() {
             state_waits(rpc)
         );
     }
+}
+
+/// **How many waits one endpoint will hold, and what the one past that gets**
+/// (design §15.70; plan §18 item 64(a)).
+///
+/// The three other cost surfaces §10 clause 2 bounds are all *request* dimensions,
+/// refused by [`every_maximum_is_refused_before_anything_is_armed`] above. This one
+/// is the endpoint's **occupancy**, and it is the factor the other guards could not
+/// see: `TapHub::ingest` walks the armed-wait list on every ingested chunk and each
+/// entry rescans its whole retained window, so the hub's per-chunk work is
+/// `waits × lookback × the pattern's cost per byte` — and two of those three had a
+/// stated maximum while the product did not.
+///
+/// **Every armed wait is one control-socket connection.** §15.20 runs one waiting
+/// verb per connection, and `tap.wait` is off the web bridge's allowlist (§10 clause
+/// 8), so this test arms them the only way an operator can: one connection each.
+///
+/// **The number is read from the daemon, not written down here.** `MAX_ARMED_WAITS`
+/// lives in a private daemon module, and a copy of it in this file would be a second
+/// implementation of the very thing under test — §7.1 clause 2's shape, one surface
+/// over. So the loop probes until the daemon refuses, and the assertion is that the
+/// count it accepted **is** the maximum its own refusal names. `PROBE_CEILING` keeps
+/// that loop from being the test: a tree with no cap runs to the ceiling and fails
+/// there, rather than passing because nothing ever said no.
+///
+/// **Fail-first:** delete the `waits.len() >= MAX_ARMED_WAITS` arm in
+/// `TapHub::arm_wait` and this reddens at `PROBE_CEILING` with "armed 512 waits on
+/// one endpoint and was never refused"; spell the arm `>` and it reddens on the
+/// count-versus-stated-maximum assertion (65 armed against a stated 64), which is
+/// the off-by-one no `<=` assertion could see.
+#[test]
+fn an_endpoint_holds_a_stated_number_of_armed_waits_and_refuses_the_next() {
+    /// Enough headroom that a healthy tree never reaches it, low enough that an
+    /// uncapped one fails here in seconds rather than exhausting the box.
+    const PROBE_CEILING: usize = 512;
+
+    let d = Daemon::start();
+    let rpc = quiet_endpoint(&d);
+    let socket = d.socket();
+
+    // Arm until refused, one connection per wait.
+    let mut conns: Vec<WaitConn> = Vec::new();
+    let mut refusal: Option<Value> = None;
+    while conns.len() < PROBE_CEILING {
+        let want = conns.len() + 1;
+        let mut c = WaitConn::connect(&socket);
+        let id = park(
+            &mut c,
+            "usb0",
+            json!([literal("p", b"never")]),
+            60_000,
+            false,
+        );
+        // A wait that arms shows up in `state` and answers nothing until its
+        // deadline; a wait that is refused answers at once and never appears. The
+        // arrival is the signal, not the silence, so this loop costs one round trip
+        // per rung rather than one timeout (§9: readiness, never a sleep).
+        if wait_until(Duration::from_secs(5), || state_waits(rpc).len() >= want) {
+            conns.push(c);
+            continue;
+        }
+        refusal = c.response(id, Duration::from_secs(5));
+        assert!(
+            refusal.is_some(),
+            "wait {want} neither armed nor answered within 10s — a `tap.wait` that \
+             does neither is the one failure a caller cannot diagnose"
+        );
+        break;
+    }
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!(
+            "armed {PROBE_CEILING} waits on one endpoint and was never refused. The \
+             list `TapHub::ingest` walks per chunk — rescanning every armed wait's \
+             whole lookback window — has no stated maximum, so the hub's per-chunk \
+             work on the thread that runs every console is whatever a caller chooses \
+             to make it (§15.70)"
+        )
+    });
+
+    // The refusal is typed, and it names both numbers — §16.12's rule that a maximum
+    // is worth nothing if the refusal does not say what to shrink.
+    assert_eq!(
+        refusal["error"]["code"],
+        json!(-32602),
+        "the refusal is the same typed shape as every other §10 clause 2 maximum: {refusal}"
+    );
+    let message = refusal["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.contains("armed pattern waits") && message.contains("maximum"),
+        "the refusal names the dimension and that it is a maximum: {message:?}"
+    );
+    // Read the numbers from past the endpoint's own name, which carries digits of its
+    // own (`usb0`) and is not one of them.
+    let tail = message
+        .split_once("already holds")
+        .map(|(_, t)| t)
+        .unwrap_or_else(|| panic!("the refusal says what the endpoint is holding: {message:?}"));
+    let numbers: Vec<usize> = tail
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse().expect("digits parse"))
+        .collect();
+    assert_eq!(
+        numbers.len(),
+        2,
+        "the refusal names exactly two numbers — the occupancy and the maximum — so a \
+         caller learns what to shrink: {message:?}"
+    );
+    let (occupancy, stated_max) = (numbers[0], numbers[1]);
+    assert_eq!(
+        conns.len(),
+        stated_max,
+        "the daemon accepted {} waits and then refused the next one naming {stated_max} \
+         as its maximum. The cap it enforces and the cap it states must be the same \
+         number, or the refusal teaches the operator the wrong one: {message:?}",
+        conns.len()
+    );
+    assert_eq!(
+        occupancy, stated_max,
+        "at the cap, both numbers agree: {message:?}"
+    );
+    assert!(
+        (8..=PROBE_CEILING).contains(&stated_max),
+        "a maximum of {stated_max} is outside any band this verb could be useful in — \
+         §10 clause 2 already lets one wait carry 8 patterns: {message:?}"
+    );
+
+    // The refusal armed nothing, and cost the endpoint nothing it had.
+    assert_eq!(
+        state_waits(rpc).len(),
+        stated_max,
+        "a refused wait must leave the endpoint exactly as it found it"
+    );
+    assert!(
+        rpc.info().get("daemon_version").is_some(),
+        "a capped endpoint does not cost the daemon its control plane"
+    );
+
+    // Occupancy, not a lifetime quota: a slot freed is a slot reusable, which is what
+    // makes the refusal's own "retry" advice true.
+    conns.pop().expect("at least one wait armed").cancel();
+    assert!(
+        wait_until(Duration::from_secs(5), || state_waits(rpc).len()
+            == stated_max - 1),
+        "a cancelled wait must free its slot: {}",
+        state_waits(rpc).len()
+    );
+    let mut fresh = WaitConn::connect(&socket);
+    let id = park(
+        &mut fresh,
+        "usb0",
+        json!([literal("p", b"never")]),
+        60_000,
+        false,
+    );
+    assert!(
+        fresh.response(id, Duration::from_secs(2)).is_none(),
+        "the freed slot must accept a new wait, or the cap is a quota on the \
+         endpoint's whole life rather than on what it is holding"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || state_waits(rpc).len()
+            == stated_max),
+        "the endpoint is back at its maximum: {}",
+        state_waits(rpc).len()
+    );
 }
 
 /// §10's version-skew rule, from the other side: the verb is reachable over RPC, and

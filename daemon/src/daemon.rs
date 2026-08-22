@@ -1761,6 +1761,21 @@ impl Daemon {
                 ));
             }
             crate::tap::Armed::Parked(rx) => rx,
+            // The endpoint's occupancy maximum (§15.70, [`crate::tap::MAX_ARMED_WAITS`]).
+            // Refused in the same breath and the same code as every other §10 clause 2
+            // maximum, with the dimension and its ceiling named so the caller learns
+            // what to shrink (§16.12's rule about refusals). Nothing was armed and the
+            // ring was not scanned, so a hub at its cap costs a refused caller exactly
+            // one parse and one compile.
+            crate::tap::Armed::Refused { armed, max } => {
+                return Err(RpcError::invalid_params(format!(
+                    "endpoint {:?} already holds {armed} armed pattern waits, the maximum \
+                     of {max}; each one rescans its whole lookback window on every chunk \
+                     the endpoint ingests, so the count is a per-chunk cost on the thread \
+                     that runs every console. Close a wait on this endpoint and retry",
+                    spec.endpoint
+                )));
+            }
         };
         // Armed from here on: the guard disarms on **every** path out of this
         // function, including the one that runs no code in it — the connection

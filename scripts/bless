@@ -86,7 +86,13 @@ rc=0
 for profile in "${profiles[@]}"; do
   echo "== ${profile} =="
   built="$repo/target/$profile/serial-nexus-devprep"
-  blessed="$repo/.snx-bin/$profile/serial-nexus-devprep"
+  # There is deliberately no `blessed=` path here. One stood at this line from
+  # `adec786` until plan §18 item 110 and was never expanded: it died when the script
+  # stopped inspecting `.snx-bin/` itself and started asking the tool (the design this
+  # file's header states below — "ask the tool"), because `install --verify` owns the
+  # comparison and spells the installed path from the capability set it already knows.
+  # Spelling it a second time here would be the two-copies-that-must-agree shape §16.5
+  # bans, one file over.
 
   # **`--verify` builds too, and skipping it was a defect** (plan §18 item 101).
   # `install --verify` compares the installed copy against

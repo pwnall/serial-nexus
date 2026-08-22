@@ -26,12 +26,23 @@
 //!
 //! * **argv only.** It reads no environment variable, so there is no `LD_PRELOAD`
 //!   or config-file path into a capability-holding process.
-//! * **no `exec`.** It never spawns anything while privileged; `PR_SET_NO_NEW_PRIVS`
-//!   makes that a kernel guarantee rather than a property of the code, and the one
-//!   module that does spawn (`install`) is refused when the capability is held. The
-//!   prctl is *established*, not attempted: [`main`] checks it, reads the bit back
-//!   from the kernel, and a copy holding the capability that cannot get both answers
-//!   refuses to run at all rather than continuing unhardened.
+//! * **no `exec`.** Nothing in this crate spawns a process at all, and since
+//!   2026-08-21 that is a gate rather than a sentence: `itest`'s
+//!   `the_privileged_helper_neither_spawns_a_process_nor_reads_the_environment` scans
+//!   `devprep/src/**` for both bounds, and it exists because this was the one AGENTS
+//!   §4 tripwire with no enforcement — and the tree was violating it. `install` used
+//!   to shell out to `getcap`, guarded by a refusal on `install` while blessed, but
+//!   `preflight` reaches the same code with no refusal in front of it, so a blessed
+//!   copy execed a `PATH`-selected binary while holding both capabilities (design
+//!   §15.71, plan §18 items 103 and 104). The reader is now one `getxattr(2)`.
+//!   `PR_SET_NO_NEW_PRIVS` remains, and is what makes the bound a kernel guarantee
+//!   rather than a property of the code; it is *established*, not attempted: [`main`]
+//!   checks it, reads the bit back from the kernel, and a copy holding the capability
+//!   that cannot get both answers refuses to run at all rather than continuing
+//!   unhardened. Note what the prctl does and does not buy: it stops an exec from
+//!   *gaining* privilege, and it does nothing about an exec that inherits the
+//!   environment and the `PATH` of a process that already holds it — which is exactly
+//!   what the `getcap` spawn did.
 //! * **no path parameter.** The only device argument is a USB port *name* like
 //!   `3-1`, validated against a digit/`-`/`.` alphabet and joined to a compile-time
 //!   root, so no caller-supplied byte ever reaches `open(2)` as a path.
@@ -385,9 +396,12 @@ pub fn main() {
             profile,
             verify,
             print_setcap,
-            // The union, not `held`: this refusal exists to keep `Command::new`
-            // away from a process carrying *any* capability (§15.45's no-`exec`
-            // bound), not only from one carrying `cap_dac_override`.
+            // The union, not `held`: this refusal exists to keep a privileged file
+            // write away from a process carrying *any* capability, not only from one
+            // carrying `cap_dac_override`. (It was written for §15.45's no-`exec`
+            // bound, when `install` shelled out to `getcap`; §15.71 removed that
+            // spawn and left the refusal standing on the reason below, which is the
+            // one it should always have carried.)
         } => install_verb(&profile, verify, print_setcap, any_held),
         Verb::Preflight { profile, json } => preflight(&profile, json, held),
     };
@@ -1220,8 +1234,8 @@ fn hold_conclusion(
 
 fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState) -> i32 {
     // Printing the command is a pure string derivation — no copy, no capability, no
-    // spawn — so it is answered before the blessed-copy refusal below, which exists
-    // to keep `Command::new` away from a process holding capabilities.
+    // file written — so it is answered before the blessed-copy refusal below, which
+    // exists to keep a privileged file write away from a process holding capabilities.
     if print_setcap {
         let root = match repo_root() {
             Ok(r) => r,
@@ -1233,9 +1247,17 @@ fn install_verb(profile: &str, verify: bool, print_setcap: bool, held: CapState)
         );
         return exit::READY;
     }
-    // A blessed process must never spawn anything, and `install` shells out to
-    // `getcap`. Refusing here is what keeps `CAP_DAC_OVERRIDE` and `Command::new`
-    // from ever being live in the same process.
+    // `install` is the one verb that writes files outside sysfs — it copies the
+    // built binary into `.snx-bin/<profile>/` and chmods it — and a process holding
+    // `CAP_DAC_OVERRIDE` bypasses every permission check on that write. The copy that
+    // places and mode-restricts the blessed binary should be the unblessed one.
+    //
+    // **This refusal is not what keeps the no-`exec` bound**, and reading it that way
+    // is how the bound went unenforced: until §15.71 the comment here said the
+    // refusal kept `CAP_DAC_OVERRIDE` and `Command::new` out of one process, which
+    // was true of this verb and false of the module — `preflight` called the same
+    // spawning code with nothing in front of it (plan §18 item 103). The bound is now
+    // held by there being no spawn anywhere in the crate, gated in `itest`.
     if held.permitted || held.effective {
         return refuse(
             "refusing to run `install` from a blessed copy — run it from \
@@ -1325,13 +1347,13 @@ fn sweep_orphaned_capabilities(root: &std::path::Path, profile: &str) {
                          (carried {}, {whose}); nothing references it and \
                          `scripts/bless` reproduces it",
                         entry.orphan.path.display(),
-                        entry.orphan.field,
+                        entry.orphan.grant,
                     ),
                     Some(e) => eprintln!(
                         "serial-nexus-devprep: could NOT remove orphaned blessed copy {} \
                          (carries {}, {whose}): {e} — delete it by hand",
                         entry.orphan.path.display(),
-                        entry.orphan.field,
+                        entry.orphan.grant,
                     ),
                 }
             }

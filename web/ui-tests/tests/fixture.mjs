@@ -14,7 +14,18 @@ import { expect } from "@playwright/test";
 /** The bootstrap URL, token included: `GET /?token=…` 302s and sets the cookie. */
 export const WEB_URL = required("SNX_WEB_URL");
 
-/** The echo console — a serial node over a `serial-nexus-sim pty --echo` device. */
+/**
+ * The echo console — a serial node over a `serial-nexus-sim pty --echo` device.
+ *
+ * **A spec that reads {@link ECHO} or {@link HOSE} is tagged `@device`.** The two are the
+ * same statement made twice on purpose: the `test.skip(!ECHO, …)` guard is what the spec
+ * actually does at run time, and the tag is what `p8_web_ui.rs` can ask Playwright about
+ * *before* the run (`--list --grep @device`). The gate derives the device-free spec count
+ * and the expected skip count from the tag, and then asserts the two agree — so a
+ * device-gated spec that lands without its tag is a failure with a name rather than one
+ * spec of quiet slack in a floor. Twelve specs carry it today; eleven of those are in the
+ * per-push selection, the twelfth being `@slow` as well.
+ */
 export const ECHO = process.env.SNX_ECHO_CONSOLE || "";
 /** The firehose console, whose burst is released by touching {@link HOSE_GO}. */
 export const HOSE = process.env.SNX_HOSE_CONSOLE || "";

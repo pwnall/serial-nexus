@@ -207,6 +207,179 @@ mod tests {
         |_| Err("dummy never builds".to_owned())
     }
 
+    // **Which tests here may name `reference`, and why that is a `cfg` rather than a
+    // convention (plan §18 item 102).** §8 puts every built-in codec behind its own
+    // Cargo feature "so minimal builds drop what they don't need", and
+    // `--no-default-features` is the build `docs/codec-authors.md` tells an in-tree
+    // codec author to keep working. So `Registry::with_builtins()` has *two*
+    // contracts, not one: the default build seeds `reference`, the minimal build
+    // seeds nothing. A test that calls `with_builtins()` with no `#[cfg]` is
+    // asserting whichever of the two the person running it happened to compile.
+    //
+    // Five tests in this module did exactly that, and the minimal build had been
+    // red on them — `209 passed; 5 failed; 0 ignored` on Linux 7.0.0-30, and a red
+    // lib binary means the doctests never ran either — while the sixth
+    // (`the_reference_factory_satisfies_the_kit_attribute_suite`) carried the gate.
+    // The pattern was known and applied once out of six. That figure and its
+    // both-ends twin are the CI workflow's, taken against a scratch copy of the
+    // commit rather than a working tree with other work in flight; read them there,
+    // with their scope.
+    //
+    // **Nothing saw it, and the near-miss is the part worth keeping.** All three of
+    // CI's `--no-default-features` clippy invocations omitted `--all-targets` (the
+    // workspace clippy standing beside them has it), so no lane so much as
+    // *compiled* these test targets. Adding `--all-targets` — which item 102 also
+    // does — would not have found this: measured on the unfixed tree, `cargo clippy
+    // -p serial-nexus-daemon-bin -p serial-nexus-daemon --no-default-features
+    // --all-targets --locked -- -D warnings` exits **0** while the five assertions
+    // are still red, because a failing assertion is a run-time fact and clippy never
+    // runs a test. Only running the configuration finds *this* class, which is what
+    // the `check` job's minimal-daemon test step now does.
+    //
+    // **The two instruments are complementary, not ordered.** This comment claimed
+    // the clippy one was "strictly weaker" and that is measured false. Four plants
+    // in this module's minimal-only test fn — one file, one stationary tree,
+    // `--no-default-features` throughout; minimal clippy `--all-targets -- -D
+    // warnings` first, then `cargo test -p serial-nexus-daemon
+    // --no-default-features --locked`:
+    //
+    //   unused `use std::collections::HashMap;` │ clippy 101 │ test **0**, 214 passed
+    //   `codec_names().len() == 0`              │ clippy 101 │ test **0**, 214 passed
+    //   `!registry.contains(…)` un-negated      │ clippy **0** │ test 101, 1 failed
+    //   `let _plant: u32 = "…";`                │ clippy 101 │ test 101
+    //
+    // Read it by axis. *Compiling* the minimal test targets is the one thing both
+    // do, and there `cargo test` subsumes clippy (row 4). *Linting* them is clippy's
+    // alone: the workspace table sets `clippy::all = "warn"` and denies only
+    // `unused_must_use`, so `cargo test` compiles both lint plants green — row 2
+    // with no diagnostic at all, rustc having no `len_zero` lint to emit. *Running*
+    // them is `cargo test`'s alone, and row 3 is this module's own defect class
+    // re-planted: an assertion that states the default build's contract inside the
+    // minimal build. Neither instrument contains the other; dropping either loses a
+    // whole axis, so CI keeps both.
+    //
+    // The one asymmetry worth naming, because it decides where `--all-targets` is
+    // load-bearing rather than merely cheap: on Linux its *compile* half is indeed
+    // redundant with the test step (row 4 reddens both) and only its *lint* half is
+    // unique. On the Apple cross-check's two triples nothing can be run at all, so
+    // there both halves are unique and that invocation is the only instrument in CI
+    // that so much as looks at this code.
+    //
+    // The split below is by **property**, not by copying each test twice. Everything
+    // `Registry` promises regardless of which codecs are compiled in is asserted
+    // once, ungated, and so runs in *both* configurations; the built-in set itself
+    // is asserted under `#[cfg(feature = "codec-reference")]` for the default build
+    // and under `#[cfg(not(...))]` for the minimal one. That minimal arm is not
+    // symmetry for its own sake: "`with_builtins()` is empty" is the promise §8
+    // makes about a minimal build, and until item 102 no test on any platform
+    // asserted it — the five failures were the only thing the configuration said,
+    // and they said it where nobody was listening.
+    //
+    // **Deliberately not done:** driving these from a `BUILT_IN_NAMES` slice picked
+    // by `cfg!`. Every assertion looped over an empty slice is vacuously true, so
+    // the minimal arm's passing output would equal its not-running output — plan §3
+    // rule 22's tell, and the same shape as the vacuous doctor loop notes §3.103
+    // replaced. The expected names are written out literally, per configuration.
+
+    /// Sorting belongs to `codec_names()` itself and not to whichever built-ins a
+    /// build carries, so it is proven from an empty registry with the two names
+    /// registered in *descending* order — which keeps the property in the minimal
+    /// build too, instead of borrowing `reference` as a second name.
+    #[test]
+    fn register_adds_a_codec_and_sorts_names() {
+        let registry = Registry::new()
+            .register("zzz", dummy())
+            .expect("a fresh name registers")
+            .register("aaa", dummy())
+            .expect("a second fresh name registers");
+        // Registered descending, reported ascending.
+        assert_eq!(
+            registry.codec_names(),
+            vec!["aaa".to_owned(), "zzz".to_owned()]
+        );
+        assert!(
+            registry.contains("aaa"),
+            "the first registration is queryable"
+        );
+        assert!(
+            registry.contains("zzz"),
+            "the second registration is queryable"
+        );
+    }
+
+    /// The general rule (§8/§15.26). The instance an embedder actually meets — a
+    /// collision against a name `with_builtins()` seeded — is
+    /// `registering_over_a_built_in_name_is_a_startup_error`, which needs a built-in
+    /// to exist and is therefore gated.
+    #[test]
+    fn a_duplicate_name_is_a_startup_error() {
+        let err = Registry::new()
+            .register("twice", dummy())
+            .expect("a fresh name registers")
+            .register("twice", dummy())
+            .expect_err("the second registration collides");
+        assert_eq!(err, RegistryError::Duplicate("twice".to_owned()));
+    }
+
+    /// RV-10: `exec` is a usable codec name, so the operator-facing list names it —
+    /// while the registration-level list keeps meaning "registered factories", which
+    /// is what `register` and `build` are judged against. Asserted over registries
+    /// whose whole contents this test put there, so it holds in a minimal build as
+    /// well as the default one.
+    #[test]
+    fn the_usable_names_include_the_reserved_exec_codec() {
+        // An empty registry (a minimal daemon with no built-in codecs, §8) still has
+        // `exec` — that is the whole point of the escape hatch.
+        assert_eq!(
+            Registry::new().usable_codec_names(),
+            vec!["exec".to_owned()]
+        );
+
+        let registry = Registry::new()
+            .register("aaa", dummy())
+            .expect("a fresh name registers");
+        assert_eq!(
+            registry.usable_codec_names(),
+            vec!["aaa".to_owned(), "exec".to_owned()],
+            "the usable list must name every codec a configuration may use, sorted"
+        );
+        assert!(
+            !registry.codec_names().contains(&"exec".to_owned()),
+            "exec must stay out of the registration-level list: it has no factory"
+        );
+    }
+
+    #[test]
+    fn the_exec_name_is_reserved() {
+        let err = Registry::new()
+            .register("exec", dummy())
+            .expect_err("exec is reserved for the child-process codec");
+        assert_eq!(err, RegistryError::Reserved("exec".to_owned()));
+    }
+
+    /// `build`'s defensive fallback names what it *could* have built. The list is
+    /// this test's own registration, so the assertion means the same thing in both
+    /// builds; the default build's list is checked against `reference` by
+    /// `an_unknown_codec_build_names_the_built_in_reference`.
+    #[test]
+    fn an_unknown_codec_build_names_the_available_list() {
+        let registry = Registry::new()
+            .register("aaa", dummy())
+            .expect("a fresh name registers");
+        // `Box<dyn Codec>` is not `Debug`, so match rather than `expect_err`.
+        let err = match registry.build("nope", &toml::Table::new()) {
+            Ok(_) => panic!("nope is not a registered codec"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown codec"));
+        assert!(err.contains("aaa"), "the available list is present");
+    }
+
+    /// The default build's built-in set is exactly `reference` (`[features] default
+    /// = ["codec-reference"]`). Gated because the minimal build answers the same
+    /// question the other way, in
+    /// `with_builtins_registers_nothing_when_every_built_in_codec_feature_is_off`.
+    #[cfg(feature = "codec-reference")]
     #[test]
     fn with_builtins_registers_the_reference_codec() {
         let registry = Registry::with_builtins();
@@ -214,8 +387,9 @@ mod tests {
         assert_eq!(registry.codec_names(), vec!["reference".to_owned()]);
     }
 
+    #[cfg(feature = "codec-reference")]
     #[test]
-    fn register_adds_a_codec_and_sorts_names() {
+    fn register_adds_a_codec_alongside_the_built_in_and_sorts_names() {
         let registry = Registry::with_builtins()
             .register("aaa", dummy())
             .expect("fresh name registers");
@@ -226,19 +400,18 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "codec-reference")]
     #[test]
-    fn a_duplicate_name_is_a_startup_error() {
+    fn registering_over_a_built_in_name_is_a_startup_error() {
         let err = Registry::with_builtins()
             .register("reference", dummy())
             .expect_err("reference is already a built-in");
         assert_eq!(err, RegistryError::Duplicate("reference".to_owned()));
     }
 
-    /// RV-10: `exec` is a usable codec name, so the operator-facing list names it —
-    /// while the registration-level list keeps meaning "registered factories", which
-    /// is what `register` and `build` are judged against.
+    #[cfg(feature = "codec-reference")]
     #[test]
-    fn the_usable_names_include_the_reserved_exec_codec() {
+    fn the_usable_names_union_the_reserved_exec_over_the_built_ins() {
         let registry = Registry::with_builtins();
         assert_eq!(
             registry.usable_codec_names(),
@@ -249,20 +422,19 @@ mod tests {
             !registry.codec_names().contains(&"exec".to_owned()),
             "exec must stay out of the registration-level list: it has no factory"
         );
-        // An empty registry (a minimal daemon with no built-in codecs, §8) still has
-        // `exec` — that is the whole point of the escape hatch.
-        assert_eq!(
-            Registry::new().usable_codec_names(),
-            vec!["exec".to_owned()]
-        );
     }
 
+    #[cfg(feature = "codec-reference")]
     #[test]
-    fn the_exec_name_is_reserved() {
-        let err = Registry::new()
-            .register("exec", dummy())
-            .expect_err("exec is reserved for the child-process codec");
-        assert_eq!(err, RegistryError::Reserved("exec".to_owned()));
+    fn an_unknown_codec_build_names_the_built_in_reference() {
+        let registry = Registry::with_builtins();
+        // `Box<dyn Codec>` is not `Debug`, so match rather than `expect_err`.
+        let err = match registry.build("nope", &toml::Table::new()) {
+            Ok(_) => panic!("nope is not a registered codec"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown codec"));
+        assert!(err.contains("reference"), "the available list is present");
     }
 
     /// The built-in `reference` factory owes the same attribute contract an
@@ -291,15 +463,44 @@ mod tests {
         );
     }
 
+    /// **The minimal build's own promise, which nothing asserted before plan §18
+    /// item 102.** §8 puts each built-in behind a Cargo feature "so minimal builds
+    /// drop what they don't need"; `--no-default-features` is that build, and what
+    /// it owes is an *empty* `with_builtins()` — not a registry that quietly kept
+    /// `reference` anyway, and not a `with_builtins()` that fails to compile. `exec`
+    /// survives because it is reserved rather than registered (§7.6/RV-10), and a
+    /// configuration naming `reference` now fails structurally with the available
+    /// list — which is the whole operator-visible difference between the two builds,
+    /// and the reason `codec-authors.md` can promise the feature drops the codec.
+    #[cfg(not(feature = "codec-reference"))]
     #[test]
-    fn an_unknown_codec_build_names_the_available_list() {
+    fn with_builtins_registers_nothing_when_every_built_in_codec_feature_is_off() {
         let registry = Registry::with_builtins();
-        // `Box<dyn Codec>` is not `Debug`, so match rather than `expect_err`.
-        let err = match registry.build("nope", &toml::Table::new()) {
-            Ok(_) => panic!("nope is not a registered codec"),
+        assert!(
+            !registry.contains("reference"),
+            "a build with codec-reference off must not carry the reference codec"
+        );
+        assert_eq!(
+            registry.codec_names(),
+            Vec::<String>::new(),
+            "with_builtins() seeds exactly the built-ins whose feature is on"
+        );
+        assert_eq!(
+            registry.usable_codec_names(),
+            vec!["exec".to_owned()],
+            "exec is reserved rather than registered, so it survives a minimal build"
+        );
+        // The operator-facing consequence, stated rather than implied: the config
+        // that loads on the default binary is refused here, structurally and by
+        // name, instead of the codec silently doing nothing.
+        let err = match registry.build("reference", &toml::Table::new()) {
+            Ok(_) => panic!("codec-reference is off in this build, so nothing builds it"),
             Err(e) => e,
         };
         assert!(err.contains("unknown codec"));
-        assert!(err.contains("reference"), "the available list is present");
+        assert!(
+            err.contains("reference"),
+            "the refusal names the codec the configuration asked for"
+        );
     }
 }

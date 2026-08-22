@@ -32,9 +32,23 @@ ExecStart=/usr/local/bin/serial-nexus-daemon \
 # "Upgrading to this build". Skipping it costs every node added since the last `load`.
 
 # --- Identity ------------------------------------------------------------------
-# A transient, unprivileged service identity. It still needs the `dialout` group to
-# open USB serial device nodes (/dev/ttyUSB*, /dev/ttyACM* are root:dialout 0660).
-# If your distro uses `uucp` instead, change it here.
+# A transient, unprivileged service identity. It still needs the group that owns the
+# USB serial device nodes. That group is `dialout` where this project has measured it:
+# /dev/ttyUSB* and /dev/ttyACM* are root:dialout mode 0660 on one box, one distro
+# (Ubuntu, udev 259), across two drivers and two majors — `ftdi_sio` (188) and
+# `cdc_acm` (166), both resolving through the same shipped udev rule. The evidence and
+# its scope are in packaging/README.md under `SupplementaryGroups=`.
+#
+# That is a measurement of one box, not a claim about yours. Read the group off your
+# own nodes before trusting the value below, and change it if it differs:
+#
+#     stat -c '%G %a %n' /dev/ttyUSB* /dev/ttyACM*
+#
+# This line used to name a specific alternative group as the one "your distro" uses.
+# Nothing in this project had ever booted a distro that does, so the name was an
+# assertion the record could not support — and an operator who needs it has the answer
+# on their own box in one command, which is worth more than a guess at which name it
+# will be (plan §18 item 78(b)).
 DynamicUser=yes
 SupplementaryGroups=dialout
 
@@ -60,6 +74,23 @@ StateDirectoryMode=0700
 LogsDirectory=serial-nexus-daemon
 LogsDirectoryMode=0750
 
+# **The recipe below is executed, not just read.** itest/tests/p8_packaging.rs parses
+# the commands, the replacement directives and the predicted stat output straight out
+# of these comments and runs them on a box that has root — so the shapes matter. A
+# line beginning `sudo ` is a command (continued onto the next line with a trailing
+# backslash); a line that is a bare `Name=value` is a replacement directive; a line
+# whose text begins with a second `#` is predicted output. Prose between them is
+# ignored, deliberately, because this block explains itself in sentences. The gate
+# derives its own plants from the recipe it has just parsed, so the group's name lives
+# here and on no executable line anywhere else: rename it in every half of this block
+# and the gate follows you; rename it in one half and the gate names the half that
+# disagrees. Both arms measured 2026-08-21 — and before that a CONSISTENT rename was
+# refused, by the machinery written to catch inconsistent ones.
+#
+# The two `stat` paths are the exception, and they are pinned on purpose: the directory
+# is held to RuntimeDirectory= and the socket to ExecStart='s own --socket, because a
+# verification step that agrees only with itself verifies nothing.
+#
 # The control socket's file permissions ARE the authorization model (§10): 0600
 # owner-only by default. Letting a `console-operators` group drive the daemon needs the
 # RUNTIME DIRECTORY to belong to that group as well, and that is the part a

@@ -150,15 +150,11 @@
 //!   after body row 17 renders as **one table of 17 rows plus a paragraph**, so
 //!   sixteen of the thirty-three authority rows stop being in a table at all. That
 //!   makes the interruption *itself* the defect rather than a reason to check fewer
-//!   rows — plan §3 rule 19's authority surface is one table — so the expectation is
-//!   now derived from the run of **row-shaped** lines below the delimiter
-//!   ([`row_shaped_surface`]), which steps over exactly the interruptions the walk
-//!   stops at and reports every one it steps over. Two expectations now bracket the
-//!   walk: the non-blank run is blind to a blank line — it stops on the very one the
-//!   walk stops on — while the surface is blind to neither shape, so the surface is
-//!   the one that reports an interruption. The run is kept because it stops for a
-//!   *different* reason than the walk does, and two rules that stop for different
-//!   reasons are evidence where one rule is a restatement.
+//!   rows — plan §3 rule 19's authority surface is one table — so a second
+//!   expectation was added beside the walk, blind to what the walk is blind to. The
+//!   non-blank run is kept because it stops for a *different* reason than the walk
+//!   does, and two rules that stop for different reasons are evidence where one rule
+//!   is a restatement.
 //!
 //!   The second: [`locate_table`] takes the **first** line carrying the needle, so a
 //!   second table under the same header aimed the entire gate at the decoy and left
@@ -170,8 +166,31 @@
 //!   decoy is *ideal* by every check it makes. The only defence is that there be one
 //!   table. Both renderers were asked what a decoy is, too: with a blank line between
 //!   them it is two tables (9 rows and 33), and with no blank it is **one** table of
-//!   44 rows — which is why the surface walk reads a header-plus-delimiter pair as
-//!   the next table only when a block boundary precedes it ([`table_starts_at`]).
+//!   44 rows — which is why a header-plus-delimiter pair inside an uninterrupted run
+//!   of rows is not a new table ([`table_starts_at`]).
+//!
+//!   **Its third pass deleted the second expectation rather than repairing it**
+//!   (plan §18 item 99), because the thing being repaired was the *shape* of the
+//!   rule and not its arithmetic. Every version of it answered "does the table
+//!   continue here?" by looking ahead over a window, and the window was the defect's
+//!   own lever three times running: first the next non-row line, then the next
+//!   non-row line with no rows under it, then the first heading with no rows before
+//!   the heading after it — and **two adjacent headings planted inside the table
+//!   both satisfy the third**, so the first of them ended the section from inside the
+//!   table it was in. Measured on this document: `""` / `"#### Retired figures"` /
+//!   `""` / a sentence / `""` / `"#### Retired table"` / `""` before line 50, plus a
+//!   surplus cell below, printed `ok` while both reference renderers rendered 16 body
+//!   rows against the table's 39. One heading was caught, two were not, three were
+//!   not either. The same window was also crying wolf in the other direction: a
+//!   legitimate three-column table anywhere below the Status table in its section
+//!   reddened the gate — while a two-column one did not, the row shape having a
+//!   three-cell floor — with a message naming *all* 39 rows as the truncated surface.
+//!   What replaced it has no window and no yardstick to move
+//!   ([`authority_surface`]): a figure is on the authority surface iff GFM renders it
+//!   inside a table, a table exists iff a **frame** introduced it, and the expectation
+//!   is that no row-shaped line below this table's header sits outside one — a
+//!   constant zero, over the whole document, and measured at 0 against the 4107
+//!   lines below that header, 80 of which carry a pipe.
 //!
 //! **What makes each of these a gate rather than a decoration** (AGENTS §3: "a
 //! scanning gate proves its **matcher** as well as its walker — plant the violation
@@ -3370,175 +3389,216 @@ fn is_row_shaped(line: &str) -> bool {
 }
 
 /// Does a table **begin** at `lines[index]` — a row-shaped line with a delimiter row
-/// directly beneath it, which is GFM's own two-line signature for a table's frame?
+/// directly beneath it *and the same number of cells in both*, which is GFM's own
+/// two-line signature for a table's frame?
 ///
-/// Only ever asked after a block boundary, because that is the only place the answer
-/// is yes. Measured on both reference renderers with this document's table: a nine-row
+/// Measured on both reference renderers with this document's table: a nine-row
 /// table, a blank line, then this table renders as **two** tables (9 rows and 33),
 /// while the same pair with the blank line removed renders as **one** table of 44 rows
 /// — the second header and its `|---|` become ordinary body rows. So a header-plus-
-/// delimiter pair inside an uninterrupted run of rows is not a new table, and the
-/// surface walk must not treat it as one.
+/// delimiter pair inside an uninterrupted run of rows is not a new table, and
+/// [`authority_surface`] must not treat it as one.
+///
+/// **The cell-count clause is load-bearing and was missing** (plan §18 item 99). GFM
+/// renders a table only when the delimiter row has exactly the header's cell count:
+/// `| a | b | c |` over `| --- | --- |` and the same over `| --- | --- | --- | --- |`
+/// each render **no table at all** in `marked@15` and in `micromark` +
+/// `micromark-extension-gfm-table`, which agree. Without the clause a scan that
+/// consumes frames would swallow such a pair and every row under it, reporting
+/// nothing about lines GitHub shows as a paragraph of pipes — the exact silence this
+/// file exists to remove, one layer down.
+///
+/// This is asked at every line the scan is not already inside a table or a fence,
+/// **not only after a block boundary**. The comment here used to claim a block
+/// boundary was "the only place the answer is yes"; both renderers falsify that — a
+/// frame directly under `Some prose` or under `**bold prose**` renders as a table in
+/// each. Requiring a boundary would therefore call a real table's rows orphans,
+/// which is a false alarm on a correct document and the one direction a gate may not
+/// fail in.
+///
+/// The limit, stated because it is the obvious over-read: the two renderers disagree
+/// about a frame directly under a list marker or a blockquote (`marked` renders a
+/// table, `micromark` does not), and this function follows `marked` there by not
+/// looking up at all. Reading such a pair as a frame would hide the rows under it
+/// from [`authority_surface`] — but a Status row cannot open with `-` or `>` in the
+/// first place ([`ends_gfm_table`] ends the table on both), and these two shapes are
+/// already two of the seven recorded renderer disagreements.
 fn table_starts_at(lines: &[&str], index: usize) -> bool {
-    lines.get(index).is_some_and(|line| is_row_shaped(line))
-        && lines
-            .get(index + 1)
-            .is_some_and(|line| is_delimiter_row(line))
+    let Some(header) = lines.get(index).filter(|line| is_row_shaped(line)) else {
+        return false;
+    };
+    lines.get(index + 1).is_some_and(|line| {
+        is_delimiter_row(line) && split_cells(line).len() == split_cells(header).len()
+    })
 }
 
-/// Is `line` an **ATX heading** — up to three columns of indent, then one to six
-/// `#`, then a space or the line's end?
+/// Does `line` open or close a **fenced code block**, and with which character?
 ///
-/// [`ends_gfm_table`] already answers the wider question — does this line open a
-/// block — which every heading does and so does a blank line, a list marker and a
-/// fence. This asks the narrow one, because only a heading bounds a *section*, and
-/// the section is what [`row_shaped_surface`] measures its extent against.
-fn is_atx_heading(line: &str) -> bool {
+/// Up to three columns of indent, then three or more backticks or tildes. A fence is
+/// the one place a row-shaped line is not a row: both reference renderers render
+/// `| a | b | c |` inside a fence as code and **no table at all**, so a documented
+/// example of a broken table — the likeliest thing this pair of documents will ever
+/// grow, given what plan §18 item 99 is about — must not be read as a broken table.
+/// That is the cry-wolf direction, and this gate has been in it once already.
+///
+/// The plan carries no fence at all below the Status table's header today, so this
+/// arm is proven only by the fixtures in the test: it is skipped code on the real
+/// document, and skipped code that nothing plants against is decoration.
+fn fence_delimiter(line: &str) -> Option<char> {
     let rest = line.trim_start();
     if line.len() - rest.len() >= 4 {
-        return false;
+        return None;
     }
-    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
-    (1..=6).contains(&hashes)
-        && rest
-            .as_bytes()
-            .get(hashes)
-            .is_none_or(|b| *b == b' ' || *b == b'\t')
-}
-
-/// The 1-based line the section holding the table headed at `header_line` ends on:
-/// the first ATX heading below it that does **not** have row-shaped lines between it
-/// and the heading after it, or one past the last line of the document.
-///
-/// Why not simply "the next heading". A heading is a terminator, so a heading
-/// planted *inside* a table is byte-for-byte the shape of the heading that ends the
-/// section — and taking the first one would let the very interruption this walk
-/// exists to report choose the window it is reported in. That is AGENTS §3's tell
-/// one level down: the yardstick moves with the defect, so a passing output is
-/// identical to a not-running one. Measured on this document: `""`, `"#### Retired
-/// figures"`, `""`, a sentence and `""` planted before line 50 printed `ok` against
-/// a surface bounded by the first heading below the table, with seventeen of the
-/// thirty-three authority rows outside it. A heading with rows below it is therefore
-/// read as an interruption; the first one without them ends the section.
-///
-/// The limit, stated because it is the obvious over-read: `#` inside a fenced code
-/// block reads as a heading here. Nothing between this table and its section's end
-/// is fenced, and the direction of that error is a section that ends *early*, which
-/// this rule then rejects for the rows below it.
-fn section_end_below(lines: &[&str], header_line: usize) -> usize {
-    let headings: Vec<usize> = (header_line..lines.len())
-        .filter(|index| is_atx_heading(lines[*index]))
-        .collect();
-    for (nth, heading) in headings.iter().enumerate() {
-        let next = headings.get(nth + 1).copied().unwrap_or(lines.len());
-        if !lines[heading + 1..next].iter().any(|l| is_row_shaped(l)) {
-            return heading + 1;
-        }
+    if rest.starts_with("```") {
+        Some('`')
+    } else if rest.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
     }
-    lines.len() + 1
 }
 
-/// Is any line row-shaped in `from ..` up to the end of the section that ends on the
-/// 1-based line `section_end`?
+/// Every **orphan row** below the Status table's own frame — a line GFM reads as a
+/// table row while rendering it inside no table at all — plus the frames met on the
+/// way and a second frame stacked directly under this one.
 ///
-/// The question that tells the table's real end from an interruption: both are a
-/// line the table cannot continue through, and only "do the rows come back"
-/// separates them.
-fn row_shaped_below(lines: &[&str], from: usize, section_end: usize) -> bool {
-    let stop = (section_end - 1).min(lines.len());
-    from < stop && lines[from..stop].iter().any(|l| is_row_shaped(l))
+/// **Why this replaced a section window** (plan §18 item 99). The three shapes this
+/// walk has to separate are the same three lines to a reader: a blank inside the
+/// table, a heading inside the table, and the end of the table. Every rule tried
+/// before this one answered "does the table continue here?" by looking *ahead* over
+/// some window, and each time the window was the defect's own lever:
+///
+/// 1. the first line that is not a row — a blank inside the table ended the walk,
+///    and the derived expectation stopped on the same line for the same reason, so
+///    the two agreed by construction;
+/// 2. the first line that is not a row **with no rows below it** — better, but the
+///    "below" had to stop somewhere, and stopping at the first heading let a heading
+///    planted inside the table choose its own window;
+/// 3. the first heading with no row-shaped line before the *next* heading — which is
+///    where item 99 found it: **two** adjacent headings inside the table both
+///    qualify, because the prose between them carries no row, so the first of them
+///    ends the section and the walk stops inside the table. Measured on this
+///    document, `""` / `"#### Retired figures"` / `""` / a sentence / `""` /
+///    `"#### Retired table"` / `""` planted before line 50, plus a surplus cell on a
+///    row below it: walk 16, non-blank run 16, surface 16, section end 51 — *the
+///    planted heading* — no interruptions, no offences, `ok`. Both reference
+///    renderers render that document as **16 body rows against the table's 39**,
+///    with the malformed row among the 23 that leave. One heading was caught; two
+///    were not; three are not either.
+///
+/// The window was also the cry-wolf half. Every row-shaped line anywhere in the
+/// enclosing section was inside the walk's scope, so a legitimate, well-formed
+/// **three-column** table placed below the Status table in the same section reddened
+/// the gate — while a two-column one did not, `is_row_shaped`'s floor being three.
+/// From a reader's position the trigger was a column count. Measured on this
+/// document at the unfixed tree: a `| Name | Meaning | Note |` table planted at line
+/// 105 reddened with the frame stop at line 108 and the message *"the 39 row(s) this
+/// walk reached are the whole authority surface"* — 39 being every row there is —
+/// while the same block one column narrower printed `ok`.
+///
+/// **What replaced it has no window.** The question stops being "where does the
+/// table end" and becomes the one plan §3 rule 19 actually asks: *is there a figure
+/// below this table that GitHub renders in no table at all?* A row-shaped line
+/// belongs to a table iff a **frame** introduced it ([`table_starts_at`]) — GFM's
+/// own two-line signature, which is what the renderers key on too. So this walks
+/// from the Status table's own header to the end of the document, consuming each
+/// table it meets frame-first and skipping fenced blocks, and reports every
+/// row-shaped line that lands between tables. The expectation is the constant zero:
+/// there is no yardstick left for an edit to move.
+///
+/// **What running to the end of the document costs, because the item asked for the
+/// cost and not for the direction.** Measured on the plan as it stands: 4107 lines
+/// below the Status table's header, 80 of them carrying a pipe and 74 carrying two,
+/// three tables consumed as frames, and **zero** orphans. Exactly five lines outside
+/// those tables do split into three or more cells — `` `KERNEL=="tty[A-Z]*[0-9]|…"` ``
+/// among them — and every one of the five is a §18 continuation line indented four
+/// columns, which [`ends_gfm_table`] already reads as code. The residual risk is a
+/// future *unindented* prose line carrying two bare pipes, which would be reported
+/// as an orphan far from the Status table; the message below therefore names the
+/// remedy for that case as well as for the real one, because the tree's own
+/// convention is to escape a pipe in prose (`\\|`) and `split_cells` documents why.
+/// Every narrower extent is a rule about headings, and every heading rule tried so
+/// far has been the defect's own lever.
+///
+/// **What this deliberately does not see, stated because it is the obvious
+/// over-read.** Rows moved out of the Status table into a second, *well-formed*
+/// table under its own heading are in a table, so they are not orphans and this
+/// reports nothing — which is right, because that is the remediation the failure
+/// message itself asks for. The one shape of that class still worth reporting is a
+/// second frame **stacked directly under this table's run with nothing but blank
+/// lines between them**: both renderers read that as two tables, a reader sees one
+/// broken one, and no other check here can see it — the needle counter reads the
+/// header line, so a second frame spelled differently is invisible to it. That, and
+/// only that, is [`AuthoritySurface::stacked_frame`]; a table separated from this one
+/// by so much as a sentence is a different table and is left alone.
+struct AuthoritySurface {
+    /// `(1-based line number, raw line)` for every row-shaped line below the Status
+    /// table's frame that sits inside no table at all.
+    orphans: Vec<(usize, String)>,
+    /// The 1-based header line of every table frame the scan consumed, the first of
+    /// which is the Status table's own. Carried as the walker's anchor: a scan that
+    /// consumed the wrong first frame is measuring another document's table, and
+    /// reports its clean verdict just as loudly.
+    frames: Vec<usize>,
+    /// A second table's frame stacked under the Status table's run with nothing but
+    /// blank lines between them, as `(1-based line number, raw line)`.
+    stacked_frame: Option<(usize, String)>,
 }
 
-/// The run of **row-shaped** lines below `table`'s delimiter, and every interruption
-/// stepped over on the way.
-///
-/// The expectation an interruption cannot move, and the reason it is needed:
-/// [`non_blank_run_below_delimiter`] stops at a blank line and so does the walk
-/// ([`ends_gfm_table`]), so for a *blank* interruption the derived expectation and the
-/// walk agree by construction and the extent check cannot fire — a passing output
-/// identical to a clean run, which is AGENTS §3's own tell. This walk instead steps
-/// over every line the table cannot continue through and keeps counting, so a
-/// truncation moves the walk and leaves this count where it was.
-///
-/// **Where it stops is derived from the enclosing section, not from the first line
-/// that is not a row** ([`section_end_below`]). Taking the first such line was a
-/// third truncator and it hid the same defect in a third way: a terminator run
-/// followed by anything the walk also stops on — ordinary prose, a planted heading —
-/// ended the surface *inside* the table, the pending run was dropped, and all three
-/// counters then agreed on the truncated count. Measured on this document, each
-/// printing `ok` with seventeen authority rows outside every check below: a blank
-/// plus a sentence plus a blank before line 50; the same without the trailing blank;
-/// and the same with a `####` heading in it. A non-row line ends the surface only
-/// when no row-shaped line follows it before the section does, so the pending run at
-/// the stop is provably empty — every terminator with a row under it has already
-/// been reported.
-///
-/// It still stops at the frame of the *next* table ([`table_starts_at`]), because
-/// both reference renderers read a header-plus-delimiter pair below a block boundary
-/// as a second table and this file does not get to disagree with them. That stop is
-/// **reported** rather than silent ([`RowSurface::stopped_at_frame`]): GFM is right
-/// that those are two tables, and for the authority surface that is the defect
-/// rather than the answer.
-struct RowSurface {
-    /// Row-shaped lines below the delimiter, interruptions ignored.
-    rows: usize,
-    /// `(1-based line number, raw line)` for each interruption inside the run.
-    interruptions: Vec<(usize, String)>,
-    /// The 1-based line the surface walk stopped on, or one past the document.
-    end_line: usize,
-    /// The line at [`RowSurface::end_line`], or `None` at end of document.
-    terminator: Option<String>,
-    /// The walk stopped on the frame of another table rather than on the end of the
-    /// table's own run — so the rows below it are in a second table.
-    stopped_at_frame: bool,
-}
-
-fn row_shaped_surface(md: &str, table: &MarkdownTable) -> RowSurface {
+fn authority_surface(md: &str, table: &MarkdownTable) -> AuthoritySurface {
     let lines: Vec<&str> = md.lines().collect();
-    let section_end = section_end_below(&lines, table.header_line);
-    let mut rows = 0usize;
-    let mut pending: Vec<(usize, String)> = Vec::new();
-    let mut interruptions: Vec<(usize, String)> = Vec::new();
-    let mut end_line = lines.len() + 1;
-    let mut terminator = None;
-    let mut stopped_at_frame = false;
-    for (index, line) in lines.iter().enumerate().skip(table.header_line + 1) {
-        // Past the enclosing section the rows belong to another surface, whatever
-        // they look like.
-        if index + 1 >= section_end {
-            end_line = index + 1;
-            terminator = Some((*line).to_owned());
-            break;
-        }
-        // A table frame below a block boundary is the next table, not this one's
-        // continuation.
-        if !pending.is_empty() && table_starts_at(&lines, index) {
-            end_line = index + 1;
-            terminator = Some((*line).to_owned());
-            stopped_at_frame = true;
-            break;
-        }
-        if is_row_shaped(line) {
-            rows += 1;
-            interruptions.append(&mut pending);
+    let mut orphans = Vec::new();
+    let mut frames = Vec::new();
+    let mut stacked_frame = None;
+    let mut fence: Option<char> = None;
+    // The Status table's own header line, 0-based: the scan is anchored on the table
+    // under audit rather than on the top of the document, so a decoy above it is
+    // another gate's business ([`lines_containing`]) and not silently folded in here.
+    let mut index = table.header_line - 1;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(open) = fence {
+            if fence_delimiter(line) == Some(open) {
+                fence = None;
+            }
+            index += 1;
             continue;
         }
-        // The table's real end: a line it cannot continue through, with no row-shaped
-        // line under it before the section ends. Anything else is an interruption,
-        // and is held until the rows that prove it was one arrive.
-        if !row_shaped_below(&lines, index + 1, section_end) {
-            end_line = index + 1;
-            terminator = Some((*line).to_owned());
-            break;
+        if let Some(open) = fence_delimiter(line) {
+            fence = Some(open);
+            index += 1;
+            continue;
         }
-        pending.push((index + 1, (*line).to_owned()));
+        if table_starts_at(&lines, index) {
+            let is_the_status_table = frames.is_empty();
+            frames.push(index + 1);
+            // Frame, then rows, then GFM's own end of the table.
+            index += 2;
+            while index < lines.len() && !ends_gfm_table(lines[index]) {
+                index += 1;
+            }
+            if is_the_status_table {
+                // …and the one adjacency worth reporting: a second frame under this
+                // table's run with nothing but blank lines between them.
+                let mut after = index;
+                while after < lines.len() && lines[after].trim().is_empty() {
+                    after += 1;
+                }
+                if after > index && table_starts_at(&lines, after) {
+                    stacked_frame = Some((after + 1, lines[after].to_owned()));
+                }
+            }
+            continue;
+        }
+        if is_row_shaped(line) {
+            orphans.push((index + 1, line.to_owned()));
+        }
+        index += 1;
     }
-    RowSurface {
-        rows,
-        interruptions,
-        end_line,
-        terminator,
-        stopped_at_frame,
+    AuthoritySurface {
+        orphans,
+        frames,
+        stacked_frame,
     }
 }
 
@@ -3795,39 +3855,139 @@ fn every_status_table_row_has_the_headers_cell_count() {
          frame"
     );
 
-    // …and the surface walk itself, on synthetic documents small enough to read.
+    // …and the authority surface itself, on synthetic documents small enough to read.
     // The first is the defect's own shape: an interrupted table, where the walk sees
-    // one row and the surface sees both.
+    // one row and the row below the gap is in no table at all.
     let interrupted_fixture =
         "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\n| 4 | 5 | 6 |\n\nprose\n";
     let fixture_table = locate_table(interrupted_fixture, "| a | b | c |")
         .expect("the fixture carries a table under its own header");
-    let fixture_surface = row_shaped_surface(interrupted_fixture, &fixture_table);
+    let fixture_surface = authority_surface(interrupted_fixture, &fixture_table);
     assert_eq!(
         (
             fixture_table.rows.len(),
-            fixture_surface.rows,
-            fixture_surface.interruptions.len()
+            fixture_surface
+                .orphans
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
+            fixture_surface.frames.clone(),
         ),
-        (1, 2, 1),
-        "on a table with one blank line inside it the walk must see 1 row, the \
-         surface 2, and the interruption must be reported. Anything else and the \
-         expectation moves with the truncation it exists to detect — which is the \
-         state this gate shipped in"
+        (1, vec![5], vec![1]),
+        "on a table with one blank line inside it the walk must see 1 row and line 5 \
+         must be reported as an orphan — a row GFM renders in no table at all. \
+         Anything else and the expectation moves with the truncation it exists to \
+         detect, which is the state this gate shipped in three times running"
     );
     // The second: two tables one blank line apart are two tables, not one
-    // interrupted one. Both reference renderers agree, and a surface walk that
-    // disagreed would redden every document that stacks tables.
+    // interrupted one. Both reference renderers agree, so no row of the second is an
+    // orphan — and for the Status table alone that stack is still worth reporting,
+    // because plan §3 rule 19 makes one table the home of every current-era figure.
     let stacked_fixture = "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\n| a | b | c |\n|---|---|---|\n| 4 | 5 | 6 |\n";
     let stacked_table = locate_table(stacked_fixture, "| a | b | c |")
         .expect("the fixture carries a table under its own header");
-    let stacked_surface = row_shaped_surface(stacked_fixture, &stacked_table);
+    let stacked_surface = authority_surface(stacked_fixture, &stacked_table);
     assert_eq!(
-        (stacked_surface.rows, stacked_surface.interruptions.len()),
-        (1, 0),
-        "the surface walk read the *next* table's rows as this one's, so a document \
-         with two tables a blank line apart reddens on a defect it does not have — \
-         and a gate that cries wolf on a correct document is a gate that gets deleted"
+        (
+            stacked_surface.orphans.len(),
+            stacked_surface.frames.clone(),
+            stacked_surface.stacked_frame.as_ref().map(|(l, _)| *l),
+        ),
+        (0, vec![1, 5], Some(5)),
+        "a document with two tables a blank line apart must yield no orphan — every \
+         row of the second is inside a frame, and reading them as this table's rows \
+         is the false alarm that got the section window deleted — while the stack \
+         itself is reported at line 5, which is the one shape no other check here can \
+         see"
+    );
+    // …and the same two tables with a sentence between them, which is the shape the
+    // retired rule cried wolf on: a correct document that stacks tables. Nothing is
+    // reported, and it is *not* reported for a reason that has nothing to do with
+    // how many columns the second table has (plan §18 item 99: the retired trigger
+    // was `is_row_shaped`'s three-cell floor, so a two-column table below the Status
+    // table passed and a three-column one reddened, on documents a reader cannot
+    // tell apart).
+    for columns in 2..=6 {
+        let cells = |prefix: &str| {
+            format!(
+                "| {} |",
+                (1..=columns)
+                    .map(|n| format!("{prefix}{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        };
+        let neighbour_fixture = format!(
+            "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\nA sentence between them.\n\n{}\n|{}\n{}\n",
+            cells("h"),
+            "---|".repeat(columns),
+            cells("r"),
+        );
+        let neighbour_table = locate_table(&neighbour_fixture, "| a | b | c |")
+            .expect("the fixture carries a table under its own header");
+        let neighbour_surface = authority_surface(&neighbour_fixture, &neighbour_table);
+        assert_eq!(
+            (
+                neighbour_surface.orphans.len(),
+                neighbour_surface.stacked_frame.is_some()
+            ),
+            (0, false),
+            "a legitimate {columns}-column table below this one, separated by a \
+             sentence, was reported. That is a correct document — both reference \
+             renderers render two tables — and a gate that cries wolf on a correct \
+             document is a gate that gets deleted. The retired rule reddened for \
+             every column count above two and stayed green at two, which is the same \
+             page to a reader"
+        );
+    }
+    // A frame whose delimiter row does not match its header's cell count is no frame
+    // at all: both renderers render that document as a paragraph of pipes, so its
+    // header and its rows are orphans and must be reported as such. Without the cell
+    // count in [`table_starts_at`] the scan would consume the pair and go quiet on
+    // every line under it.
+    let mismatch_fixture =
+        "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\n| d | e | f |\n|---|---|\n| 4 | 5 | 6 |\n";
+    let mismatch_table = locate_table(mismatch_fixture, "| a | b | c |")
+        .expect("the fixture carries a table under its own header");
+    let mismatch_surface = authority_surface(mismatch_fixture, &mismatch_table);
+    assert_eq!(
+        (
+            mismatch_surface
+                .orphans
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
+            mismatch_surface.frames.clone(),
+            mismatch_surface.stacked_frame.is_some(),
+        ),
+        (vec![5, 7], vec![1], false),
+        "a header over a delimiter row of the wrong cell count was consumed as a \
+         frame. GFM renders no table there — measured on both reference renderers — \
+         so lines 5 and 7 are rows in no table, and a scan that swallowed them would \
+         report nothing about a whole block GitHub shows as a paragraph of pipes"
+    );
+    // The fence arm, which the real document cannot exercise because it carries no
+    // fence below the Status header. A row-shaped line inside a fence is code, not a
+    // row — and the assertion above it is what keeps this from being vacuous: the
+    // line *is* row-shaped, so only the fence tracking can be what excluded it.
+    let fenced_fixture = "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\n```\n| 4 | 5 | 6 |\n```\n\n~~~\n| 7 | 8 | 9 |\n~~~\n";
+    assert!(
+        is_row_shaped("| 4 | 5 | 6 |"),
+        "the fenced line is not row-shaped to begin with, so the fixture below \
+         proves nothing about the fence"
+    );
+    let fenced_table = locate_table(fenced_fixture, "| a | b | c |")
+        .expect("the fixture carries a table under its own header");
+    assert_eq!(
+        authority_surface(fenced_fixture, &fenced_table)
+            .orphans
+            .len(),
+        0,
+        "a row-shaped line inside a fenced block was reported as an orphan. Both \
+         reference renderers render a fence's contents as code and no table at all, \
+         so an example of a broken table in either document — the likeliest thing \
+         this pair will grow, given what item 99 is about — would redden this gate on \
+         a correct page"
     );
     assert_eq!(
         lines_containing(stacked_fixture, "| a | b | c |"),
@@ -3914,81 +4074,80 @@ fn every_status_table_row_has_the_headers_cell_count() {
         table.terminator.as_deref().unwrap_or("end of document"),
     );
 
-    // 2b. …and the same walk against an expectation the interruption **cannot
-    //     move**. The check above cannot see a blank line planted inside the table,
+    // 2b. …and the same walk against an expectation no edit to this document can
+    //     move. The check above cannot see a blank line planted inside the table,
     //     and not because it is written wrongly: [`ends_gfm_table`] stops at a blank
     //     and so does the non-blank run, so the walk and its yardstick agree by
-    //     construction for that one shape. The surface walk steps over the same
-    //     terminators and keeps counting — but only because its *end* is derived
-    //     from the enclosing section rather than from the first line that is not a
-    //     row ([`section_end_below`]). That distinction is the whole of this check:
-    //     a terminator run followed by anything the walk also stops on — prose, a
-    //     planted heading, the frame of another table — used to end the surface
-    //     inside the table, and then all three counters agreed on the truncated
-    //     count and this assert restated the walk instead of checking it. Now a
-    //     non-row line ends the surface only when the rows do not come back before
-    //     the section does, so a blank moves the walk and leaves this count where
-    //     it was, whatever follows the blank.
-    let surface = row_shaped_surface(&plan, &table);
+    //     construction for that one shape. Three successive rules tried to supply a
+    //     second yardstick by looking *ahead* for the rows to come back, and each
+    //     one's window was the defect's own lever — the third, a section bounded by
+    //     the first heading with no rows under it, let **two** adjacent headings
+    //     inside the table end the section from inside it (plan §18 item 99). There
+    //     is no window here: a figure is on the authority surface iff GFM renders it
+    //     inside a table, a table exists iff a frame introduced it, and the
+    //     expectation is zero rows outside one ([`authority_surface`]).
+    let surface = authority_surface(&plan, &table);
+    assert_eq!(
+        surface.frames.first().copied(),
+        Some(table.header_line),
+        "the frame scan's first frame is at line {:?} and the Status table's header \
+         is at line {}. The scan is anchored on the table under audit, so a first \
+         frame anywhere else means it is measuring a different table and would print \
+         its clean verdict just as loudly",
+        surface.frames.first(),
+        table.header_line,
+    );
     assert!(
-        surface.interruptions.is_empty(),
-        "the Status table is interrupted at line(s) {lines:?} — the run of rows below \
-         its delimiter is broken by:\n  {report}\n\
-         GFM ends a table at a blank line or a new block, so the rows *below* an \
-         interruption are not in a table at all: measured on this table with \
-         `marked@15` and `micromark` + `micromark-extension-gfm-table`, which agree, a \
-         blank line after body row 17 renders as one table of 17 rows and a paragraph \
-         of pipes — the other sixteen figures lose their columns entirely and nothing \
-         about the page says so. Plan §3 rule 19 makes this table the single home of \
-         every current-era measured figure, so the interruption is itself the defect \
-         and not a reason to check fewer rows: close the gap, or move what is below it \
-         under its own header.",
-        lines = surface
-            .interruptions
-            .iter()
-            .map(|(line, _)| *line)
-            .collect::<Vec<_>>(),
+        surface.orphans.is_empty(),
+        "{n} line(s) below the Status table's header are rows to GFM and sit inside \
+         no table at all:\n  {report}\n\
+         The Status table's own run of rows ends at line {end_line} on {terminator:?}. \
+         Measured on this table with `marked@15` and `micromark` + \
+         `micromark-extension-gfm-table`, which agree: a blank line, a heading or any \
+         other block start inside the table ends it there, and every row below renders \
+         as a **paragraph of pipes** — the figures keep their pipes and lose their \
+         columns, and nothing about the page says so. Plan §3 rule 19 makes this table \
+         the single home of every current-era measured figure, so a figure outside a \
+         table is the defect itself and not a reason to check fewer rows.\n\
+         Close the gap and fold the rows back in; or, if what is below really is a \
+         separate table, give it a header **and** a `|---|` delimiter row of the same \
+         cell count, which is what makes GFM render it as one. If instead the line \
+         reported is ordinary prose that happens to carry two bare pipes, escape them \
+         (`\\|`) or indent it four columns — this tree's own convention, and the \
+         reason `split_cells` counts an escaped pipe as content.",
+        n = surface.orphans.len(),
         report = surface
-            .interruptions
+            .orphans
             .iter()
             .map(|(line, raw)| format!("line {line}: {:?}", preview(raw, 72)))
             .collect::<Vec<_>>()
             .join("\n  "),
+        end_line = table.end_line,
+        terminator = table.terminator.as_deref().unwrap_or("end of document"),
     );
     assert!(
-        !surface.stopped_at_frame,
-        "the run of rows below the Status table's delimiter stops at line {} on {:?} \
-         — the frame of a *second* table, one block boundary below the first. Both \
-         reference renderers agree that is two tables and not one interrupted one, \
-         and that is exactly the defect: the {} row(s) this walk reached are the \
-         whole authority surface, and every figure under the second header is \
-         outside it. Nothing else here can see this shape — the needle counter reads \
-         the header line, so a second frame spelled differently is invisible to it, \
-         and the walk and both its expectations agree on the truncated count. Plan \
-         §3 rule 19 makes one table the home of every current-era measured figure: \
-         fold the rows back in, or move them out of this section under their own \
-         header",
-        surface.end_line,
-        surface.terminator.as_deref().unwrap_or("end of document"),
-        surface.rows,
-    );
-    assert_eq!(
-        table.rows.len(),
-        surface.rows,
-        "the row walk covered {} rows against {} row-shaped line(s) below the Status \
-         table's delimiter: the walk stopped at line {} on {:?}, the surface at line \
-         {} on {:?}. The two are derived by rules blind to different things — the walk \
-         stops where GFM ends the table, the surface steps over every terminator — so \
-         they differ only when the authority surface is broken into more than one \
-         table, or when this file's parser has drifted from GFM's. Either way the \
-         figures past the break are not the quotable surface plan §3 rule 19 says they \
-         are",
-        table.rows.len(),
-        surface.rows,
-        table.end_line,
-        table.terminator.as_deref().unwrap_or("end of document"),
-        surface.end_line,
-        surface.terminator.as_deref().unwrap_or("end of document"),
+        surface.stacked_frame.is_none(),
+        "a second table's frame starts at line {} on {:?}, separated from the Status \
+         table's last row by nothing but blank lines. Both reference renderers read \
+         that as **two** tables, and a reader scrolling the page sees one table that \
+         changed its mind: every figure under the second header is outside the \
+         surface plan §3 rule 19 makes authoritative. Nothing else here can see this \
+         shape — the needle counter reads the header line, so a second frame spelled \
+         differently is invisible to it, and every row is inside *a* table, so the \
+         orphan scan is right not to report one. Fold the rows back in, or move them \
+         out from under this table: a heading or a sentence between the two is enough \
+         to make them separate tables rather than one broken one, and this check \
+         deliberately says nothing about a table that far away.",
+        surface
+            .stacked_frame
+            .as_ref()
+            .map(|(line, _)| *line)
+            .unwrap_or(0),
+        surface
+            .stacked_frame
+            .as_ref()
+            .map(|(_, raw)| preview(raw, 72))
+            .unwrap_or_default(),
     );
 
     // 3. Planted against the real document's own bytes, in every direction, before a
@@ -4124,19 +4283,18 @@ fn every_status_table_row_has_the_headers_cell_count() {
         blank_table.rows.len(),
         table.rows.len(),
     );
-    let blank_surface = row_shaped_surface(&blank_plan, &blank_table);
+    let blank_surface = authority_surface(&blank_plan, &blank_table);
     let retired_extent_passes =
         blank_table.rows.len() == non_blank_run_below_delimiter(&blank_plan, &blank_table);
-    let current_extent_passes =
-        blank_surface.interruptions.is_empty() && blank_surface.rows == blank_table.rows.len();
+    let current_extent_passes = blank_surface.orphans.is_empty();
     assert!(
         retired_extent_passes && !current_extent_passes,
         "with a blank line planted at line {blank_at}, the non-blank run {retired} and \
-         the surface walk {current}. Those two differing here is the whole of the \
+         the frame scan {current}. Those two differing here is the whole of the \
          repair: the non-blank run stops at a blank and so does the walk, so for this \
          one shape the expectation and the walk agree *by construction* and step 2's \
          check cannot fire — {} of the {} authority rows leave the gate's scope with a \
-         passing output identical to a clean run. If the surface walk also passes, \
+         passing output identical to a clean run. If the frame scan also passes, \
          nothing detects an interrupted table again",
         table.rows.len() - blank_table.rows.len(),
         table.rows.len(),
@@ -4151,24 +4309,37 @@ fn every_status_table_row_has_the_headers_cell_count() {
             "does not"
         },
     );
+    assert_eq!(
+        blank_surface.orphans.len(),
+        table.rows.len() - blank_table.rows.len(),
+        "the blank planted at line {blank_at} left the walk covering {} of this \
+         table's {} rows, and the frame scan reported {} orphan(s) — the two have to \
+         account for the same rows or one of them is counting something else. Reported: \
+         {:?}",
+        blank_table.rows.len(),
+        table.rows.len(),
+        blank_surface.orphans.len(),
+        blank_surface
+            .orphans
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>(),
+    );
     assert!(
         blank_surface
-            .interruptions
+            .orphans
             .iter()
-            .any(|(line, _)| *line == blank_at),
-        "the interruption at line {blank_at} is not named in the report ({:?}), so \
-         the gate would redden without saying where — and a red gate nobody can act \
-         on is a deleted gate",
-        blank_surface.interruptions,
-    );
-    assert_eq!(
-        blank_surface.rows,
-        table.rows.len(),
-        "the surface walk lost rows to the interruption it is supposed to step over: \
-         {} against the {} this table has. The expectation has to be derived from \
-         something the truncation cannot also move, or it is the walk restated",
-        blank_surface.rows,
-        table.rows.len(),
+            .any(|(line, _)| *line == blank_at + 1),
+        "the first row stranded by the blank at line {blank_at} — line {} of the \
+         planted document — is not named in the report ({:?}), so the gate would \
+         redden without saying where, and a red gate nobody can act on is a deleted \
+         gate",
+        blank_at + 1,
+        blank_surface
+            .orphans
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>(),
     );
 
     // 3d. …and the pair that made the silence dangerous rather than merely wrong: the
@@ -4189,18 +4360,188 @@ fn every_status_table_row_has_the_headers_cell_count() {
     );
     let pair_table = locate_table(&pair_plan, STATUS_TABLE_HEADER)
         .expect("the planted document still carries the Status table");
-    let pair_surface = row_shaped_surface(&pair_plan, &pair_table);
+    let pair_surface = authority_surface(&pair_plan, &pair_table);
     let cell_check_sees_it = named(&cell_count_offences(&pair_table), below_line + 1);
-    let interruption_check_fires = !pair_surface.interruptions.is_empty();
+    let orphan_check_names_it = pair_surface
+        .orphans
+        .iter()
+        .any(|(line, _)| *line == below_line + 1);
     assert!(
-        !cell_check_sees_it && interruption_check_fires,
+        !cell_check_sees_it && orphan_check_names_it,
         "a surplus cell on line {} — below a blank planted at line {blank_at} — was \
-         seen by the cell-count check ({cell_check_sees_it}) and the interruption \
-         check fired ({interruption_check_fires}). GFM puts that row outside the \
-         table, so the cell-count check is *right* not to reach it and the \
-         interruption is what has to be reported; this pair is exactly the mutation \
-         that used to print `ok`",
+         seen by the cell-count check ({cell_check_sees_it}) and the frame scan named \
+         that very line ({orphan_check_names_it}). GFM puts that row outside the \
+         table, so the cell-count check is *right* not to reach it and the orphan is \
+         what has to be reported — and reported at the row itself rather than at the \
+         blank, because the row is the figure a reader can no longer see. This pair \
+         is exactly the mutation that used to print `ok`",
         below_line + 1,
+    );
+
+    // 3e. The plant item 99 was filed on, and the shape that defeated the third
+    //     extent rule: **two adjacent headings** inside the table. One heading with
+    //     rows under it was read as an interruption; two were not, because the rule
+    //     asked whether a row-shaped line sat between a heading and the *next*
+    //     heading — and the prose between two planted headings carries none, so the
+    //     first of them ended the section from inside the table it was in. Measured
+    //     on this document at the unfixed tree: walk 16, non-blank run 16, surface
+    //     16, section end at the planted heading, no interruptions, no offences,
+    //     `ok`, with a surplus cell sitting on a row below the plant. Both reference
+    //     renderers render that document as 16 body rows.
+    //
+    //     The counts here are not written down: the plant lands above a well-formed
+    //     row that is taken from the table, and the orphan count is compared against
+    //     the rows the walk lost, so this proof cannot go stale as the table grows.
+    //     Two, three and four headings are all planted, because "one is caught, two
+    //     are not" was the whole defect and a fix that stopped at two would be the
+    //     same rule one notch along.
+    for headings in 2..=4 {
+        let block: String = (1..=headings)
+            .map(|n| format!("\n#### Retired figures {n}\n\nA sentence under it.\n"))
+            .collect();
+        let heading_plan = insert_before(&plan, blank_at, &block);
+        let planted_lines = heading_plan.lines().count() - plan.lines().count();
+        assert!(
+            planted_lines > 0,
+            "the {headings}-heading block was never planted, so the proof below \
+             asserts nothing"
+        );
+        // …with a surplus cell on a row below the plant, which is what makes the
+        // silence dangerous rather than merely wrong: the cell-count check is the one
+        // that was working, and a truncated walk disarms it. The victim is checked
+        // by its text before it is replaced: the plant shifts every row below it, and
+        // a plant that landed one row off would prove something about a row nobody
+        // chose (see [`insert_before`]).
+        assert_eq!(
+            heading_plan.lines().nth(below_line + planted_lines - 1),
+            Some(below_raw.as_str()),
+            "the {headings}-heading block shifted the rows by {planted_lines} lines \
+             and the row that was on line {below_line} is not on line {}, so the \
+             surplus cell below is about to land on a line nobody chose",
+            below_line + planted_lines,
+        );
+        let heading_plan = replace_line(
+            &heading_plan,
+            below_line + planted_lines,
+            &format!("{} an orphan cell |", below_raw.trim_end()),
+        );
+        let heading_table = locate_table(&heading_plan, STATUS_TABLE_HEADER)
+            .expect("the planted document still carries the Status table");
+        let lost = table.rows.len() - heading_table.rows.len();
+        assert!(
+            lost > 0,
+            "the {headings}-heading block planted at line {blank_at} did not truncate \
+             the walk, so this plant is not the interruption it is meant to be"
+        );
+        // Every check that survives the repair, on the planted document. All of them
+        // passing is what "printed `ok`" meant.
+        let retired_checks_pass = heading_table.header == split_cells(STATUS_TABLE_HEADER)
+            && delimiter_offences(&heading_table).is_empty()
+            && heading_table.rows.len()
+                == non_blank_run_below_delimiter(&heading_plan, &heading_table)
+            && cell_count_offences(&heading_table).is_empty()
+            && lines_containing(&heading_plan, STATUS_TABLE_HEADER).len() == 1;
+        let heading_surface = authority_surface(&heading_plan, &heading_table);
+        assert!(
+            retired_checks_pass && heading_surface.orphans.len() == lost,
+            "with {headings} adjacent headings planted at line {blank_at}, every other \
+             check {retired} and the frame scan reported {reported} orphan(s) against \
+             the {lost} row(s) the walk lost. Those two differing is the whole of the \
+             third repair: the surplus cell planted below the block is inside the \
+             truncated walk's blind spot, so if the frame scan also passes, {lost} \
+             authority rows — the malformed one among them — leave the gate's scope \
+             with a passing output identical to a clean run",
+            retired = if retired_checks_pass {
+                "passes"
+            } else {
+                "fails"
+            },
+            reported = heading_surface.orphans.len(),
+        );
+    }
+
+    // 3f. The cry-wolf control, on this document's own bytes: a legitimate,
+    //     well-formed table placed in the Status section below the Status table. The
+    //     retired rule reddened on it — the surface walk stepped over the prose
+    //     between the two and stopped on the second table's frame, reporting *"the 39
+    //     row(s) this walk reached are the whole authority surface"*, which is every
+    //     row there is — and it reddened only from three columns up, `is_row_shaped`
+    //     having a three-cell floor. Two documents a reader cannot tell apart, one
+    //     red and one green, on a page with nothing wrong with it.
+    let after_the_table = table.end_line + 4;
+    for columns in 2..=6 {
+        let row = |prefix: &str| {
+            format!(
+                "| {} |",
+                (1..=columns)
+                    .map(|n| format!("{prefix} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        };
+        let neighbour = format!(
+            "\n**A second table, correct and unrelated.**\n\n{}\n|{}\n{}\n{}\n",
+            row("column"),
+            "---|".repeat(columns),
+            row("value"),
+            row("value"),
+        );
+        let neighbour_plan = insert_before(&plan, after_the_table, &neighbour);
+        assert_ne!(
+            neighbour_plan, plan,
+            "the {columns}-column neighbour was never planted, so the control below \
+             asserts nothing"
+        );
+        let neighbour_table = locate_table(&neighbour_plan, STATUS_TABLE_HEADER)
+            .expect("the planted document still carries the Status table");
+        let neighbour_surface = authority_surface(&neighbour_plan, &neighbour_table);
+        assert!(
+            neighbour_table.rows.len() == table.rows.len()
+                && neighbour_table.rows.len()
+                    == non_blank_run_below_delimiter(&neighbour_plan, &neighbour_table)
+                && neighbour_surface.orphans.is_empty()
+                && neighbour_surface.stacked_frame.is_none()
+                && cell_count_offences(&neighbour_table).is_empty(),
+            "a correct {columns}-column table planted at line {after_the_table} — below \
+             the Status table, inside its section, with a paragraph between them — was \
+             reported: walk {walk} rows against {rows}, {orphans} orphan(s), stacked \
+             frame {stacked:?}. Both reference renderers render that document as the \
+             Status table unchanged plus one more table, so every one of those has to \
+             be quiet. This is the half of item 99 that is not a hole but a false \
+             alarm, and a gate that cries wolf on a correct document is a gate that \
+             gets deleted",
+            walk = neighbour_table.rows.len(),
+            rows = table.rows.len(),
+            orphans = neighbour_surface.orphans.len(),
+            stacked = neighbour_surface
+                .stacked_frame
+                .as_ref()
+                .map(|(line, _)| *line),
+        );
+    }
+
+    // 3g. The walker's own floor. The frame scan runs to the end of the document
+    //     rather than to the end of a section, which is the whole reason no edit can
+    //     move its extent — so the proof that it does is a row planted on the last
+    //     line, as far from the Status table as this document goes. A scan that
+    //     stopped early would report nothing here, and reporting nothing is what a
+    //     clean document reports.
+    let tail_plan = format!("{}\n| a stray | figure | in no table |\n", plan.trim_end());
+    let tail_table = locate_table(&tail_plan, STATUS_TABLE_HEADER)
+        .expect("appending a line leaves the Status table where it was");
+    let tail_surface = authority_surface(&tail_plan, &tail_table);
+    assert_eq!(
+        tail_surface
+            .orphans
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>(),
+        vec![tail_plan.lines().count()],
+        "a row-shaped line planted on the document's last line was not reported. The \
+         scan's extent is the document, deliberately — every narrower one has been a \
+         rule about headings, and every heading rule so far has been the defect's own \
+         lever — so a scan that stops early is this same defect in a fifth \
+         spelling, and it prints exactly what a clean document prints"
     );
 
     // 4. …and each structural check above, in the direction that would disarm it. A
@@ -4344,22 +4685,22 @@ fn every_status_table_row_has_the_headers_cell_count() {
         "the surplus cell never landed in the real table, so this plant proves \
          nothing about what the decoy hides"
     );
-    let decoy_surface = row_shaped_surface(&decoy_plan, &decoy_table);
+    let decoy_surface = authority_surface(&decoy_plan, &decoy_table);
     let retired_checks_pass = decoy_table.header == split_cells(STATUS_TABLE_HEADER)
         && delimiter_offences(&decoy_table).is_empty()
         && decoy_table.rows.len() == non_blank_run_below_delimiter(&decoy_plan, &decoy_table)
-        && decoy_table.rows.len() == decoy_surface.rows
-        && decoy_surface.interruptions.is_empty()
+        && decoy_surface.orphans.is_empty()
         && cell_count_offences(&decoy_table).is_empty();
     let current_check_passes = lines_containing(&decoy_plan, STATUS_TABLE_HEADER).len() == 1;
     assert!(
         retired_checks_pass && !current_check_passes,
         "against a document carrying a decoy table under this header, every check but \
          one {retired}, and the needle-count check {current}. That difference is the \
-         second repair: the decoy satisfies the header shape, the delimiter row, both \
-         extents and the cell counts — being well formed is *all* it has to be — while \
-         the real table below it, surplus cell and all, is never read. If the \
-         needle-count check also passes, a second table silently re-aims the gate again",
+         second repair: the decoy satisfies the header shape, the delimiter row, the \
+         extent, the frame scan and the cell counts — being well formed is *all* it \
+         has to be — while the real table below it, surplus cell and all, is never \
+         read. If the needle-count check also passes, a second table silently re-aims \
+         the gate again",
         retired = if retired_checks_pass {
             "passes on the decoy"
         } else {
@@ -4370,6 +4711,41 @@ fn every_status_table_row_has_the_headers_cell_count() {
         } else {
             "fails"
         },
+    );
+    // This decoy sits one blank line above the real table, so the stacked-frame
+    // check catches it too — worth recording, and worth recording that it is not a
+    // second defence. Move the decoy one sentence further up and that check goes
+    // quiet by design ([`AuthoritySurface::stacked_frame`] deliberately says nothing
+    // about a table separated by prose), while the needle count still sees it. The
+    // distance-independent check is the one that has to hold.
+    assert!(
+        decoy_surface.stacked_frame.is_some(),
+        "the decoy one blank line above the real table did not read as a stacked \
+         frame, so the pair below is not the contrast it is meant to be"
+    );
+    let distant_decoy = insert_before(
+        &decoy_plan,
+        decoy_headers[1],
+        "A sentence between the two tables.\n",
+    );
+    let distant_table = locate_table(&distant_decoy, STATUS_TABLE_HEADER)
+        .expect("the planted document still carries a table under this header");
+    let distant_surface = authority_surface(&distant_decoy, &distant_table);
+    assert!(
+        distant_surface.stacked_frame.is_none()
+            && distant_surface.orphans.is_empty()
+            && lines_containing(&distant_decoy, STATUS_TABLE_HEADER).len() == 2,
+        "with one sentence between the decoy and the real table, the stacked-frame \
+         check reported {:?} and the frame scan reported {} orphan(s). Both must go \
+         quiet — two tables a paragraph apart are two tables to both reference \
+         renderers, and reddening there is the false alarm that cost the section \
+         window its life — which is exactly why the needle count, and not either of \
+         them, is what stands between this gate and a decoy",
+        distant_surface
+            .stacked_frame
+            .as_ref()
+            .map(|(line, _)| *line),
+        distant_surface.orphans.len(),
     );
 
     // 5. The verdict.
